@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 from html import escape
+from zoneinfo import ZoneInfo
 
 import altair as alt
 import pandas as pd
@@ -41,25 +42,80 @@ from fpl_manager.squad import (
 st.set_page_config(page_title="FPL Manager", page_icon="⚽", layout="wide")
 
 CACHE_TTL = 6 * 3600
-SQUAD_COLS = ["name", "position", "club", "price", "xpts_next", "xpts_total", "ownership"]
 POSITIONS_IN_ORDER = ("GKP", "DEF", "MID", "FWD")
+
+# One table answering several questions, rather than one wide table answering
+# none of them well. Model terms has no equivalent on the stats sites and is
+# the point of ours: the three separable terms laid out so a ranking that looks
+# wrong can be argued with instead of taken on faith.
+STAT_VIEWS = {
+    "Projection": ["price", "xpts_next", "xpts_total", "value", "ownership"],
+    "Model terms": ["price", "points_per_90", "minutes_share", "start_rate", "prior_p90"],
+    "Form and attack": [
+        "price",
+        "form",
+        "points_per_game",
+        "total_points",
+        "expected_goals",
+        "expected_assists",
+    ],
+    "Availability": ["price", "fitness", "chance_of_playing", "minutes_share", "ownership"],
+}
+# read straight off the API rather than through the model, so they are the
+# check on it rather than a restatement of it
+EXTRA_STATS = ["form", "points_per_game", "total_points", "expected_goals", "expected_assists"]
+# FPL sets its deadlines in UK time and shows them that way, so converting to
+# the server's timezone would disagree with the site people are playing on.
+UK = ZoneInfo("Europe/London")
 POSITION_COLOURS = {"GKP": "#FFB020", "DEF": "#00C2FF", "MID": "#00E87B", "FWD": "#FF4D6D"}
 
 PITCH_CSS = """
 <style>
+:root {
+  --line: rgba(255,255,255,.16);
+  --line-soft: rgba(255,255,255,.08);
+  --muted: rgba(255,255,255,.62);
+  --radius: 12px;
+  --card: #1F1830;
+  --shadow: 0 1px 2px rgba(0,0,0,.30), 0 4px 14px rgba(0,0,0,.22);
+}
+.statusbar {
+  display:flex; flex-wrap:wrap; gap:0;
+  border:1px solid var(--line-soft); border-radius:var(--radius);
+  background:var(--card); box-shadow:var(--shadow);
+  margin-bottom:18px; overflow:hidden;
+}
+.statusbar .cell {
+  flex:1 1 auto; min-width:132px; padding:9px 14px;
+  border-right:1px solid var(--line-soft);
+}
+.statusbar .cell:last-child { border-right:0; }
+.statusbar .k {
+  display:block; font-size:.62rem; letter-spacing:.11em;
+  text-transform:uppercase; color:var(--muted);
+}
+.statusbar .v { font-size:.94rem; font-weight:700; }
+.statusbar .v.soon { color:#FFB020; }
+.statusbar .v.stale { color:#ff2d55; }
+/* on a phone the cells wrap, and left to grow freely the two long ones each
+   take a row of their own and push the tabs off the screen */
+@media (max-width: 640px) {
+  .statusbar .cell { flex-basis:44%; min-width:0; padding:8px 10px; }
+  .statusbar .v { font-size:.8rem; }
+}
 .pitch {
   background:
     repeating-linear-gradient(to bottom,
       rgba(255,255,255,.05) 0 7%, rgba(0,0,0,0) 7% 14%),
     linear-gradient(180deg, #10794a 0%, #0a5733 100%);
-  border: 1px solid rgba(255,255,255,.16);
-  border-radius: 14px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
   padding: 16px 10px 4px;
 }
 .pitch-line { display:flex; justify-content:center; gap:10px; flex-wrap:wrap; margin-bottom:14px; }
 .pitch-cap, .bench-cap {
   text-align:center; font-size:.68rem; letter-spacing:.12em; text-transform:uppercase;
-  color:rgba(255,255,255,.7); margin-bottom:10px;
+  color:var(--muted); margin-bottom:10px;
 }
 .shirt {
   position:relative;
@@ -95,8 +151,8 @@ PITCH_CSS = """
 .badge.c { background:#37003C; color:#00E87B; }
 .badge.v { background:#ded6e5; color:#37003C; }
 .bench-strip {
-  margin-top:10px; padding:12px 10px 0; border-radius:12px;
-  background:rgba(255,255,255,.05); border:1px dashed rgba(255,255,255,.2);
+  margin-top:10px; padding:12px 10px 0; border-radius:var(--radius);
+  background:rgba(255,255,255,.05); border:1px dashed var(--line);
 }
 .bench-strip .shirt { width:100px; background:rgba(255,255,255,.8); }
 </style>
@@ -109,17 +165,21 @@ def fdr_css(value: float) -> str:
 
     Thresholds rather than exact values, because a club with two fixtures in a
     gameweek gets the mean of the two and lands between the integers.
+
+    The middle band is deliberately the dimmest thing on the grid. A bright
+    neutral on a dark page draws the eye hardest towards the fixtures that
+    should influence a decision least, which is backwards.
     """
     if pd.isna(value):
         return "background-color:#241c30;color:#6f6580;"
     if value <= 2.0:
         return "background-color:#00d060;color:#05240f;"
     if value <= 2.75:
-        return "background-color:#84dd8f;color:#0d2a14;"
+        return "background-color:#5faa6d;color:#07200d;"
     if value <= 3.25:
-        return "background-color:#d7d2dd;color:#2b2333;"
+        return "background-color:#3b3450;color:#b3aac4;"
     if value <= 4.0:
-        return "background-color:#ff5a5f;color:#2b0206;"
+        return "background-color:#e0455f;color:#2b0206;"
     return "background-color:#8b0f2b;color:#ffe9ee;"
 
 
@@ -163,29 +223,223 @@ def load_projections(
     return project(_season, horizon=horizon, prior=prior)
 
 
+@st.cache_data(show_spinner=False)
+def fixture_runs(_season: Season, horizon: int) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Opponent labels and difficulty per club per gameweek, keyed by club id.
+
+    Home is upper case and away is lower case, which is how fixture tickers
+    encode it and saves the table a legend. Keyed by club id rather than name
+    because that is what the projections carry, so it reindexes onto players
+    without a lookup.
+
+    Doubles and blanks need nothing special here. `team_fixtures` emits a row
+    per fixture, so a double joins both opponents into the cell and averages
+    the difficulty that colours it, and a blank produces no row at all.
+    """
+    tf = _season.team_fixtures(horizon).copy()
+    tf["label"] = tf["opponent_short"].where(tf["is_home"], tf["opponent_short"].str.lower())
+
+    difficulty = tf.pivot_table(index="team", columns="event", values="difficulty", aggfunc="mean")
+    labels = tf.groupby(["team", "event"])["label"].apply(" ".join).unstack()
+
+    clubs, events = _season.teams.index, difficulty.columns
+    return (
+        labels.reindex(index=clubs, columns=events).fillna(""),
+        difficulty.reindex(index=clubs, columns=events),
+    )
+
+
 # ----------------------------------------------------------------------
 # display helpers
 # ----------------------------------------------------------------------
-def squad_table(df: pd.DataFrame) -> None:
-    st.dataframe(
-        df[SQUAD_COLS],
+def _relative(delta: pd.Timedelta) -> str:
+    """A rough "in 3 days" or "20 minutes ago", depending on the sign."""
+    ahead = delta.total_seconds() > 0
+    seconds = int(abs(delta.total_seconds()))
+    for size, unit in ((86400, "day"), (3600, "hour"), (60, "minute")):
+        if seconds >= size:
+            count = seconds // size
+            phrase = f"{count} {unit}{'' if count == 1 else 's'}"
+            return f"in {phrase}" if ahead else f"{phrase} ago"
+    return "in under a minute" if ahead else "just now"
+
+
+def _cell(key: str, value: str, tone: str = "") -> str:
+    return (
+        f'<div class="cell"><span class="k">{escape(key)}</span>'
+        f'<span class="v {tone}">{escape(value)}</span></div>'
+    )
+
+
+def status_bar(season: Season, players: int) -> None:
+    """The facts that say whether the rest of the page is worth acting on.
+
+    The deadline and the age of the data are the two the app never showed, and
+    they are the two that decide whether a projection is still current. Both
+    are read off shared state rather than the session, since the disk cache is
+    shared by everyone using a deployed app.
+    """
+    now = pd.Timestamp.now(tz="UTC")
+    played = season.gameweeks_played
+    cells = [
+        _cell(
+            "Gameweek",
+            f"GW{season.next_gameweek} next"
+            + (f" · {played} played" if played else " · pre-season"),
+        )
+    ]
+
+    deadline = season.next_deadline
+    if deadline is None:
+        cells.append(_cell("Deadline", "None left this season"))
+    elif deadline <= now:
+        cells.append(_cell("Deadline", "Passed, gameweek under way"))
+    else:
+        gap = deadline - now
+        tone = "soon" if gap < pd.Timedelta(hours=24) else ""
+        cells.append(
+            _cell("Deadline", f"{deadline.tz_convert(UK):%a %d %b, %H:%M} · {_relative(gap)}", tone)
+        )
+
+    cells.append(_cell("Players projected", str(players)))
+
+    fetched = season.api.fetched_at("bootstrap")
+    if fetched is None:
+        cells.append(_cell("FPL data", "Not cached"))
+    else:
+        age = pd.Timestamp(fetched) - now
+        tone = "stale" if -age > pd.Timedelta(seconds=CACHE_TTL) else ""
+        cells.append(_cell("FPL data", f"Fetched {_relative(age)}", tone))
+
+    st.markdown(f'<div class="statusbar">{"".join(cells)}</div>', unsafe_allow_html=True)
+
+
+def pool_column_config(horizon: int, gw_cols: list[str], max_xpts: float) -> dict:
+    """Labels and formats for every column any stat view can put on screen.
+
+    One dict covering all of them rather than one per view, so a column reads
+    the same whichever view you found it in. The player name is pinned because
+    the fixture run makes the table wider than a phone.
+    """
+    config = {
+        "name": st.column_config.TextColumn("Player", pinned=True),
+        "position": st.column_config.TextColumn("Pos", width="small"),
+        "club": st.column_config.TextColumn("Club", width="small"),
+        "price": st.column_config.NumberColumn("Price", format="%.1f", width="small"),
+        "xpts_next": st.column_config.NumberColumn("xPts next", format="%.1f"),
+        "xpts_total": st.column_config.ProgressColumn(
+            f"xPts {horizon} GW", format="%.1f", min_value=0.0, max_value=max_xpts
+        ),
+        "value": st.column_config.NumberColumn("Pts per m", format="%.2f"),
+        "ownership": st.column_config.NumberColumn("Owned %", format="%.1f"),
+        "points_per_90": st.column_config.NumberColumn("Pts per 90", format="%.2f"),
+        "minutes_share": st.column_config.NumberColumn("Mins share", format="%.2f"),
+        "start_rate": st.column_config.NumberColumn("Start rate", format="%.2f"),
+        "prior_p90": st.column_config.NumberColumn("Last season p90", format="%.2f"),
+        "form": st.column_config.NumberColumn("Form", format="%.1f"),
+        "points_per_game": st.column_config.NumberColumn("PPG", format="%.1f"),
+        "total_points": st.column_config.NumberColumn("Total", format="%d"),
+        "expected_goals": st.column_config.NumberColumn("xG", format="%.2f"),
+        "expected_assists": st.column_config.NumberColumn("xA", format="%.2f"),
+        "chance_of_playing": st.column_config.NumberColumn("Chance %", format="%.0f"),
+        "fitness": st.column_config.TextColumn("Fitness", width="medium"),
+    }
+    for col in gw_cols:
+        config[col] = st.column_config.TextColumn(col, width="small")
+    return config
+
+
+def pool_table(
+    view: pd.DataFrame,
+    labels: pd.DataFrame,
+    difficulty: pd.DataFrame,
+    columns: list[str],
+    horizon: int,
+    key: str,
+) -> int | None:
+    """The pool, with each player's fixture run beside his numbers.
+
+    Reading a projection without the run that produced it means holding two
+    tabs in your head at once. Returns the id of the selected player, or None.
+    """
+    gw_cols = [f"GW{int(c)}" for c in labels.columns]
+    table = view[["name", "position", "club", *columns]]
+
+    if gw_cols:
+        runs = labels.reindex(view["team"]).set_axis(view.index)
+        runs.columns = gw_cols
+        table = pd.concat([table, runs.replace("", "—")], axis=1)
+
+    colours = pd.DataFrame("", index=table.index, columns=table.columns)
+    if gw_cols:
+        fdr = difficulty.reindex(view["team"]).to_numpy()
+        colours[gw_cols] = pd.DataFrame(
+            [[fdr_css(v) for v in row] for row in fdr], index=table.index, columns=gw_cols
+        )
+
+    selection = st.dataframe(
+        table.style.apply(lambda _: colours, axis=None),
         hide_index=True,
         width="stretch",
-        column_config={
-            "name": "Player",
-            "position": "Pos",
-            "club": "Club",
-            "price": st.column_config.NumberColumn("Price", format="%.1f"),
-            "xpts_next": st.column_config.NumberColumn("xPts next", format="%.1f"),
-            "xpts_total": st.column_config.ProgressColumn(
-                "xPts horizon",
-                format="%.1f",
-                min_value=0.0,
-                max_value=float(max(df["xpts_total"].max(), 1)),
-            ),
-            "ownership": st.column_config.NumberColumn("Owned %", format="%.1f"),
-        },
+        column_config=pool_column_config(horizon, gw_cols, float(max(view["xpts_total"].max(), 1))),
+        on_select="rerun",
+        selection_mode="single-row",
+        key=key,
     )
+    rows = selection["selection"]["rows"]
+    return int(table.index[rows[0]]) if rows else None
+
+
+@st.dialog("Player detail", width="large")
+def player_detail(row: pd.Series, weeks: pd.DataFrame, horizon: int) -> None:
+    """Why this player is ranked where he is.
+
+    The projection is three terms multiplied together and the total says
+    nothing about which of them is driving it. A cheap player with a high
+    scoring rate and a thin minutes share is a completely different
+    proposition from one the other way round, and a column of totals cannot
+    tell you which you are looking at.
+    """
+    severity, note = availability(row)
+    st.markdown(f"#### {escape(str(row['name']))}")
+    st.caption(
+        f"{row['club']} · {row['position']} · {row['price']:.1f}m · {row['ownership']:.1f}% owned"
+    )
+    if severity:
+        {"out": st.error, "doubt": st.warning, "note": st.info}[severity](note)
+
+    a, b, c = st.columns(3)
+    a.metric("Points per 90", f"{row['points_per_90']:.2f}")
+    b.metric("Expected minutes", f"{row['minutes_share']:.0%} of 90")
+    c.metric(f"Projected, {horizon} GW", f"{row['xpts_total']:.1f} pts")
+
+    current = row["current_p90"]
+    st.caption(
+        "Scoring rate times expected minutes times a fixture multiplier, summed over the "
+        f"run below. The rate blends last season at {row['prior_p90']:.2f} per 90 with this "
+        + (f"season at {current:.2f}" if pd.notna(current) else "season, which has no sample yet")
+        + ", weighted by how much of the season has been played."
+    )
+
+    if weeks.empty:
+        st.info("No fixtures for this club inside the horizon.")
+        return
+
+    st.altair_chart(
+        alt.Chart(weeks)
+        .mark_bar(color=POSITION_COLOURS.get(row["position"], "#00E87B"), cornerRadiusEnd=3)
+        .encode(
+            x=alt.X("label:N", title=None, sort=list(weeks["label"])),
+            y=alt.Y("xpts:Q", title="Projected points"),
+            tooltip=[
+                alt.Tooltip("label:N", title="Gameweek"),
+                alt.Tooltip("fixture:N", title="Fixture"),
+                alt.Tooltip("xpts:Q", title="xPts", format=".2f"),
+            ],
+        )
+        .properties(height=210)
+    )
+    st.caption("Upper case is at home, lower case away. A double gameweek shows both.")
 
 
 STATUS_WORDS = {
@@ -292,6 +546,31 @@ def flag_legend() -> None:
     )
 
 
+def player_weeks(by_gameweek: pd.DataFrame, player_id: int) -> pd.DataFrame:
+    """One row per gameweek for a player, with doubles summed into their week."""
+    gw = by_gameweek[by_gameweek["id"] == player_id]
+    if gw.empty:
+        return gw
+    gw = gw.assign(
+        fixture=gw["opponent_short"].where(gw["is_home"], gw["opponent_short"].str.lower())
+    )
+    weeks = gw.groupby("event", as_index=False).agg(
+        xpts=("xpts", "sum"), fixture=("fixture", " ".join)
+    )
+    weeks["label"] = "GW" + weeks["event"].astype(str)
+    return weeks
+
+
+def position_scale(frame: pd.DataFrame) -> alt.Scale:
+    """Position colours, restricted to the positions actually on the chart.
+
+    Handing Altair the full domain when only forwards are plotted leaves three
+    dead entries in the legend.
+    """
+    present = [p for p in POSITIONS_IN_ORDER if p in set(frame["position"])]
+    return alt.Scale(domain=present, range=[POSITION_COLOURS[p] for p in present])
+
+
 def name_lookup(projections: pd.DataFrame) -> dict[str, int]:
     return {
         f"{row['name']} ({row['club']}, {row['price']:.1f})": int(pid)
@@ -338,9 +617,8 @@ projections, by_gameweek = load_projections(season, horizon, use_prior)
 lookup = name_lookup(projections)
 
 st.sidebar.divider()
-st.sidebar.caption(
-    f"GW{season.next_gameweek} next · {season.gameweeks_played} played · {len(projections)} players"
-)
+# the gameweek, player count and data age used to live here as a caption, and
+# now sit in the status bar at the top of the page instead
 if not use_prior and season.gameweeks_played == 0:
     st.sidebar.warning("No prior data and no gameweeks played. Projections are guesswork.")
 
@@ -385,6 +663,8 @@ with st.sidebar.expander("Your squad", expanded=True):
 # ----------------------------------------------------------------------
 # tabs
 # ----------------------------------------------------------------------
+status_bar(season, len(projections))
+
 build_tab, players_tab, fixtures_tab, transfers_tab, chips_tab = st.tabs(
     ["Squad", "Players", "Fixtures", "Transfers", "Chips"]
 )
@@ -426,53 +706,122 @@ with build_tab:
 
 with players_tab:
     st.subheader("Player pool")
-    f1, f2, f3, f4 = st.columns(4)
-    pos = f1.selectbox("Position", ["All", "GKP", "DEF", "MID", "FWD"])
-    max_price = f2.slider("Max price", 3.5, 16.0, 16.0, 0.1)
-    max_own = f3.slider("Max ownership %", 0.0, 100.0, 100.0, 1.0)
-    sort_by = f4.selectbox("Sort by", ["xpts_total", "xpts_next", "value", "ownership"])
 
-    view = projections[
-        (projections["price"] <= max_price)
-        & (projections["ownership"] <= max_own)
-        & (projections["minutes_share"] > 0)
-    ]
+    # the raw API stats are joined on rather than modelled, so the Form and
+    # attack view is a check on the projection instead of a restatement of it
+    pool = projections.join(season.players.reindex(columns=EXTRA_STATS))
+
+    s1, s2 = st.columns([3, 1])
+    search = s1.text_input("Search", placeholder="Player or club name")
+    include_unavailable = s2.toggle(
+        "Include unavailable",
+        help="Injured, suspended and out of the squad are projected at zero minutes, so "
+        "they are hidden by default. Turn this on to see them anyway.",
+    )
+
+    f1, f2, f3, f4, f5 = st.columns(5)
+    pos = f1.selectbox("Position", ["All", "GKP", "DEF", "MID", "FWD"])
+    club = f2.selectbox("Club", ["All", *sorted(season.teams["short_name"])])
+    max_price = f3.slider("Max price", 3.5, 16.0, 16.0, 0.1)
+    max_own = f4.slider("Max ownership %", 0.0, 100.0, 100.0, 1.0)
+    sort_by = f5.selectbox(
+        "Sort by", ["xpts_total", "xpts_next", "value", "ownership", "form", "points_per_game"]
+    )
+
+    view = pool[(pool["price"] <= max_price) & (pool["ownership"] <= max_own)]
+    if not include_unavailable:
+        view = view[view["minutes_share"] > 0]
     if pos != "All":
         view = view[view["position"] == pos]
+    if club != "All":
+        view = view[view["club"] == club]
+    if search:
+        hay = view["name"].str.lower() + " " + view["club"].str.lower()
+        view = view[hay.str.contains(search.strip().lower(), regex=False)]
     view = view.sort_values(sort_by, ascending=False)
 
-    plot = view.head(200).reset_index()
-    present = [p for p in POSITIONS_IN_ORDER if p in set(plot["position"])]
-    dots = (
-        alt.Chart(plot)
-        .mark_circle(opacity=0.75)
-        .encode(
-            x=alt.X("price:Q", title="Price (m)", scale=alt.Scale(zero=False, nice=True)),
-            y=alt.Y("xpts_total:Q", title=f"Projected points, next {horizon} GW"),
-            color=alt.Color(
-                "position:N",
-                title="Position",
-                scale=alt.Scale(domain=present, range=[POSITION_COLOURS[p] for p in present]),
-            ),
-            size=alt.Size("ownership:Q", title="Owned %", scale=alt.Scale(range=[25, 400])),
-            tooltip=[
-                alt.Tooltip("name:N", title="Player"),
-                alt.Tooltip("club:N", title="Club"),
-                alt.Tooltip("position:N", title="Pos"),
-                alt.Tooltip("price:Q", title="Price", format=".1f"),
-                alt.Tooltip("xpts_next:Q", title="xPts next", format=".1f"),
-                alt.Tooltip("xpts_total:Q", title="xPts horizon", format=".1f"),
-                alt.Tooltip("value:Q", title="Pts per m", format=".2f"),
-                alt.Tooltip("ownership:Q", title="Owned %", format=".1f"),
-            ],
+    # an empty filter result is an ordinary thing to do, not an error, so it
+    # must not reach st.stop() and take the other four tabs down with it
+    if view.empty:
+        st.info("Nothing matches those filters. Widen them to see players again.")
+    else:
+        stat_view = st.segmented_control(
+            "Stat view", list(STAT_VIEWS), default="Projection", label_visibility="collapsed"
         )
-    )
-    tags = (
-        alt.Chart(plot.nlargest(10, "value"))
-        .mark_text(align="left", dx=9, dy=-7, fontSize=11, color="#ECE8F2")
-        .encode(x="price:Q", y="xpts_total:Q", text="name:N")
-    )
-    st.altair_chart((dots + tags).properties(height=430).interactive())
+        columns = STAT_VIEWS[stat_view or "Projection"]
+
+        show_all = st.toggle("Show more rows", help="Up to 250, rather than the top 40.")
+        shown = view.head(250 if show_all else 40)
+        if "fitness" in columns:
+            shown = shown.assign(
+                fitness=[availability(row)[1] or "No news" for _, row in shown.iterrows()]
+            )
+
+        st.caption(
+            f"Showing {len(shown)} of {len(view)} players, ranked by "
+            f"{sort_by.replace('_', ' ')}. Click a row for the working behind the projection."
+        )
+        labels, difficulty = fixture_runs(season, horizon)
+        chosen = pool_table(shown, labels, difficulty, columns, horizon, key="pool")
+
+        # only open on a change, or closing the dialog would reopen it at once
+        if chosen is not None and st.session_state.get("inspected") != chosen:
+            st.session_state.inspected = chosen
+            player_detail(view.loc[chosen], player_weeks(by_gameweek, chosen), horizon)
+        elif chosen is None:
+            st.session_state.inspected = None
+
+        st.divider()
+        scatter, leaders = st.columns([3, 2])
+        plot = view.head(200).reset_index()
+        with scatter:
+            st.caption("Points against price. Bigger dots are more owned.")
+            dots = (
+                alt.Chart(plot)
+                .mark_circle(opacity=0.75)
+                .encode(
+                    x=alt.X("price:Q", title="Price (m)", scale=alt.Scale(zero=False, nice=True)),
+                    y=alt.Y("xpts_total:Q", title=f"Projected points, next {horizon} GW"),
+                    color=alt.Color("position:N", title="Position", scale=position_scale(plot)),
+                    size=alt.Size("ownership:Q", title="Owned %", scale=alt.Scale(range=[25, 400])),
+                    tooltip=[
+                        alt.Tooltip("name:N", title="Player"),
+                        alt.Tooltip("club:N", title="Club"),
+                        alt.Tooltip("position:N", title="Pos"),
+                        alt.Tooltip("price:Q", title="Price", format=".1f"),
+                        alt.Tooltip("xpts_next:Q", title="xPts next", format=".1f"),
+                        alt.Tooltip("xpts_total:Q", title="xPts horizon", format=".1f"),
+                        alt.Tooltip("value:Q", title="Pts per m", format=".2f"),
+                        alt.Tooltip("ownership:Q", title="Owned %", format=".1f"),
+                    ],
+                )
+            )
+            tags = (
+                alt.Chart(plot.nlargest(10, "value"))
+                .mark_text(align="left", dx=9, dy=-7, fontSize=11, color="#ECE8F2")
+                .encode(x="price:Q", y="xpts_total:Q", text="name:N")
+            )
+            st.altair_chart((dots + tags).properties(height=430).interactive())
+
+        with leaders:
+            st.caption("Most projected points per million")
+            best = view.nlargest(14, "value").reset_index()
+            st.altair_chart(
+                alt.Chart(best)
+                .mark_bar(cornerRadiusEnd=3)
+                .encode(
+                    y=alt.Y("name:N", title=None, sort="-x"),
+                    x=alt.X("value:Q", title="Points per million"),
+                    color=alt.Color("position:N", title="Position", scale=position_scale(best)),
+                    tooltip=[
+                        alt.Tooltip("name:N", title="Player"),
+                        alt.Tooltip("club:N", title="Club"),
+                        alt.Tooltip("price:Q", title="Price", format=".1f"),
+                        alt.Tooltip("value:Q", title="Pts per m", format=".2f"),
+                    ],
+                )
+                .properties(height=430)
+            )
 
     st.divider()
     st.subheader("Price pressure")
@@ -518,26 +867,6 @@ with players_tab:
         st.caption(
             "Price moves are not in the projection. A rise is worth chasing only if you "
             "wanted the player anyway."
-        )
-
-    st.divider()
-    ranked, best_value = st.columns([3, 2])
-    with ranked:
-        st.caption(f"Ranked by {sort_by.replace('_', ' ')}")
-        squad_table(view.head(40))
-    with best_value:
-        st.caption("Most points per million")
-        st.dataframe(
-            view.nlargest(15, "value")[["name", "position", "club", "price", "value"]],
-            hide_index=True,
-            width="stretch",
-            column_config={
-                "name": "Player",
-                "position": "Pos",
-                "club": "Club",
-                "price": st.column_config.NumberColumn("Price", format="%.1f"),
-                "value": st.column_config.NumberColumn("Pts per m", format="%.2f"),
-            },
         )
 
 with fixtures_tab:
