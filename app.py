@@ -567,6 +567,27 @@ def player_weeks(by_gameweek: pd.DataFrame, player_id: int) -> pd.DataFrame:
     return weeks
 
 
+def zoomable(chart: alt.Chart, key: str) -> alt.Chart:
+    """Hand the chart the mouse wheel only once it has been asked for.
+
+    An Altair chart made `.interactive()` claims the wheel for zooming, so
+    scrolling the page past a tall scatter zooms the chart instead of moving
+    the page, and you arrive somewhere further down having quietly rescaled it.
+
+    Vega can gate zooming behind a click, but only by arming it from a point
+    selection, which fires on marks rather than on the plot area and clears
+    itself when you click the background. A control you can see is both plainer
+    and harder to trigger by accident.
+    """
+    zoom = st.toggle(
+        "Zoom and pan",
+        key=key,
+        help="Off by default so that scrolling the page cannot rescale the chart. "
+        "Turn it on to zoom with the wheel and drag to pan.",
+    )
+    return chart.interactive() if zoom else chart
+
+
 def position_scale(frame: pd.DataFrame) -> alt.Scale:
     """Position colours, restricted to the positions actually on the chart.
 
@@ -808,7 +829,7 @@ with players_tab:
                 .mark_text(align="left", dx=9, dy=-7, fontSize=11, color="#ECE8F2")
                 .encode(x="price:Q", y="xpts_total:Q", text="name:N")
             )
-            st.altair_chart((dots + tags).properties(height=430).interactive())
+            st.altair_chart(zoomable((dots + tags).properties(height=430), "pool_zoom"))
 
         with leaders:
             st.caption("Most projected points per million")
@@ -958,7 +979,7 @@ with roi_tab:
                 .mark_text(align="left", dx=9, dy=-7, fontSize=11, color="#ECE8F2")
                 .encode(x="price:Q", y="points:Q", text="name:N")
             )
-            st.altair_chart((scatter + labels).properties(height=430).interactive())
+            st.altair_chart(zoomable((scatter + labels).properties(height=430), "roi_zoom"))
 
             roi_cols = ["name", "position", "club", "price", "points", "minutes", "roi"]
             config = {

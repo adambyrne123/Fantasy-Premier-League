@@ -8,6 +8,7 @@ somewhere down a tab the developer did not click on before shipping.
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import pytest
@@ -188,6 +189,44 @@ def test_clearing_the_selection_allows_the_drill_down_to_reopen(midseason_app):
     at.session_state["pool"] = {"selection": {"rows": [], "columns": []}}
     at.run()
     assert at.session_state["inspected"] is None
+
+
+def _chart_specs(at):
+    """Every Vega-Lite spec on the page, parsed.
+
+    `.proto.spec` rather than `.spec`, since the element's own accessor reads
+    session state and a chart with no key has none.
+    """
+    specs = [json.loads(c.proto.spec) for c in at.get("vega_lite_chart")]
+    assert specs, "no charts found, so an assertion about them proves nothing"
+    return specs
+
+
+def _has_scale_binding(spec) -> bool:
+    """Whether a spec binds a selection to the scales, which is what claims
+    the wheel. `.interactive()` puts it on the top level of a layered chart."""
+    if isinstance(spec, dict):
+        if any(p.get("bind") == "scales" for p in spec.get("params", []) if isinstance(p, dict)):
+            return True
+        return any(_has_scale_binding(v) for v in spec.values())
+    if isinstance(spec, list):
+        return any(_has_scale_binding(v) for v in spec)
+    return False
+
+
+def test_charts_do_not_claim_the_wheel_until_asked(app):
+    """A chart left `.interactive()` zooms when you scroll the page past it, so
+    you scroll down and arrive having quietly rescaled it."""
+    at = app.run()
+    assert not at.exception
+    assert not any(_has_scale_binding(spec) for spec in _chart_specs(at))
+
+
+def test_turning_zoom_on_gives_the_chart_back_its_wheel(app):
+    at = app.run()
+    next(t for t in at.toggle if t.key == "pool_zoom").set_value(True).run()
+    assert not at.exception
+    assert any(_has_scale_binding(spec) for spec in _chart_specs(at))
 
 
 def test_changing_horizon_reruns_cleanly(app):
