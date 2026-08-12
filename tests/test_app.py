@@ -288,6 +288,54 @@ def test_turning_zoom_on_gives_the_chart_back_its_wheel(app):
     assert any(_has_scale_binding(spec) for spec in _chart_specs(at))
 
 
+def test_the_radar_says_nothing_is_coming_rather_than_showing_a_blank_table(app):
+    """The synthetic season has every club playing exactly once a week, which
+    is also what a real fixture list looks like until postponements start."""
+    at = app.run()
+    assert not at.exception
+    assert any("No blanks or doubles" in info.value for info in at.info)
+
+
+def test_the_radar_lists_clubs_once_a_double_exists(monkeypatch, tmp_path):
+    """The empty case is the one the synthetic season reaches on its own, so
+    the populated table needs its rows supplying."""
+    import pandas as pd
+
+    from fpl_manager.data import Season
+
+    rows = pd.DataFrame(
+        [
+            {"event": 24, "club": "C01", "fixtures": 2, "shape": "double"},
+            {"event": 24, "club": "C02", "fixtures": 2, "shape": "double"},
+            {"event": 24, "club": "C03", "fixtures": 0, "shape": "blank"},
+        ]
+    )
+    monkeypatch.setattr(Season, "gameweek_shape", lambda self, horizon=12: rows)
+
+    at = _app(monkeypatch, tmp_path, played=12).run()
+    assert not at.exception
+    table = next(
+        d.value for d in at.dataframe if {"double", "blank"} <= set(map(str, d.value.columns))
+    )
+    assert list(table["event"]) == [24]
+    assert table.loc[0, "double"] == "C01, C02"
+    assert table.loc[0, "blank"] == "C03"
+
+
+def test_swings_split_into_easing_and_worsening(app):
+    at = app.run()
+    assert not at.exception
+    captions = [c.value for c in at.caption]
+    assert any("Hard now, easier later" in c for c in captions)
+    assert any("Easy now, harder later" in c for c in captions)
+
+
+def test_changing_the_swing_window_reruns_cleanly(app):
+    at = app.run()
+    next(s for s in at.slider if s.key == "swing_window").set_value(5).run()
+    assert not at.exception
+
+
 def test_changing_horizon_reruns_cleanly(app):
     at = app.run()
     at.sidebar.slider[0].set_value(10).run()

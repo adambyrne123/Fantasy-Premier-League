@@ -69,7 +69,18 @@ EXTRA_STATS = ["form", "points_per_game", "total_points", "expected_goals", "exp
 # FPL sets its deadlines in UK time and shows them that way, so converting to
 # the server's timezone would disagree with the site people are playing on.
 UK = ZoneInfo("Europe/London")
+# how much a run has to change before it is worth acting on. Below about half a
+# point of difficulty the swing is inside the noise of FPL's own 1 to 5 rating.
+SWING_THRESHOLD = 0.6
 POSITION_COLOURS = {"GKP": "#FFB020", "DEF": "#00C2FF", "MID": "#00E87B", "FWD": "#FF4D6D"}
+SWING_COLUMNS = {
+    "club": "Club",
+    "now": st.column_config.NumberColumn("Now", format="%.2f"),
+    "later": st.column_config.NumberColumn("Later", format="%.2f"),
+    "swing": st.column_config.NumberColumn("Swing", format="%+.2f"),
+    "now_games": st.column_config.NumberColumn("Games now", format="%d"),
+    "later_games": st.column_config.NumberColumn("Games later", format="%d"),
+}
 
 PITCH_CSS = """
 <style>
@@ -228,6 +239,16 @@ def load_projections(
     """Per-player totals and the per-gameweek frame chip timing needs."""
     prior = cached_prior(_season) if use_prior else None
     return project(_season, horizon=horizon, prior=prior)
+
+
+@st.cache_data(show_spinner=False)
+def load_gameweek_shape(_season: Season, horizon: int) -> pd.DataFrame:
+    return _season.gameweek_shape(horizon)
+
+
+@st.cache_data(show_spinner=False)
+def load_swings(_season: Season, window: int) -> pd.DataFrame:
+    return _season.fixture_swings(window)
 
 
 @st.cache_data(show_spinner=False)
@@ -1078,6 +1099,78 @@ with fixtures_tab:
             "avg_difficulty": st.column_config.NumberColumn("Avg difficulty", format="%.2f"),
         },
     )
+
+    st.divider()
+    st.subheader("Blanks and doubles")
+    st.caption(
+        "Which clubs play twice in a gameweek, and which do not play at all. This is when "
+        "chips are worth playing and when a squad quietly stops fielding eleven. Blanks and "
+        "doubles appear mid-season, once cup ties and European fixtures force postponements, "
+        "so an empty table here means none have been announced yet."
+    )
+    radar_weeks = st.slider("Gameweeks to scan", 4, 20, 12, key="radar_horizon")
+    shape = load_gameweek_shape(season, radar_weeks)
+
+    if shape.empty:
+        st.info(
+            f"No blanks or doubles in the next {radar_weeks} gameweeks on the published "
+            "fixture list. This fills in on its own as postponements are announced."
+        )
+    else:
+        summary = (
+            shape.assign(clubs=shape["club"])
+            .groupby(["event", "shape"])["clubs"]
+            .apply(lambda names: ", ".join(sorted(names)))
+            .unstack(fill_value="")
+            .reindex(columns=["double", "blank"], fill_value="")
+            .reset_index()
+        )
+        st.dataframe(
+            summary,
+            hide_index=True,
+            width="stretch",
+            column_config={
+                "event": st.column_config.NumberColumn("GW", format="%d", width="small"),
+                "double": st.column_config.TextColumn("Playing twice", width="large"),
+                "blank": st.column_config.TextColumn("Not playing", width="large"),
+            },
+        )
+
+    st.divider()
+    st.subheader("Fixture swings")
+    swing_window = st.slider("Gameweeks either side", 2, 5, 3, key="swing_window")
+    swings = load_swings(season, swing_window)
+    st.caption(
+        f"The next {swing_window} gameweeks against the {swing_window} after them. This is "
+        "about timing rather than quality: a club can have a kind run overall and still be "
+        "the wrong buy this week."
+    )
+
+    if swings.empty:
+        st.info("Not enough fixtures published to compare one block against the next.")
+    else:
+        easing, worsening = st.columns(2)
+        with easing:
+            st.caption("Hard now, easier later. Worth waiting for.")
+            st.dataframe(
+                swings[swings["swing"] >= SWING_THRESHOLD].head(8),
+                hide_index=True,
+                width="stretch",
+                column_config=SWING_COLUMNS,
+            )
+        with worsening:
+            st.caption("Easy now, harder later. Use them, then plan the exit.")
+            st.dataframe(
+                swings[swings["swing"] <= -SWING_THRESHOLD].tail(8).iloc[::-1],
+                hide_index=True,
+                width="stretch",
+                column_config=SWING_COLUMNS,
+            )
+        st.caption(
+            "Games either side are shown because a swing resting on one fixture is a much "
+            "weaker signal than one resting on three, and a blank gameweek is what makes "
+            "the difference."
+        )
 
 with transfers_tab:
     st.subheader("Transfer planner")
