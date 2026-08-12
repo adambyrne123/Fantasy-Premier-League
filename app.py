@@ -21,6 +21,7 @@ from fpl_manager.api import FplApi
 from fpl_manager.chips import best_per_chip
 from fpl_manager.chips import evaluate as evaluate_chips
 from fpl_manager.data import MAX_PER_CLUB, Season
+from fpl_manager.leagues import leagues_of, load_manager, past_seasons, standings
 from fpl_manager.optimiser import (
     MAX_PLAN_WEEKS,
     POOL_SIZE,
@@ -663,7 +664,7 @@ with st.sidebar.expander("Your squad", expanded=True):
             except (ValueError, KeyError, json.JSONDecodeError) as exc:
                 st.error(f"Could not read that file: {exc}")
     elif source == "FPL entry id":
-        entry_id = st.number_input("Entry id", min_value=0, step=1, value=0)
+        entry_id = st.number_input("Entry id", min_value=0, step=1, value=0, key="sidebar_entry")
         st.caption("Only works once a deadline has passed.")
         paid = st.file_uploader(
             "Optional: squad.json, for what you paid",
@@ -693,8 +694,8 @@ with st.sidebar.expander("Your squad", expanded=True):
 # ----------------------------------------------------------------------
 status_bar(season, len(projections))
 
-build_tab, players_tab, roi_tab, fixtures_tab, transfers_tab, chips_tab = st.tabs(
-    ["Squad", "Players", "ROI", "Fixtures", "Transfers", "Chips"]
+build_tab, players_tab, roi_tab, fixtures_tab, transfers_tab, chips_tab, leagues_tab = st.tabs(
+    ["Squad", "Players", "ROI", "Fixtures", "Transfers", "Chips", "Leagues"]
 )
 
 with build_tab:
@@ -1282,3 +1283,114 @@ with chips_tab:
                 "Rotation, press conferences and minutes management are not in the API. "
                 "A gap of a point or two between gameweeks is inside the noise."
             )
+
+
+with leagues_tab:
+    st.subheader("Managers and mini leagues")
+    st.caption(
+        "Public data for any manager id, which is the number in the URL of their points page "
+        "on the FPL site. Ranks and league tables stay empty until the first gameweek has "
+        "been scored, which is how the API behaves rather than a fault here."
+    )
+
+    entry = st.number_input(
+        "Manager entry id",
+        min_value=0,
+        step=1,
+        value=int(st.session_state.get("sidebar_entry") or 0),
+        key="league_entry",
+    )
+
+    manager, history, joined = None, None, None
+    if entry:
+        # a mistyped id is an ordinary thing to do, so it reports itself rather
+        # than reaching st.stop() and taking the rest of the page with it
+        try:
+            manager = load_manager(season, int(entry))
+            history = past_seasons(season, int(entry))
+            joined = leagues_of(season, int(entry))
+        except RuntimeError as exc:
+            st.error(str(exc))
+
+    if manager is None:
+        st.info("Enter a manager id to see their record and the leagues they are in.")
+    else:
+        st.markdown(f"#### {escape(manager.name)} · {escape(manager.team_name)}")
+        m1, m2, m3 = st.columns(3)
+        m1.metric("Overall points", f"{manager.overall_points:,}")
+        m2.metric(
+            "Overall rank",
+            f"{manager.overall_rank:,}" if manager.overall_rank else "Not ranked yet",
+        )
+        m3.metric("Seasons played", manager.seasons_played)
+
+        st.divider()
+        st.caption("Previous seasons")
+        if history.empty:
+            st.info("No previous seasons. This is their first.")
+        else:
+            st.altair_chart(
+                alt.Chart(history)
+                .mark_bar(color="#00E87B", cornerRadiusEnd=3)
+                .encode(
+                    x=alt.X("season_name:N", title=None, sort=list(history["season_name"])),
+                    y=alt.Y("total_points:Q", title="Points"),
+                    tooltip=[
+                        alt.Tooltip("season_name:N", title="Season"),
+                        alt.Tooltip("total_points:Q", title="Points", format="d"),
+                        alt.Tooltip("rank:Q", title="Final rank", format=","),
+                    ],
+                )
+                .properties(height=220)
+            )
+            st.dataframe(
+                history,
+                hide_index=True,
+                width="stretch",
+                column_config={
+                    "season_name": "Season",
+                    "total_points": st.column_config.NumberColumn("Points", format="%d"),
+                    "rank": st.column_config.NumberColumn("Final rank", format="%d"),
+                },
+            )
+
+        st.divider()
+        st.caption("Their classic leagues, the ones they joined listed first")
+        if joined.empty:
+            st.info("No classic leagues on this entry.")
+        else:
+            names = {
+                f"{row['name']}{' (automatic)' if row['system'] else ''}": int(row["id"])
+                for _, row in joined.iterrows()
+            }
+            picked = st.selectbox("League table", options=list(names), key="league_pick")
+            table, info = standings(season, names[picked])
+
+            if table.empty:
+                st.info(
+                    f"{info['name']} has no table yet. Classic leagues fill in once the first "
+                    "gameweek has been scored."
+                )
+            else:
+                st.caption(f"{info['name']}, page {info['page']}")
+                st.dataframe(
+                    table,
+                    hide_index=True,
+                    width="stretch",
+                    column_config={
+                        "rank": st.column_config.NumberColumn("Rank", format="%d"),
+                        "movement": st.column_config.NumberColumn(
+                            "Moved",
+                            format="%+d",
+                            help="Places climbed since the last gameweek. Empty for a new entry.",
+                        ),
+                        "team": "Team",
+                        "manager": "Manager",
+                        "gameweek": st.column_config.NumberColumn("GW", format="%d"),
+                        "total": st.column_config.NumberColumn("Total", format="%d"),
+                        "entry_id": st.column_config.NumberColumn("Entry", format="%d"),
+                        "last_rank": None,
+                    },
+                )
+                if info["has_next"]:
+                    st.caption("Showing the first fifty. Later pages are not loaded.")

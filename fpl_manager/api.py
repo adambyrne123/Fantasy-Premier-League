@@ -124,6 +124,20 @@ class FplApi:
         """Per-gameweek results, chips used and past seasons for a manager."""
         return self._get(f"entry/{entry_id}/history/", key=f"history_{entry_id}", ttl=3600)
 
+    def league_standings(self, league_id: int, page: int = 1) -> dict:
+        """One page of a classic league table, fifty managers at a time.
+
+        Returns an empty results list until a gameweek has been scored, since
+        nobody has a rank before anyone has any points. A longer TTL than the
+        entry endpoints because a league table only moves when a gameweek is
+        published, not continuously.
+        """
+        return self._get(
+            f"leagues-classic/{league_id}/standings/?page_standings={page}",
+            key=f"league_{league_id}_{page}",
+            ttl=1800,
+        )
+
     def live(self, gameweek: int) -> dict:
         """Live points for every player in a gameweek. Short TTL by design."""
         return self._get(f"event/{gameweek}/live/", key=f"live_{gameweek}", ttl=60)
