@@ -63,7 +63,7 @@ def test_every_tab_renders(app):
     at = app.run()
     assert not at.exception
     labels = [tab.label for tab in at.tabs] if at.tabs else []
-    for expected in ["Squad", "Players", "Fixtures", "Transfers", "Chips"]:
+    for expected in ["Squad", "Players", "ROI", "Fixtures", "Transfers", "Chips"]:
         assert expected in labels
 
 
@@ -103,6 +103,19 @@ def test_choosing_an_entry_id_reruns_cleanly(app):
     at = app.run()
     at.sidebar.radio[0].set_value("FPL entry id").run()
     assert not at.exception
+
+
+def test_roi_says_nothing_before_any_points_are_scored(app):
+    at = app.run()
+    assert not at.exception
+    assert any("every return is zero" in info.value for info in at.info)
+
+
+def test_roi_ranks_players_once_points_exist(midseason_app):
+    at = midseason_app.run()
+    assert not at.exception
+    assert any("Best return" in m.label for m in at.metric)
+    assert not any("every return is zero" in info.value for info in at.info)
 
 
 def test_price_pressure_says_nothing_before_the_season(app):

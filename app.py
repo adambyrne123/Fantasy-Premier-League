@@ -30,6 +30,7 @@ from fpl_manager.optimiser import (
 )
 from fpl_manager.prices import is_dormant, movers, price_pressure
 from fpl_manager.projections import load_prior, project
+from fpl_manager.roi import LAST_SEASON, MIN_MINUTES, NOTHING_YET, points_source, roi_frame
 from fpl_manager.squad import (
     MySquad,
     load_from_entry,
@@ -152,6 +153,11 @@ def cached_prior(_season: Season) -> pd.DataFrame | None:
 @st.cache_data(show_spinner="Reading transfer activity")
 def load_prices(_season: Season) -> pd.DataFrame:
     return price_pressure(_season)
+
+
+@st.cache_data(show_spinner="Working out returns")
+def load_roi(_season: Season, projections: pd.DataFrame) -> pd.DataFrame:
+    return roi_frame(_season, projections)
 
 
 @st.cache_data(show_spinner="Projecting")
@@ -314,6 +320,7 @@ if st.sidebar.button("Refresh FPL data", width="stretch"):
     load_season.clear()
     load_projections.clear()
     load_prices.clear()
+    load_roi.clear()
     cached_prior.clear()
 st.sidebar.caption("Prices change daily. Refreshing refetches for everyone on the app.")
 
@@ -385,8 +392,8 @@ with st.sidebar.expander("Your squad", expanded=True):
 # ----------------------------------------------------------------------
 # tabs
 # ----------------------------------------------------------------------
-build_tab, players_tab, fixtures_tab, transfers_tab, chips_tab = st.tabs(
-    ["Squad", "Players", "Fixtures", "Transfers", "Chips"]
+build_tab, players_tab, roi_tab, fixtures_tab, transfers_tab, chips_tab = st.tabs(
+    ["Squad", "Players", "ROI", "Fixtures", "Transfers", "Chips"]
 )
 
 with build_tab:
@@ -539,6 +546,148 @@ with players_tab:
                 "value": st.column_config.NumberColumn("Pts per m", format="%.2f"),
             },
         )
+
+with roi_tab:
+    st.subheader("Return on investment")
+    points_from = points_source(season)
+    roi = load_roi(season, projections)
+
+    if points_from == NOTHING_YET:
+        st.info(
+            "No points have been scored yet this season, so every return is zero. "
+            "This fills in from the first gameweek onwards."
+        )
+    else:
+        whose = "last season's points" if points_from == LAST_SEASON else "this season's points"
+        st.caption(
+            f"Points divided by price, using {whose} against today's price. "
+            "The Players tab ranks by *projected* points per million, which is the "
+            "forward-looking version of the same idea. This one is what a player has "
+            "already returned."
+        )
+        if points_from == LAST_SEASON:
+            st.warning(
+                "FPL has not reset its counters for the new season yet, so these are "
+                "2025/26 totals. They will drop to zero at the first deadline and build "
+                "up again from there."
+            )
+
+        r1, r2, r3 = st.columns(3)
+        roi_pos = r1.selectbox("Position", ["All", "GKP", "DEF", "MID", "FWD"], key="roi_pos")
+        roi_max_price = r2.slider("Max price", 3.5, 16.0, 16.0, 0.1, key="roi_price")
+        min_minutes = r3.slider(
+            "Minimum minutes",
+            0,
+            2000,
+            MIN_MINUTES,
+            30,
+            help="A player can post a flattering rate off one substitute appearance. "
+            "This is how much football he has to have played to be ranked.",
+        )
+
+        roi_view = roi[(roi["price"] <= roi_max_price) & (roi["minutes"] >= min_minutes)]
+        if roi_pos != "All":
+            roi_view = roi_view[roi_view["position"] == roi_pos]
+
+        if roi_view.empty:
+            st.info("Nobody clears those filters. Try lowering the minimum minutes.")
+        else:
+            top = roi_view.iloc[0]
+            k1, k2, k3 = st.columns(3)
+            k1.metric("Best return", top["name"], f"{top['roi']:.1f} pts per m", delta_color="off")
+            k2.metric("Players ranked", len(roi_view))
+            k3.metric("Median return", f"{roi_view['roi'].median():.1f} pts per m")
+
+            chart = roi_view.head(200).reset_index()
+            present = [p for p in POSITIONS_IN_ORDER if p in set(chart["position"])]
+            scatter = (
+                alt.Chart(chart)
+                .mark_circle(opacity=0.75)
+                .encode(
+                    x=alt.X("price:Q", title="Price (m)", scale=alt.Scale(zero=False, nice=True)),
+                    y=alt.Y("points:Q", title="Points"),
+                    color=alt.Color(
+                        "position:N",
+                        title="Position",
+                        scale=alt.Scale(
+                            domain=present, range=[POSITION_COLOURS[p] for p in present]
+                        ),
+                    ),
+                    size=alt.Size("roi:Q", title="Pts per m", scale=alt.Scale(range=[25, 400])),
+                    tooltip=[
+                        alt.Tooltip("name:N", title="Player"),
+                        alt.Tooltip("club:N", title="Club"),
+                        alt.Tooltip("price:Q", title="Price", format=".1f"),
+                        alt.Tooltip("points:Q", title="Points", format="d"),
+                        alt.Tooltip("roi:Q", title="Pts per m", format=".2f"),
+                        alt.Tooltip("minutes:Q", title="Minutes", format="d"),
+                    ],
+                )
+            )
+            labels = (
+                alt.Chart(chart.nlargest(10, "roi"))
+                .mark_text(align="left", dx=9, dy=-7, fontSize=11, color="#ECE8F2")
+                .encode(x="price:Q", y="points:Q", text="name:N")
+            )
+            st.altair_chart((scatter + labels).properties(height=430).interactive())
+
+            roi_cols = ["name", "position", "club", "price", "points", "minutes", "roi"]
+            config = {
+                "name": "Player",
+                "position": "Pos",
+                "club": "Club",
+                "price": st.column_config.NumberColumn("Price", format="%.1f"),
+                "points": st.column_config.NumberColumn("Points", format="%d"),
+                "minutes": st.column_config.NumberColumn("Minutes", format="%d"),
+                "roi": st.column_config.ProgressColumn(
+                    "Pts per m",
+                    format="%.1f",
+                    min_value=0.0,
+                    max_value=float(max(roi_view["roi"].max(), 1)),
+                ),
+            }
+            if "gap" in roi_view.columns:
+                roi_cols = [*roi_cols, "projected_roi", "gap"]
+                config["projected_roi"] = st.column_config.NumberColumn(
+                    "Projected pts per m", format="%.2f"
+                )
+                config["gap"] = st.column_config.NumberColumn("Gap", format="%+.2f")
+
+            best, movers_up = st.columns([3, 2])
+            with best:
+                st.caption("Best return per million")
+                st.dataframe(
+                    roi_view.head(40)[roi_cols],
+                    hide_index=True,
+                    width="stretch",
+                    column_config=config,
+                )
+            with movers_up:
+                if "gap" in roi_view.columns:
+                    st.caption("Projected to return more than they have")
+                    st.dataframe(
+                        roi_view.nlargest(15, "gap")[["name", "position", "roi", "projected_roi"]],
+                        hide_index=True,
+                        width="stretch",
+                        column_config={
+                            "name": "Player",
+                            "position": "Pos",
+                            "roi": st.column_config.NumberColumn("Returned", format="%.1f"),
+                            "projected_roi": st.column_config.NumberColumn(
+                                "Projected", format="%.2f"
+                            ),
+                        },
+                    )
+                    st.caption(
+                        "A large gap is someone the model likes more than his record does, "
+                        "which is what an injury or a new signing looks like."
+                    )
+
+            st.caption(
+                "Price is today's price, not what anyone paid. A player who has risen "
+                "scores worse here than he did for whoever bought him early, which is "
+                "right for deciding what to buy now and unfair as a verdict on the buy."
+            )
 
 with fixtures_tab:
     st.subheader(f"Fixture ticker, next {horizon} gameweeks")
