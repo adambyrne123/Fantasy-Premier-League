@@ -161,6 +161,14 @@ per club per fixture, so a club with two fixtures in a gameweek gets two rows
 and a club with none gets zero. Do not add special casing. If you find yourself
 writing `if is_double_gameweek`, the design has gone wrong.
 
+`Season.gameweek_shape` is the one exception, because naming them is the point
+of it rather than an accident of the arithmetic. It is also the only reader here
+that keeps finished fixtures: a club that has played the first leg of a double
+still has a double, and dropping played fixtures halfway through a gameweek
+would report every club that had already kicked off as blanking. It skips
+gameweeks with no fixtures at all, or the far end of the horizon reads as twenty
+clubs blanking at once.
+
 **`total_points` changes meaning at the season rollover.** Before the first
 deadline the API still serves the previous season's totals, so in early August
 `total_points` is last season's return and a week later it is this season's,
