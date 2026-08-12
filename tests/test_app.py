@@ -73,6 +73,123 @@ def test_squad_summary_is_shown(app):
     assert any("Squad cost" in m.label for m in at.metric)
 
 
+def _status_bar(at):
+    """The rendered strip, not the stylesheet that also mentions the class."""
+    return next(m.value for m in at.markdown if '<div class="statusbar">' in m.value)
+
+
+def _pool(at):
+    """The player pool table, found by the fixture run only it carries."""
+    return next(
+        d.value for d in at.dataframe if any(str(c).startswith("GW") for c in d.value.columns)
+    )
+
+
+def test_the_status_bar_carries_the_deadline_and_the_data_age(midseason_app):
+    """Neither was on screen anywhere before, and they are what say whether the
+    projections are still worth acting on."""
+    at = midseason_app.run()
+    assert not at.exception
+    bar = _status_bar(at)
+    assert "Deadline" in bar
+    assert "FPL data" in bar
+
+
+def test_the_status_bar_survives_a_season_with_no_deadline_left(app):
+    """`next_deadline` is None once the last gameweek is done, and the strip has
+    to render anyway rather than formatting None into a date."""
+    at = app.run()
+    assert not at.exception
+    assert "Gameweek" in _status_bar(at)
+
+
+def test_the_pool_shows_each_player_s_fixture_run(app):
+    """The run has to sit beside the numbers, or comparing two players means
+    holding the Fixtures tab in your head."""
+    at = app.run()
+    assert not at.exception
+    pool = _pool(at)
+    horizon = at.sidebar.slider[0].value
+    assert sum(str(c).startswith("GW") for c in pool.columns) == horizon
+
+
+def test_home_and_away_are_distinguished_by_case(app):
+    """Upper case at home, lower case away, which is what saves the table a
+    legend. A run that is all one case means the encoding has been lost."""
+    at = app.run()
+    gw_cols = [c for c in _pool(at).columns if str(c).startswith("GW")]
+    runs = _pool(at)[gw_cols].to_numpy().ravel()
+    played = [str(v) for v in runs if str(v) not in {"—", "nan"}]
+    assert any(v.isupper() for v in played)
+    assert any(v.islower() for v in played)
+
+
+@pytest.mark.parametrize("view", ["Model terms", "Form and attack", "Availability"])
+def test_every_stat_view_renders(midseason_app, view):
+    """Each view names a different set of columns, and one that does not exist
+    on the frame is an exception rather than a missing column."""
+    at = midseason_app.run()
+    at.segmented_control[0].set_value(view).run()
+    assert not at.exception
+    assert any(str(c).startswith("GW") for c in _pool(at).columns), "the run should survive"
+
+
+def test_filtering_to_nothing_leaves_the_other_tabs_alone(app):
+    """An empty result is an ordinary thing to do. Reaching st.stop() here
+    would blank the four tabs below it."""
+    at = app.run()
+    at.text_input[0].set_value("no such player anywhere").run()
+    assert not at.exception
+    assert any("Nothing matches" in info.value for info in at.info)
+    assert any("Squad cost" in m.label for m in at.metric), "the Squad tab should still render"
+
+
+def test_the_pool_says_how_much_it_is_hiding(app):
+    """It used to cut silently to forty rows with nothing on screen saying so."""
+    at = app.run()
+    assert any("Showing" in c.value and "players" in c.value for c in at.caption)
+
+
+def _select_row(at, row=0):
+    """Pick a row in the pool table.
+
+    A dataframe selection is a click on a canvas, which AppTest cannot do, so
+    this writes the widget state Streamlit would have written. It has to be a
+    fresh dict rather than a mutation, since widget state is read only.
+    """
+    at.session_state["pool"] = {"selection": {"rows": [row], "columns": []}}
+    return at.run()
+
+
+def test_selecting_a_player_shows_the_working_behind_his_projection(midseason_app):
+    """A total says nothing about which of the three terms produced it, which
+    is the whole reason the drill-down exists."""
+    at = _select_row(midseason_app.run())
+    assert not at.exception
+    labels = [m.label for m in at.get("dialog")[0].metric]
+    assert "Points per 90" in labels
+    assert "Expected minutes" in labels
+    assert any(label.startswith("Projected") for label in labels)
+
+
+def test_the_drill_down_says_so_when_there_is_no_current_sample(app):
+    """`current_p90` is NaN before a ball is kicked, and formatting that into a
+    rate would print nan at the reader instead of saying there is no sample."""
+    at = _select_row(app.run())
+    assert not at.exception
+    assert any("no sample yet" in c.value for c in at.get("dialog")[0].caption)
+
+
+def test_clearing_the_selection_allows_the_drill_down_to_reopen(midseason_app):
+    """The guard that stops the dialog reopening on every rerun has to reset,
+    or a player can only ever be inspected once."""
+    at = _select_row(midseason_app.run())
+    assert at.session_state["inspected"] is not None
+    at.session_state["pool"] = {"selection": {"rows": [], "columns": []}}
+    at.run()
+    assert at.session_state["inspected"] is None
+
+
 def test_changing_horizon_reruns_cleanly(app):
     at = app.run()
     at.sidebar.slider[0].set_value(10).run()

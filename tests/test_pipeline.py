@@ -41,6 +41,35 @@ def test_fixture_ticker_covers_every_club(season: Season):
     assert ticker["avg_difficulty"].between(1, 5).all()
 
 
+def test_next_deadline_belongs_to_the_next_gameweek(season: Season):
+    """The status bar puts the two side by side, so a deadline lifted from a
+    different event than the gameweek shown next would be worse than none."""
+    deadline = season.next_deadline
+    assert deadline is not None
+    assert deadline == season.events.loc[season.next_gameweek, "deadline_time"]
+
+
+def test_fetched_at_reports_nothing_before_a_fetch(tmp_path):
+    """A cold cache has no age to report, and inventing one would tell the user
+    the numbers on screen are fresher than they are."""
+    from fpl_manager.api import FplApi
+
+    api = FplApi(cache_dir=tmp_path)
+    assert api.fetched_at("bootstrap") is None
+
+
+def test_fetched_at_reads_the_cache_file(tmp_path):
+    from datetime import UTC, datetime
+
+    from fpl_manager.api import FplApi
+
+    api = FplApi(cache_dir=tmp_path)
+    (tmp_path / "bootstrap.json").write_text("{}")
+    fetched = api.fetched_at("bootstrap")
+    assert fetched is not None
+    assert abs((datetime.now(UTC) - fetched).total_seconds()) < 60
+
+
 def test_team_fixtures_emits_one_row_per_fixture(season: Season):
     """Doubles and blanks fall out of the row count, with no special casing."""
     horizon = 4
