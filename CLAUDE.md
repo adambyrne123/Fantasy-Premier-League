@@ -55,6 +55,7 @@ api.py  ──▶  data.py  ──▶  projections.py  ──▶  optimiser.py  
 | `optimiser.py` | MILP formulation and solving, single week and multi. | Anything that fetches or estimates |
 | `chips.py` | What a chip is worth, and in which gameweek. | New MILP formulations, which go in `optimiser.py` |
 | `prices.py` | Who is close to a price rise or fall. | Anything the points model reads |
+| `roi.py` | Points already returned per million. | Projections, which look forward |
 | `squad.py` | Loading the user's 15, bank, selling prices. | Projections or optimisation |
 | `cli.py` | Argument parsing and printing. | Model logic of any kind |
 | `app.py` | Streamlit view: widgets, layout, caching. | Model logic of any kind |
@@ -158,6 +159,14 @@ one.
 per club per fixture, so a club with two fixtures in a gameweek gets two rows
 and a club with none gets zero. Do not add special casing. If you find yourself
 writing `if is_double_gameweek`, the design has gone wrong.
+
+**`total_points` changes meaning at the season rollover.** Before the first
+deadline the API still serves the previous season's totals, so in early August
+`total_points` is last season's return and a week later it is this season's,
+with no schema change to notice. `roi.points_source` decides which by reading
+the data rather than the calendar, because the reset does not line up neatly
+with `gameweeks_played`. Anything new that divides by or ranks on
+`total_points` has the same problem and should go through it.
 
 **Pre-season means no current data.** `gameweeks_played` is 0 until late August,
 so the shrinkage weight is 0 and projections rest entirely on last season. Any
