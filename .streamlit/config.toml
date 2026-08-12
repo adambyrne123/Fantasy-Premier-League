@@ -1,0 +1,12 @@
+# Dark, purple tinted, with FPL's green as the accent. The default Streamlit red
+# reads as an error state, which is the wrong signal on a page full of numbers
+# you are meant to like.
+[theme]
+base = "dark"
+primaryColor = "#00E87B"
+backgroundColor = "#14101C"
+secondaryBackgroundColor = "#1F1830"
+textColor = "#ECE8F2"
+
+[server]
+headless = true

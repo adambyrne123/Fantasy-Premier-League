@@ -1,0 +1,17 @@
+# Environments
+.venv/
+
+# Python
+__pycache__/
+*.py[cod]
+
+# Tooling caches
+.pytest_cache/
+.ruff_cache/
+
+# Machine local Claude Code permissions
+.claude/settings.local.json
+
+# The user's own squad, which changes every gameweek and is not project data.
+# app.py takes a squad by upload or entry id, so nothing in the deploy reads it.
+squad.json
