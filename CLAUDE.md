@@ -57,6 +57,7 @@ api.py  ──▶  data.py  ──▶  projections.py  ──▶  optimiser.py  
 | `prices.py` | Who is close to a price rise or fall. | Anything the points model reads |
 | `roi.py` | Points already returned per million. | Projections, which look forward |
 | `squad.py` | Loading the user's 15, bank, selling prices. | Projections or optimisation |
+| `leagues.py` | Public manager profiles and classic league tables. | Anything that scores or ranks players |
 | `cli.py` | Argument parsing and printing. | Model logic of any kind |
 | `app.py` | Streamlit view: widgets, layout, caching. | Model logic of any kind |
 
@@ -307,6 +308,23 @@ speculatively.
 
 ## Not built yet
 
+- Live scoring, and the provisional bonus that goes with it. `leagues.py` reads
+  manager profiles, past seasons and classic league tables, but nothing scores
+  a gameweek in progress. `FplApi.live` exists and is unused.
+
+  The reason it is not built is that it cannot be tested yet. The API serves
+  only the current season, so before the first kickoff `event/{gw}/live/`
+  returns zero elements and no classic league has a single standings row. That
+  also means the row keys inside a league table are the one shape in
+  `leagues.py` that was never read off the live API, which is why `standings`
+  keeps the columns it finds rather than assuming any of them are there.
+
+  When it is built, the thing worth knowing is that picks are immutable once a
+  deadline passes. Only `event/{gw}/live/` needs a short TTL, so a twenty
+  manager league costs twenty long cached requests fetched once per gameweek
+  rather than twenty on every rerun. Provisional bonus means ranking each
+  fixture's players by `bps` and awarding 3, 2 and 1, which is model logic and
+  belongs in a module, not in `app.py`.
 - Chips are advisory only, in `chips.py`. Bench Boost, Triple Captain and Free
   Hit are priced per gameweek across the horizon, and wildcard is still `build`
   at current budget. What is missing is planning two chips together, and any

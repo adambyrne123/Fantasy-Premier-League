@@ -28,6 +28,13 @@ def _app(monkeypatch, tmp_path, played: int):
     fake = FakeApi(played=played)
     monkeypatch.setattr(api.FplApi, "bootstrap", lambda self: fake.bootstrap())
     monkeypatch.setattr(api.FplApi, "fixtures", lambda self: fake.fixtures())
+    # the Leagues tab reads these three, and leaving them on the catch-all
+    # below would hand it an empty payload and quietly test nothing
+    monkeypatch.setattr(api.FplApi, "entry", lambda self, e: fake.entry(e))
+    monkeypatch.setattr(api.FplApi, "entry_history", lambda self, e: fake.entry_history(e))
+    monkeypatch.setattr(
+        api.FplApi, "league_standings", lambda self, lid, page=1: fake.league_standings(lid, page)
+    )
     monkeypatch.setattr(api.FplApi, "_get", lambda self, *a, **kw: {})
 
     from fpl_manager.data import Season
@@ -64,8 +71,60 @@ def test_every_tab_renders(app):
     at = app.run()
     assert not at.exception
     labels = [tab.label for tab in at.tabs] if at.tabs else []
-    for expected in ["Squad", "Players", "ROI", "Fixtures", "Transfers", "Chips"]:
+    for expected in ["Squad", "Players", "ROI", "Fixtures", "Transfers", "Chips", "Leagues"]:
         assert expected in labels
+
+
+def _leagues_entry(at):
+    return next(n for n in at.number_input if n.key == "league_entry")
+
+
+def test_the_leagues_tab_asks_before_it_fetches(app):
+    """Nothing should be requested for a manager nobody has named."""
+    at = app.run()
+    assert not at.exception
+    assert any("Enter a manager id" in info.value for info in at.info)
+
+
+def test_a_manager_id_shows_their_record(midseason_app):
+    at = midseason_app.run()
+    _leagues_entry(at).set_value(1).run()
+    assert not at.exception
+    labels = [m.label for m in at.metric]
+    assert "Overall points" in labels
+    assert "Overall rank" in labels
+
+
+def test_an_unranked_manager_reads_as_unranked_not_as_first(app):
+    """Pre-season the API sends a null rank, and formatting that as a number
+    would put every manager top of the world."""
+    at = app.run()
+    _leagues_entry(at).set_value(1).run()
+    assert not at.exception
+    rank = next(m for m in at.metric if m.label == "Overall rank")
+    assert rank.value == "Not ranked yet"
+
+
+def test_an_empty_league_table_says_so(app):
+    """The real endpoint returns no rows until a gameweek is scored."""
+    at = app.run()
+    _leagues_entry(at).set_value(1).run()
+    assert not at.exception
+    assert any("no table yet" in info.value for info in at.info)
+
+
+def test_a_bad_manager_id_is_an_error_not_a_traceback(app, monkeypatch):
+    at = app.run()
+    from fpl_manager import leagues as leagues_module
+
+    def boom(*args, **kwargs):
+        raise RuntimeError("Could not read the manager for id 42. Check the id is right.")
+
+    monkeypatch.setattr(leagues_module, "load_manager", boom)
+    _leagues_entry(at).set_value(42).run()
+    assert not at.exception
+    assert any("Check the id is right" in e.value for e in at.error)
+    assert any("Squad cost" in m.label for m in at.metric), "other tabs should survive"
 
 
 def test_squad_summary_is_shown(app):
