@@ -121,6 +121,30 @@ class MySquad:
         """Owned ids the projections do not know about, for warning on."""
         return [i for i in self.player_ids if i not in projections.index]
 
+    def unpriced(self) -> list[int]:
+        """Owned ids with no selling price, so valued at today's price.
+
+        The optimiser assumes current price for these, which overstates what
+        you could raise by selling them. Front ends use this to say so rather
+        than quietly planning with money that is not there.
+        """
+        known = self._selling_prices
+        return [i for i in self.player_ids if i not in known]
+
+    @classmethod
+    def from_frame(cls, frame: pd.DataFrame) -> MySquad:
+        """A squad from a built 15, priced at what it would cost today.
+
+        Today's price is the right purchase price at the moment you make the
+        transfer and drifts from then on, which is the same assumption
+        `write_squad_file` documents. It exists so a freshly built squad can be
+        written out with its money intact.
+        """
+        return cls(
+            player_ids=[int(i) for i in frame.index],
+            purchase_prices={int(i): int(cost) for i, cost in frame["now_cost"].items()},
+        )
+
 
 # ----------------------------------------------------------------------
 # squad files
@@ -139,9 +163,9 @@ def _to_tenths(value) -> int:
 def _parse_players(raw) -> tuple[list[int], dict[int, int], dict[int, int]]:
     """Accept either a list of ids or a list of objects carrying prices.
 
-    The bare list exists because the app's download button writes one and
-    because it is the least tedious thing to type by hand. The object form is
-    the one worth keeping, since it carries the money.
+    The bare list is the least tedious thing to type by hand, and files the app
+    downloaded before it started writing prices are still in that form. The
+    object form is the one worth keeping, since it carries the money.
     """
     ids: list[int] = []
     purchases: dict[int, int] = {}
@@ -161,26 +185,22 @@ def _parse_players(raw) -> tuple[list[int], dict[int, int], dict[int, int]]:
     return ids, purchases, selling
 
 
-def load_squad_file(path: Path | str, season: Season | None = None) -> MySquad:
-    """Read a squad from disk.
+def parse_squad(payload, season: Season | None = None) -> MySquad:
+    """Build a squad from already-read JSON.
 
-    Passing a season resolves selling prices immediately. Without one the squad
-    still loads and the optimiser falls back to current prices.
+    Separate from `load_squad_file` because an upload arrives as bytes, and a
+    web front end serving several people at once must not stage it through a
+    file on the server. Passing a season resolves selling prices immediately.
+    Without one the squad still loads and the optimiser falls back to current
+    prices.
     """
-    path = Path(path)
-    if not path.exists():
-        raise FileNotFoundError(
-            f"No squad file at {path}. Create one with `fpl-manager build --save {path.name}`."
-        )
-
-    payload = json.loads(path.read_text())
     if isinstance(payload, list):
         payload = {"players": payload}
 
     raw_players = payload.get("players") or payload.get("player_ids") or []
     ids, purchases, selling = _parse_players(raw_players)
     if not ids:
-        raise ValueError(f"{path} lists no players.")
+        raise ValueError("That squad lists no players.")
 
     bank = payload.get("bank_tenths")
     if bank is None and payload.get("bank") is not None:
@@ -200,14 +220,26 @@ def load_squad_file(path: Path | str, season: Season | None = None) -> MySquad:
     return squad
 
 
-def write_squad_file(path: Path | str, squad: MySquad, season: Season | None = None) -> Path:
-    """Write a squad to disk in the form `load_squad_file` reads back.
+def load_squad_file(path: Path | str, season: Season | None = None) -> MySquad:
+    """Read a squad from disk."""
+    path = Path(path)
+    if not path.exists():
+        raise FileNotFoundError(
+            f"No squad file at {path}. Create one with `fpl-manager build --save {path.name}`."
+        )
+    try:
+        return parse_squad(json.loads(path.read_text()), season)
+    except ValueError as exc:
+        raise ValueError(f"{path}: {exc}") from exc
+
+
+def squad_payload(squad: MySquad, season: Season | None = None) -> dict:
+    """A squad as the JSON `parse_squad` reads back.
 
     Purchase prices default to today's price, which is correct at the moment
     you make the transfer and drifts from then on. That is the intended use:
     save when you buy, not weeks later.
     """
-    path = Path(path)
     players_frame = season.players if season is not None else None
 
     players = []
@@ -226,15 +258,20 @@ def write_squad_file(path: Path | str, squad: MySquad, season: Season | None = N
             entry["selling_price"] = round(squad.explicit_selling[pid] / 10, 1)
         players.append(entry)
 
-    payload = {
+    return {
         "entry_id": squad.entry_id,
         "gameweek": squad.gameweek or (season.next_gameweek if season is not None else None),
         "bank": round(squad.bank_tenths / 10, 1),
         "free_transfers": int(squad.free_transfers),
         "players": players,
     }
+
+
+def write_squad_file(path: Path | str, squad: MySquad, season: Season | None = None) -> Path:
+    """Write a squad to disk in the form `load_squad_file` reads back."""
+    path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(payload, indent=2))
+    path.write_text(json.dumps(squad_payload(squad, season), indent=2))
     return path
 
 
@@ -314,6 +351,28 @@ def load_from_entry(season: Season, entry_id: int, gameweek: int | None = None) 
     )
 
 
+def merge_prices(squad: MySquad, saved: MySquad, season: Season | None = None) -> MySquad:
+    """Take what you paid from a squad file into a squad read from an entry.
+
+    The entry knows who you own, the file is the only source of what you paid
+    for them. Prices for players you no longer hold are dropped, so an out of
+    date file contributes what it still can rather than being rejected whole.
+
+    Both front ends go through this so they cannot disagree about how the two
+    sources combine.
+    """
+    held = set(squad.player_ids)
+    squad.purchase_prices = {
+        pid: paid for pid, paid in saved.purchase_prices.items() if pid in held
+    }
+    squad.explicit_selling = {
+        pid: sell for pid, sell in saved.explicit_selling.items() if pid in held
+    }
+    if season is not None:
+        squad.resolve_selling_prices(season)
+    return squad
+
+
 def load_squad(
     season: Season, path: Path | str | None = None, entry_id: int | None = None
 ) -> MySquad:
@@ -327,16 +386,7 @@ def load_squad(
         try:
             squad = load_from_entry(season, entry_id)
             if path and Path(path).exists():
-                # the entry knows who you own, the file is the only source of
-                # what you paid for them
-                saved = load_squad_file(path)
-                held = set(squad.player_ids)
-                squad.purchase_prices = {
-                    pid: paid for pid, paid in saved.purchase_prices.items() if pid in held
-                }
-                squad.explicit_selling = {
-                    pid: sell for pid, sell in saved.explicit_selling.items() if pid in held
-                }
+                merge_prices(squad, load_squad_file(path))
             squad.resolve_selling_prices(season)
             return squad
         except (RuntimeError, ValueError):

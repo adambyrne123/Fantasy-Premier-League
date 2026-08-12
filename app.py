@@ -9,6 +9,7 @@ this app can never disagree about what the best squad is.
 
 from __future__ import annotations
 
+import json
 from html import escape
 
 import altair as alt
@@ -18,13 +19,28 @@ import streamlit as st
 from fpl_manager.api import FplApi
 from fpl_manager.chips import best_per_chip
 from fpl_manager.chips import evaluate as evaluate_chips
-from fpl_manager.data import Season
-from fpl_manager.optimiser import build_squad, pick_xi, suggest_transfers
-from fpl_manager.projections import PRIOR_CACHE, load_prior, project
-from fpl_manager.squad import load_from_entry, load_squad_file
+from fpl_manager.data import MAX_PER_CLUB, Season
+from fpl_manager.optimiser import (
+    MAX_PLAN_WEEKS,
+    POOL_SIZE,
+    build_squad,
+    pick_xi,
+    plan_transfers,
+    suggest_transfers,
+)
+from fpl_manager.prices import is_dormant, movers, price_pressure
+from fpl_manager.projections import load_prior, project
+from fpl_manager.squad import (
+    MySquad,
+    load_from_entry,
+    merge_prices,
+    parse_squad,
+    squad_payload,
+)
 
 st.set_page_config(page_title="FPL Manager", page_icon="⚽", layout="wide")
 
+CACHE_TTL = 6 * 3600
 SQUAD_COLS = ["name", "position", "club", "price", "xpts_next", "xpts_total", "ownership"]
 POSITIONS_IN_ORDER = ("GKP", "DEF", "MID", "FWD")
 POSITION_COLOURS = {"GKP": "#FFB020", "DEF": "#00C2FF", "MID": "#00E87B", "FWD": "#FF4D6D"}
@@ -115,13 +131,27 @@ def load_season(refresh_token: int) -> Season:
     """Season holds an HTTP session, so it is a resource rather than data.
 
     `refresh_token` exists only to give the cache something to invalidate on.
+
+    The forced refresh lasts only as long as construction, which is where the
+    two calls worth refreshing happen. Leaving ttl at 0 afterwards would make
+    every later call through this season skip the disk cache, and since the
+    season is a shared resource that would be every visitor's entry lookup, not
+    just the one who pressed the button.
     """
-    return Season(FplApi(ttl=0 if refresh_token else 6 * 3600))
+    api = FplApi(ttl=0 if refresh_token else CACHE_TTL)
+    season = Season(api)
+    api.ttl = CACHE_TTL
+    return season
 
 
 @st.cache_data(show_spinner="Fetching last season's totals, this takes a few minutes")
 def cached_prior(_season: Season) -> pd.DataFrame | None:
     return load_prior(_season)
+
+
+@st.cache_data(show_spinner="Reading transfer activity")
+def load_prices(_season: Season) -> pd.DataFrame:
+    return price_pressure(_season)
 
 
 @st.cache_data(show_spinner="Projecting")
@@ -277,9 +307,15 @@ st.sidebar.title("FPL Manager")
 if "refresh_token" not in st.session_state:
     st.session_state.refresh_token = 0
 if st.sidebar.button("Refresh FPL data", width="stretch"):
+    # Streamlit's caches are process wide and there is no per-session clear, so
+    # this refetches for everyone using the app, not just whoever clicked. Clear
+    # the three functions that hold FPL data rather than every cache there is.
     st.session_state.refresh_token += 1
-    st.cache_resource.clear()
-    st.cache_data.clear()
+    load_season.clear()
+    load_projections.clear()
+    load_prices.clear()
+    cached_prior.clear()
+st.sidebar.caption("Prices change daily. Refreshing refetches for everyone on the app.")
 
 with st.sidebar.expander("Projection", expanded=True):
     horizon = st.slider("Gameweeks to project over", 1, 12, 6)
@@ -316,21 +352,29 @@ with st.sidebar.expander("Your squad", expanded=True):
     if source == "squad.json":
         upload = st.file_uploader("squad.json", type="json")
         if upload:
-            saved = PRIOR_CACHE.parent / "uploaded_squad.json"
-            saved.parent.mkdir(parents=True, exist_ok=True)
-            saved.write_bytes(upload.getvalue())
             try:
-                my_squad = load_squad_file(saved, season)
-            except (ValueError, KeyError) as exc:
+                my_squad = parse_squad(json.loads(upload.getvalue()), season)
+            except (ValueError, KeyError, json.JSONDecodeError) as exc:
                 st.error(f"Could not read that file: {exc}")
     elif source == "FPL entry id":
         entry_id = st.number_input("Entry id", min_value=0, step=1, value=0)
         st.caption("Only works once a deadline has passed.")
+        paid = st.file_uploader(
+            "Optional: squad.json, for what you paid",
+            type="json",
+            help="The entry publishes who you own and your bank, but never what you paid, "
+            "which is what selling prices are worked out from.",
+        )
         if entry_id:
             try:
                 my_squad = load_from_entry(season, int(entry_id))
-            except Exception as exc:
+                if paid:
+                    merge_prices(my_squad, parse_squad(json.loads(paid.getvalue())), season)
+                else:
+                    my_squad.resolve_selling_prices(season)
+            except (RuntimeError, ValueError, KeyError, json.JSONDecodeError) as exc:
                 st.error(f"Could not load that entry: {exc}")
+                my_squad = None
 
     if my_squad is not None:
         missing = my_squad.missing_from(projections)
@@ -373,9 +417,11 @@ with build_tab:
 
     st.download_button(
         "Download as squad.json",
-        data=pd.Series({"players": [int(i) for i in result.squad.index]}).to_json(),
+        data=json.dumps(squad_payload(MySquad.from_frame(result.squad), season), indent=2),
         file_name="squad.json",
         mime="application/json",
+        help="Carries what each player costs today, which is what you paid if you buy "
+        "them now. Upload it back to plan transfers with the right selling prices.",
     )
 
 with players_tab:
@@ -428,6 +474,53 @@ with players_tab:
     )
     st.altair_chart((dots + tags).properties(height=430).interactive())
 
+    st.divider()
+    st.subheader("Price pressure")
+    pressure = load_prices(season)
+    if is_dormant(pressure):
+        st.info(
+            "No transfers have been made yet this gameweek, so there is nothing to read. "
+            "This fills in once the season is under way."
+        )
+    else:
+        st.caption(
+            "Net transfers this gameweek as a share of the players who already own them, "
+            "which is roughly what FPL's undisclosed thresholds scale with. It is a running "
+            "total rather than a rate, and the counters reset at the daily price update, so "
+            "read it as a shortlist to check rather than a forecast."
+        )
+        rising, falling = st.columns(2)
+        for column, direction, heading in (
+            (rising, "rise", "Closest to rising"),
+            (falling, "fall", "Closest to falling"),
+        ):
+            with column:
+                st.caption(heading)
+                moving = movers(pressure, direction, top=10)
+                if moving.empty:
+                    st.caption("Nobody, on current numbers.")
+                    continue
+                st.dataframe(
+                    moving[["name", "position", "club", "price", "net_transfers", "pressure"]],
+                    hide_index=True,
+                    width="stretch",
+                    column_config={
+                        "name": "Player",
+                        "position": "Pos",
+                        "club": "Club",
+                        "price": st.column_config.NumberColumn("Price", format="%.1f"),
+                        "net_transfers": st.column_config.NumberColumn(
+                            "Net transfers", format="%d"
+                        ),
+                        "pressure": st.column_config.NumberColumn("Pressure", format="%.2f"),
+                    },
+                )
+        st.caption(
+            "Price moves are not in the projection. A rise is worth chasing only if you "
+            "wanted the player anyway."
+        )
+
+    st.divider()
     ranked, best_value = st.columns([3, 2])
     with ranked:
         st.caption(f"Ranked by {sort_by.replace('_', ' ')}")
@@ -493,20 +586,38 @@ with transfers_tab:
     if squad is None:
         st.info("Load your squad in the sidebar to see suggested moves.")
     else:
+        unpriced = squad.unpriced()
+        if unpriced:
+            st.warning(
+                f"No purchase price for {len(unpriced)} of {len(squad.player_ids)} players, "
+                "so they are valued at today's price. FPL pays back what you paid plus half "
+                "of any rise, so this overstates what you can raise by selling them and the "
+                "plan below may not be affordable. Load a squad.json to fix it."
+            )
+
         t1, t2, t3 = st.columns(3)
         bank = t1.number_input("Bank (m)", 0.0, 20.0, squad.bank_tenths / 10, 0.1)
         free = t2.number_input("Free transfers", 0, 5, squad.free_transfers)
         max_moves = t3.number_input("Max transfers to consider", 1, 5, 2)
 
-        plan = suggest_transfers(
-            projections,
-            current_ids=squad.player_ids,
-            selling_prices=squad.selling_prices,
-            bank_tenths=round(bank * 10),
-            free_transfers=int(free),
-            max_transfers=int(max_moves),
-            bench_weight=bench_weight,
-        )
+        try:
+            plan = suggest_transfers(
+                projections,
+                current_ids=squad.player_ids,
+                selling_prices=squad.selling_prices,
+                bank_tenths=round(bank * 10),
+                free_transfers=int(free),
+                max_transfers=int(max_moves),
+                bench_weight=bench_weight,
+            )
+        except RuntimeError as exc:
+            # an illegal squad has no legal plan to reach, and anyone can upload
+            # a hand-edited file, so this must not be a traceback
+            st.error(
+                f"{exc}. Check the squad is fifteen players, with no more than "
+                f"{MAX_PER_CLUB} from any one club."
+            )
+            st.stop()
 
         # squad.frame drops ids the projections no longer know about, which a
         # plain .loc would raise on once a player leaves the game mid-season
@@ -535,6 +646,72 @@ with transfers_tab:
                         f"({coming['club']}, {coming['price']:.1f}m), "
                         f"{coming['xpts_total'] - going['xpts_total']:+.1f} pts over the horizon"
                     )
+
+        st.divider()
+        if st.toggle(
+            "Plan across several gameweeks",
+            help="Solves the weeks as one problem instead of one week at a time, so it can "
+            "roll a free transfer or take a small loss now to reach a player later. Takes a "
+            "second or two.",
+        ):
+            p1, p2 = st.columns(2)
+            plan_weeks = p1.slider("Gameweeks to plan", 2, min(MAX_PLAN_WEEKS, horizon), 3)
+            per_week = p2.slider("Transfers per week at most", 1, 2, 1)
+
+            try:
+                with st.spinner("Planning"):
+                    route = plan_transfers(
+                        projections,
+                        by_gameweek,
+                        current_ids=squad.player_ids,
+                        selling_prices=squad.selling_prices,
+                        bank_tenths=round(bank * 10),
+                        free_transfers=int(free),
+                        weeks=int(plan_weeks),
+                        max_transfers_per_week=int(per_week),
+                        bench_weight=bench_weight,
+                    )
+            except (RuntimeError, ValueError) as exc:
+                st.error(f"Could not plan those gameweeks: {exc}")
+                st.stop()
+
+            m1, m2, m3 = st.columns(3)
+            m1.metric(f"Projected over {plan_weeks} GW", f"{route.projected:.0f} pts")
+            m2.metric("Transfers", route.transfers)
+            m3.metric("Hits", f"{route.hits * 4} pts", delta_color="off")
+
+            for week in route.weeks:
+                with st.container(border=True):
+                    head, money = st.columns([3, 1])
+                    hit = f" · {week.hits * 4} point hit" if week.hits else ""
+                    head.markdown(
+                        f"**GW{week.event}** · captain {escape(str(week.captain['name']))}{hit}"
+                    )
+                    money.caption(f"{week.bank:.1f}m in bank · {week.free_transfers} free")
+                    if week.transfers_in.empty:
+                        st.caption("No move. Roll the transfer.")
+                        continue
+                    for (_, going), (_, coming) in zip(
+                        week.transfers_out.iterrows(), week.transfers_in.iterrows(), strict=False
+                    ):
+                        st.markdown(
+                            f"**{escape(str(going['name']))}** ({going['club']}) → "
+                            f"**{escape(str(coming['name']))}** ({coming['club']}, "
+                            f"{coming['price']:.1f}m)"
+                        )
+
+            st.caption(
+                f"Chosen from the best {POOL_SIZE} or so players by projection plus everyone "
+                "you own, not the whole game, because every extra week multiplies the solve. "
+                "Prices are held at today's, so the bank shown for the last week is a rougher "
+                "number than the one shown for the first."
+                + (
+                    " Some of your selling prices are unknown, which makes that worse the "
+                    "further ahead it plans."
+                    if route.approximate_money
+                    else ""
+                )
+            )
 
         st.divider()
         before, after = st.columns(2)

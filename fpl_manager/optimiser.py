@@ -22,6 +22,38 @@ import pulp
 from .data import BUDGET_TENTHS, MAX_PER_CLUB, SQUAD_LIMITS, XI_MAX, XI_MIN
 
 TRANSFER_COST = 4
+MAX_FREE_TRANSFERS = 5
+
+# How many candidates a multi-week plan considers. Every week multiplies the
+# binary variables, so this is the dial that decides whether the solve returns
+# in the time a slider can wait. See `planning_pool` for what it costs.
+POOL_SIZE = 140
+MIN_POOL_PER_POSITION = 10
+
+# Measured against the real season on a 140 player pool: three weeks solves in
+# about 0.7s and four in about 1.5s, but five jumps to five or six seconds,
+# which is past what a slider can re-solve on. Pool size barely moves any of
+# those numbers, so the week count is the dial that matters and this is where
+# it stops being interactive.
+MAX_PLAN_WEEKS = 4
+
+
+def gameweek_frame(
+    projections: pd.DataFrame, by_gameweek: pd.DataFrame, event: int, ids: list[int] | None = None
+) -> pd.DataFrame:
+    """Projections for one gameweek, as a column the optimiser can maximise.
+
+    A club with two fixtures contributes twice and a club with none contributes
+    nothing, because `by_gameweek` already holds one row per fixture. That is
+    why doubles and blanks need no special casing here either.
+    """
+    points = by_gameweek[by_gameweek["event"] == event].groupby("id")["xpts"].sum()
+    frame = (
+        projections if ids is None else projections.loc[[i for i in ids if i in projections.index]]
+    )
+    frame = frame.copy()
+    frame["xpts_gw"] = points.reindex(frame.index).fillna(0.0)
+    return frame
 
 
 @lru_cache(maxsize=1)
@@ -81,14 +113,21 @@ def _base_problem(
     points_col: str,
     bench_weight: float,
     captain_col: str | None,
+    prob: pulp.LpProblem | None = None,
+    suffix: str = "",
 ):
-    """Shared variables and constraints for any 15-man squad selection."""
-    ids = list(pool.index)
-    prob = pulp.LpProblem("fpl_squad", pulp.LpMaximize)
+    """Shared variables and constraints for any 15-man squad selection.
 
-    x = pulp.LpVariable.dicts("pick", ids, cat="Binary")
-    y = pulp.LpVariable.dicts("start", ids, cat="Binary")
-    c = pulp.LpVariable.dicts("captain", ids, cat="Binary")
+    Pass an existing `prob` and a `suffix` to add another week's worth of squad
+    to one problem, which is what the multi-week planner does. Variable names
+    have to differ between weeks or PuLP silently reuses the same column.
+    """
+    ids = list(pool.index)
+    prob = pulp.LpProblem("fpl_squad", pulp.LpMaximize) if prob is None else prob
+
+    x = pulp.LpVariable.dicts(f"pick{suffix}", ids, cat="Binary")
+    y = pulp.LpVariable.dicts(f"start{suffix}", ids, cat="Binary")
+    c = pulp.LpVariable.dicts(f"captain{suffix}", ids, cat="Binary")
 
     prob += pulp.lpSum(x.values()) == 15
 
@@ -260,6 +299,250 @@ def suggest_transfers(
         transfers_in=pool.loc[in_ids],
         transfers_out=pool.loc[out_ids],
         hits=round(hits.value() or 0),
+    )
+
+
+@dataclass
+class WeekPlan:
+    """One gameweek of a multi-week plan."""
+
+    event: int
+    squad: pd.DataFrame
+    xi: pd.DataFrame
+    bench: pd.DataFrame
+    captain: pd.Series
+    transfers_in: pd.DataFrame
+    transfers_out: pd.DataFrame
+    hits: int
+    bank_tenths: int
+    free_transfers: int
+    projected: float
+
+    @property
+    def bank(self) -> float:
+        return self.bank_tenths / 10
+
+
+@dataclass
+class MultiWeekPlan:
+    weeks: list[WeekPlan]
+    projected: float
+    approximate_money: bool
+
+    @property
+    def hits(self) -> int:
+        return sum(w.hits for w in self.weeks)
+
+    @property
+    def transfers(self) -> int:
+        return sum(len(w.transfers_in) for w in self.weeks)
+
+
+def planning_pool(
+    projections: pd.DataFrame,
+    current_ids: list[int],
+    pool_size: int = POOL_SIZE,
+    points_col: str = "xpts_total",
+    min_minutes_share: float = 0.05,
+) -> pd.DataFrame:
+    """The candidates a multi-week plan is allowed to choose from.
+
+    Every week multiplies the number of binary variables, so the full 600 odd
+    players does not solve in the time a slider can wait for. Trimming to the
+    best few per position is what buys the extra weeks. It also means the plan
+    is optimal over a shortlist rather than over the whole game, which is a real
+    limitation and not a rounding error: a cheap enabler ranked just outside the
+    pool can be exactly what makes a route affordable.
+
+    Players you already own are always kept, whatever they are projected to do,
+    since a plan that cannot see them cannot sell them.
+    """
+    playing = projections[projections["minutes_share"] >= min_minutes_share]
+    keep = []
+    for pos, count in SQUAD_LIMITS.items():
+        take = max(MIN_POOL_PER_POSITION, round(pool_size * count / 15))
+        keep.append(playing[playing["position"] == pos].nlargest(take, points_col))
+
+    pool = pd.concat(keep)
+    owned = projections.loc[[i for i in current_ids if i in projections.index]]
+    return pd.concat([pool, owned[~owned.index.isin(pool.index)]])
+
+
+def plan_transfers(
+    projections: pd.DataFrame,
+    by_gameweek: pd.DataFrame,
+    current_ids: list[int],
+    selling_prices: dict[int, int] | None = None,
+    bank_tenths: int = 0,
+    free_transfers: int = 1,
+    weeks: int = 3,
+    max_transfers_per_week: int = 2,
+    bench_weight: float = 0.12,
+    pool_size: int = POOL_SIZE,
+    min_minutes_share: float = 0.05,
+) -> MultiWeekPlan:
+    """Plan transfers across several gameweeks as one problem.
+
+    `suggest_transfers` solves each week alone, so it will never take a small
+    loss now to reach a player it wants later, and it cannot bank a free
+    transfer on purpose. This links the weeks: what you own in one week is what
+    you owned in the last, plus what came in, minus what went out.
+
+    The money is the weak part and it gets weaker the further ahead it plans.
+    Prices are held at today's, so a rise you would have gained from and a fall
+    you would have suffered are both invisible, and any player whose purchase
+    price is unknown is assumed to sell for what he costs today. Those errors
+    accumulate week on week, which is why `approximate_money` comes back set
+    whenever selling prices are incomplete, and why the bank shown for the last
+    week is worth less than the bank shown for the first.
+    """
+    selling_prices = selling_prices or {}
+    events = sorted(int(e) for e in by_gameweek["event"].unique())[:weeks]
+    if not events:
+        raise ValueError("No gameweeks to plan over.")
+
+    pool = planning_pool(projections, current_ids, pool_size, min_minutes_share=min_minutes_share)
+    owned_now = {i for i in current_ids if i in pool.index}
+
+    prob = pulp.LpProblem("fpl_multiweek", pulp.LpMaximize)
+    objective = []
+    frames, picks, starts, captains = {}, {}, {}, {}
+    moves_in, moves_out, hits, free = {}, {}, {}, {}
+
+    previous = {i: (1 if i in owned_now else 0) for i in pool.index}
+    bank = bank_tenths
+    free[events[0]] = free_transfers
+
+    for position, event in enumerate(events):
+        tag = f"_w{event}"
+        frame = gameweek_frame(pool, by_gameweek, event)
+        frames[event] = frame
+
+        prob, x, y, c, week_objective = _base_problem(
+            frame, "xpts_gw", bench_weight, "xpts_gw", prob=prob, suffix=tag
+        )
+        picks[event], starts[event], captains[event] = x, y, c
+
+        tin = pulp.LpVariable.dicts(f"in{tag}", list(pool.index), cat="Binary")
+        tout = pulp.LpVariable.dicts(f"out{tag}", list(pool.index), cat="Binary")
+        moves_in[event], moves_out[event] = tin, tout
+
+        for i in pool.index:
+            prob += x[i] == previous[i] + tin[i] - tout[i]
+            prob += tin[i] + tout[i] <= 1
+
+        made = pulp.lpSum(tin.values())
+        prob += made <= max_transfers_per_week
+
+        taken = pulp.LpVariable(f"hits{tag}", lowBound=0, cat="Integer")
+        prob += taken >= made - free[event]
+        prob += taken <= made
+        hits[event] = taken
+
+        # money carried forward. Anything bought during the plan sells for what
+        # it cost, since prices are held constant, so one lookup covers both.
+        proceeds = pulp.lpSum(
+            selling_prices.get(i, int(pool.loc[i, "now_cost"])) * tout[i] for i in pool.index
+        )
+        spend = pulp.lpSum(int(pool.loc[i, "now_cost"]) * tin[i] for i in pool.index)
+        bank = bank + proceeds - spend
+        prob += bank >= 0
+
+        if position + 1 < len(events):
+            # transfers not taken as a hit came out of the free allowance, and
+            # what is left rolls with one more added, capped at five. A solver
+            # could in principle inflate `taken` to bank a free transfer, but
+            # that costs four points to save at most four, so it never pays.
+            rolled = pulp.LpVariable(
+                f"free_w{events[position + 1]}", lowBound=0, upBound=MAX_FREE_TRANSFERS
+            )
+            prob += rolled <= free[event] - made + taken + 1
+            free[events[position + 1]] = rolled
+
+        objective.append(week_objective - TRANSFER_COST * taken)
+        previous = x
+
+    prob += pulp.lpSum(objective)
+
+    status = prob.solve(solver())
+    if pulp.LpStatus[status] != "Optimal":
+        raise RuntimeError(f"No feasible plan found (solver status: {pulp.LpStatus[status]})")
+
+    return _assemble_weeks(
+        events,
+        frames,
+        picks,
+        starts,
+        captains,
+        moves_in,
+        moves_out,
+        hits,
+        free,
+        pool,
+        selling_prices,
+        bank_tenths,
+        current_ids,
+    )
+
+
+def _assemble_weeks(
+    events,
+    frames,
+    picks,
+    starts,
+    captains,
+    moves_in,
+    moves_out,
+    hits,
+    free,
+    pool,
+    selling_prices,
+    bank_tenths,
+    current_ids,
+) -> MultiWeekPlan:
+    """Read one solved multi-week problem back into a plan per gameweek."""
+    plans, running_bank, total = [], bank_tenths, 0.0
+
+    for event in events:
+        frame = frames[event]
+        squad, xi, bench, captain, _ = _assemble(
+            frame, picks[event], starts[event], captains[event], "xpts_gw"
+        )
+        in_ids = [i for i in pool.index if moves_in[event][i].value() > 0.5]
+        out_ids = [i for i in pool.index if moves_out[event][i].value() > 0.5]
+
+        running_bank += sum(
+            selling_prices.get(i, int(pool.loc[i, "now_cost"])) for i in out_ids
+        ) - sum(int(pool.loc[i, "now_cost"]) for i in in_ids)
+
+        taken = round(hits[event].value() or 0)
+        scored = float(xi["xpts_gw"].sum() + captain["xpts_gw"]) - TRANSFER_COST * taken
+        total += scored
+
+        allowance = free[event]
+        plans.append(
+            WeekPlan(
+                event=event,
+                squad=squad,
+                xi=xi,
+                bench=bench,
+                captain=captain,
+                transfers_in=pool.loc[in_ids],
+                transfers_out=pool.loc[out_ids],
+                hits=taken,
+                bank_tenths=round(running_bank),
+                free_transfers=round(
+                    allowance if isinstance(allowance, int) else (allowance.value() or 0)
+                ),
+                projected=scored,
+            )
+        )
+
+    held = [i for i in current_ids if i in pool.index]
+    return MultiWeekPlan(
+        weeks=plans,
+        projected=total,
+        approximate_money=any(i not in selling_prices for i in held),
     )
 
 

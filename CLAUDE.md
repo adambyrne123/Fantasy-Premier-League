@@ -41,9 +41,10 @@ Data flows one way. Nothing downstream writes back.
 
 ```
 api.py  ──▶  data.py  ──▶  projections.py  ──▶  optimiser.py  ──▶  cli.py
-                              ▲                       ▲
-                          squad.py                chips.py
-                    (current holdings, money)   (chip timing)
+               │              ▲                       ▲
+               ▼          squad.py                chips.py
+           prices.py  (current holdings, money)   (chip timing)
+        (price pressure)
 ```
 
 | Module | Responsibility | Do not put here |
@@ -51,8 +52,9 @@ api.py  ──▶  data.py  ──▶  projections.py  ──▶  optimiser.py  
 | `api.py` | HTTP, disk cache, TTLs. One method per endpoint. | Any parsing or business logic |
 | `data.py` | Raw JSON to tidy frames. FPL rule constants. | Anything opinionated about player quality |
 | `projections.py` | The points model. Three separable terms. | Selection logic |
-| `optimiser.py` | MILP formulation and solving. | Anything that fetches or estimates |
+| `optimiser.py` | MILP formulation and solving, single week and multi. | Anything that fetches or estimates |
 | `chips.py` | What a chip is worth, and in which gameweek. | New MILP formulations, which go in `optimiser.py` |
+| `prices.py` | Who is close to a price rise or fall. | Anything the points model reads |
 | `squad.py` | Loading the user's 15, bank, selling prices. | Projections or optimisation |
 | `cli.py` | Argument parsing and printing. | Model logic of any kind |
 | `app.py` | Streamlit view: widgets, layout, caching. | Model logic of any kind |
@@ -188,6 +190,14 @@ Players with no Premier League history get a per-position fit of rate against
 price. That fallback is weak and is documented as weak. Do not present it as
 better than it is.
 
+**Multi-week planning is one MILP, not a loop of weekly ones.** `plan_transfers`
+holds every week in a single problem and links them with
+`own[i][w] == own[i][w-1] + in - out`. Solving each week and chaining the
+results cannot roll a free transfer on purpose or take a loss now to reach a
+player later, which is the entire reason the function exists. `gameweek_frame`
+lives in `optimiser.py` rather than `chips.py` because both callers need it and
+`chips.py` already imports from the optimiser.
+
 Selection is a mixed integer programme, not a sort. Greedy points-per-million
 looks reasonable and is reliably a few points short, because what binds is the
 interaction between the club cap and the cheap enabler slots. There is a test
@@ -245,9 +255,22 @@ speculatively.
   Hit are priced per gameweek across the horizon, and wildcard is still `build`
   at current budget. What is missing is planning two chips together, and any
   sense of a chip being worth saving for a gameweek beyond the horizon.
-- Price change prediction, which matters for team value over a season.
-- Multi-gameweek transfer planning. Each week is solved in isolation, so it will
-  not plan a two-week route to a target player.
+- Price change prediction is advisory only, in `prices.py`, and deliberately
+  does not reach the optimiser. Feeding expected price movement into the MILP
+  needs a points-per-0.1m exchange rate, and a wrong one quietly degrades squad
+  selection, which is a bad trade for a signal this rough. What is missing is
+  any sense of rate: the API gives a running total since the gameweek opened,
+  not a time series, so a player who took five days to gather his net transfers
+  looks identical to one who did it this morning. Fixing that means storing a
+  daily snapshot, which nothing does yet.
+- Multi-gameweek planning beyond four weeks. `plan_transfers` links the weeks
+  into one MILP, so it can roll a free transfer or take a loss now to reach a
+  player later, but five weeks takes five or six seconds against under a second
+  for three, and the app caps at `MAX_PLAN_WEEKS`. It also chooses from a
+  trimmed pool rather than the whole game, so a cheap enabler ranked just
+  outside `POOL_SIZE` is invisible to it. Prices are held constant across the
+  horizon, which is the assumption most worth removing once `prices.py` has a
+  rate rather than a running total.
 - Deployment itself. The prerequisites are done: `prior_season.parquet` is
   committed so a cold boot reads it instead of making 700 requests, and
   `requirements.txt` is exported from `uv.lock`, since Community Cloud cannot

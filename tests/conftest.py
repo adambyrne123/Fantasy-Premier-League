@@ -89,6 +89,16 @@ class FakeApi:
                             "ep_next": "0.0",
                             "expected_goals": "0.0",
                             "expected_assists": "0.0",
+                            # zero before a ball is kicked, the way the real
+                            # payload is, so price pressure reads as dormant
+                            "transfers_in_event": self.rng.randint(0, 90_000) if self.played else 0,
+                            "transfers_out_event": self.rng.randint(0, 90_000)
+                            if self.played
+                            else 0,
+                            "cost_change_event": 0,
+                            "cost_change_start": self.rng.choice([-1, 0, 0, 0, 1])
+                            if self.played
+                            else 0,
                         }
                     )
                     pid += 1
@@ -116,7 +126,12 @@ class FakeApi:
         return fixtures
 
     def bootstrap(self) -> dict:
-        return {"teams": self._teams, "elements": self._elements, "events": self._events}
+        return {
+            "teams": self._teams,
+            "elements": self._elements,
+            "events": self._events,
+            "total_players": 9_000_000,
+        }
 
     def fixtures(self) -> list[dict]:
         return self._fixtures
