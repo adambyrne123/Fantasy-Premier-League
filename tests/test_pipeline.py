@@ -10,7 +10,13 @@ import pandas as pd
 import pytest
 
 from fpl_manager.data import MAX_PER_CLUB, SQUAD_LIMITS, XI_MIN, Season
-from fpl_manager.optimiser import build_squad, pick_xi, suggest_transfers
+from fpl_manager.optimiser import (
+    build_squad,
+    pick_xi,
+    plan_transfers,
+    planning_pool,
+    suggest_transfers,
+)
 from fpl_manager.projections import project
 
 from .conftest import N_TEAMS, SQUAD_SIZE_PER_TEAM
@@ -207,6 +213,145 @@ def test_no_free_transfers_discourages_churn(projections: pd.DataFrame, squad):
     )
     assert len(costly.transfers_in) <= len(free.transfers_in) + 1
     assert costly.hits == max(0, len(costly.transfers_in))
+
+
+# ----------------------------------------------------------------------
+# multi-gameweek transfer planning
+# ----------------------------------------------------------------------
+@pytest.fixture
+def horizon(season: Season, prior: pd.DataFrame):
+    """Projections plus the per-gameweek frame the planner links weeks with."""
+    return project(season, horizon=4, prior=prior)
+
+
+@pytest.fixture
+def multiweek(horizon, squad):
+    projections, by_gameweek = horizon
+    return plan_transfers(
+        projections,
+        by_gameweek,
+        current_ids=[int(i) for i in squad.squad.index],
+        bank_tenths=10,
+        free_transfers=1,
+        weeks=3,
+    )
+
+
+def test_a_plan_covers_every_week_asked_for(multiweek):
+    assert len(multiweek.weeks) == 3
+    assert [w.event for w in multiweek.weeks] == sorted(w.event for w in multiweek.weeks)
+
+
+def test_every_week_is_a_legal_squad(multiweek):
+    """The rules hold in each week separately, not just at the end."""
+    for week in multiweek.weeks:
+        assert len(week.squad) == 15
+        assert week.squad["position"].value_counts().to_dict() == SQUAD_LIMITS
+        assert week.squad["club"].value_counts().max() <= MAX_PER_CLUB
+
+
+def test_every_week_fields_a_legal_eleven(multiweek):
+    for week in multiweek.weeks:
+        assert len(week.xi) == 11
+        assert len(week.bench) == 4
+        for pos, minimum in XI_MIN.items():
+            assert (week.xi["position"] == pos).sum() >= minimum
+        assert week.captain.name in set(week.xi.index)
+
+
+def test_each_week_changes_by_exactly_its_transfers(multiweek, squad):
+    """The link constraint is the whole point, so hold it to the letter."""
+    held = {int(i) for i in squad.squad.index}
+    for week in multiweek.weeks:
+        expected = held - set(week.transfers_out.index) | set(week.transfers_in.index)
+        assert set(week.squad.index) == expected
+        assert len(week.transfers_in) == len(week.transfers_out)
+        held = expected
+
+
+def test_the_bank_never_goes_negative(multiweek):
+    for week in multiweek.weeks:
+        assert week.bank_tenths >= 0
+
+
+def test_the_transfer_cap_holds_in_every_week(horizon, squad):
+    projections, by_gameweek = horizon
+    plan = plan_transfers(
+        projections,
+        by_gameweek,
+        current_ids=[int(i) for i in squad.squad.index],
+        bank_tenths=10,
+        weeks=3,
+        max_transfers_per_week=1,
+    )
+    for week in plan.weeks:
+        assert len(week.transfers_in) <= 1
+
+
+def test_a_quiet_week_banks_a_free_transfer(horizon, squad):
+    """Rolling is the thing single-week planning cannot do."""
+    projections, by_gameweek = horizon
+    plan = plan_transfers(
+        projections,
+        by_gameweek,
+        current_ids=[int(i) for i in squad.squad.index],
+        bank_tenths=10,
+        free_transfers=1,
+        weeks=3,
+    )
+    for previous, following in zip(plan.weeks, plan.weeks[1:], strict=False):
+        if not len(previous.transfers_in):
+            assert following.free_transfers <= 5
+            assert following.free_transfers >= previous.free_transfers
+
+
+def test_unknown_selling_prices_are_declared(horizon, squad):
+    """The money error compounds over weeks, so it must not be silent."""
+    projections, by_gameweek = horizon
+    owned = [int(i) for i in squad.squad.index]
+    vague = plan_transfers(projections, by_gameweek, owned, bank_tenths=10, weeks=2)
+    assert vague.approximate_money
+
+    known = {i: int(projections.loc[i, "now_cost"]) for i in owned}
+    exact = plan_transfers(
+        projections, by_gameweek, owned, selling_prices=known, bank_tenths=10, weeks=2
+    )
+    assert not exact.approximate_money
+
+
+def test_selling_prices_constrain_the_whole_plan(horizon, squad):
+    """Undervaluing the squad must bind in every week, not only the first."""
+    projections, by_gameweek = horizon
+    owned = [int(i) for i in squad.squad.index]
+    poor = {i: int(projections.loc[i, "now_cost"] * 0.6) for i in owned}
+    plan = plan_transfers(
+        projections, by_gameweek, owned, selling_prices=poor, bank_tenths=0, weeks=3
+    )
+    bank = 0
+    for week in plan.weeks:
+        bank += sum(
+            poor.get(int(i), int(projections.loc[i, "now_cost"])) for i in week.transfers_out.index
+        )
+        bank -= sum(int(projections.loc[i, "now_cost"]) for i in week.transfers_in.index)
+        assert bank >= 0
+
+
+def test_the_pool_always_keeps_what_you_own(horizon, squad):
+    """A plan that cannot see a player it owns cannot sell him."""
+    projections, _ = horizon
+    owned = [int(i) for i in squad.squad.index]
+    pool = planning_pool(projections, owned, pool_size=40)
+    assert set(owned) <= set(pool.index)
+
+
+def test_planning_needs_a_gameweek_to_plan_over(horizon, squad):
+    projections, by_gameweek = horizon
+    with pytest.raises(ValueError, match="No gameweeks"):
+        plan_transfers(
+            projections,
+            by_gameweek.iloc[0:0],
+            current_ids=[int(i) for i in squad.squad.index],
+        )
 
 
 # ----------------------------------------------------------------------

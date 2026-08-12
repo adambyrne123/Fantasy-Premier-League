@@ -89,6 +89,11 @@ class Season:
             "expected_goals_conceded",
             "ep_next",
             "chance_of_playing_next_round",
+            # what price moves are worked out from, see prices.py
+            "transfers_in_event",
+            "transfers_out_event",
+            "cost_change_event",
+            "cost_change_start",
         ]
         for col in numeric:
             if col in df.columns:
@@ -125,6 +130,16 @@ class Season:
     # ------------------------------------------------------------------
     # helpers
     # ------------------------------------------------------------------
+    @property
+    def total_players(self) -> int:
+        """How many people are playing FPL.
+
+        Needed to turn an ownership percentage into a number of owners, which
+        is what price change thresholds scale with. Zero if the payload does
+        not carry it, and callers treat that as unknown rather than as nobody.
+        """
+        return int(self._boot.get("total_players") or 0)
+
     @property
     def next_gameweek(self) -> int:
         """The gameweek that is open for transfers, or 1 before the season."""

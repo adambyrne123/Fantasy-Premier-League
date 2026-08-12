@@ -17,7 +17,10 @@ from fpl_manager.squad import (
     load_from_entry,
     load_squad,
     load_squad_file,
+    merge_prices,
+    parse_squad,
     selling_price_tenths,
+    squad_payload,
     write_squad_file,
 )
 
@@ -93,7 +96,7 @@ def test_saved_purchase_prices_default_to_todays_price(tmp_path, season: Season,
 
 
 def test_a_bare_list_of_ids_loads(tmp_path, season: Season, owned):
-    """The app's download button writes this shape, so it has to read back."""
+    """Hand written files use this shape, as did older app downloads."""
     path = tmp_path / "squad.json"
     path.write_text(json.dumps({"players": owned}))
     assert load_squad_file(path, season).player_ids == owned
@@ -126,6 +129,47 @@ def test_an_empty_file_is_rejected(tmp_path):
     path.write_text(json.dumps({"players": []}))
     with pytest.raises(ValueError, match="no players"):
         load_squad_file(path)
+
+
+def test_a_squad_parses_without_touching_disk(season: Season, owned):
+    """The app serves several people at once and must not stage uploads in a file."""
+    payload = {"bank": 2.5, "players": [{"id": owned[0], "purchase_price": 5.5}]}
+    parsed = parse_squad(payload, season)
+    assert parsed.player_ids == [owned[0]]
+    assert parsed.purchase_prices[owned[0]] == 55
+    assert parsed.bank_tenths == 25
+
+
+def test_an_empty_payload_is_rejected():
+    with pytest.raises(ValueError, match="no players"):
+        parse_squad({"players": []})
+
+
+def test_a_built_squad_carries_its_prices_out_and_back(season: Season, owned):
+    """A download that drops purchase prices loses the selling price with it."""
+    built = season.players.loc[owned]
+    payload = squad_payload(MySquad.from_frame(built), season)
+    reloaded = parse_squad(payload, season)
+    for pid in owned:
+        assert reloaded.purchase_prices[pid] == int(season.players.loc[pid, "now_cost"])
+    assert reloaded.unpriced() == []
+
+
+def test_merge_prices_keeps_only_players_still_held(season: Season, owned):
+    """An out of date file should contribute what it still can, not be rejected."""
+    entry = MySquad(player_ids=owned)
+    saved = MySquad(
+        player_ids=[owned[0], 999_999],
+        purchase_prices={owned[0]: 40, 999_999: 60},
+    )
+    merged = merge_prices(entry, saved, season)
+    assert set(merged.purchase_prices) == {owned[0]}
+
+
+def test_unpriced_names_the_players_valued_at_todays_price(season: Season, owned):
+    squad = MySquad(player_ids=owned, purchase_prices={owned[0]: 50})
+    squad.resolve_selling_prices(season)
+    assert squad.unpriced() == owned[1:]
 
 
 # ----------------------------------------------------------------------

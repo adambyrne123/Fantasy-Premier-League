@@ -19,27 +19,13 @@ from __future__ import annotations
 
 import pandas as pd
 
-from .optimiser import build_squad, pick_xi
+# lives in optimiser.py because the multi-week planner needs it too and chips
+# already depends on the optimiser rather than the other way round
+from .optimiser import build_squad, gameweek_frame, pick_xi
 
 CHIPS = ("bench_boost", "triple_captain", "free_hit")
 
-
-def gameweek_frame(
-    projections: pd.DataFrame, by_gameweek: pd.DataFrame, event: int, ids: list[int] | None = None
-) -> pd.DataFrame:
-    """Projections for one gameweek, as a column the optimiser can maximise.
-
-    A club with two fixtures contributes twice and a club with none contributes
-    nothing, because `by_gameweek` already holds one row per fixture. That is
-    why doubles and blanks need no special casing here either.
-    """
-    points = by_gameweek[by_gameweek["event"] == event].groupby("id")["xpts"].sum()
-    frame = (
-        projections if ids is None else projections.loc[[i for i in ids if i in projections.index]]
-    )
-    frame = frame.copy()
-    frame["xpts_gw"] = points.reindex(frame.index).fillna(0.0)
-    return frame
+__all__ = ["CHIPS", "best_per_chip", "evaluate", "gameweek_frame"]
 
 
 def _best_lineup(frame: pd.DataFrame) -> tuple[float, pd.DataFrame, pd.Series]:
