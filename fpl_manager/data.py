@@ -156,6 +156,19 @@ class Season:
     def gameweeks_played(self) -> int:
         return int(self.events["finished"].sum())
 
+    @property
+    def next_deadline(self) -> pd.Timestamp | None:
+        """When transfers for `next_gameweek` lock, in UTC.
+
+        Follows `next_gameweek` rather than looking for `is_next` itself, so the
+        two can never disagree about which gameweek is being talked about. Once
+        a gameweek is under way its deadline is in the past, and this still
+        returns it, because whether that reads as a countdown or as a gameweek
+        already running is a question for whoever is displaying it.
+        """
+        deadline = self.events["deadline_time"].get(self.next_gameweek)
+        return None if deadline is None or pd.isna(deadline) else deadline
+
     def team_fixtures(self, horizon: int, start_gw: int | None = None) -> pd.DataFrame:
         """One row per club per fixture across the horizon.
 

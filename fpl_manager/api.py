@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import os
 import time
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -56,6 +57,19 @@ class FplApi:
     # ------------------------------------------------------------------
     def _cache_path(self, key: str) -> Path:
         return self.cache_dir / f"{key.replace('/', '_')}.json"
+
+    def fetched_at(self, key: str) -> datetime | None:
+        """When the cached response for `key` was last written, if it exists.
+
+        The disk cache is shared by every visitor to a deployed app, so this is
+        the only honest answer to how old the numbers on screen are. Anything
+        derived from a single session would tell everyone who did not press
+        Refresh that the data was fresher than it is.
+        """
+        cached = self._cache_path(key)
+        if not cached.exists():
+            return None
+        return datetime.fromtimestamp(cached.stat().st_mtime, tz=UTC)
 
     def _get(self, path: str, key: str | None = None, ttl: int | None = None) -> Any:
         key = key or path.strip("/")
