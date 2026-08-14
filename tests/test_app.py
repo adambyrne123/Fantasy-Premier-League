@@ -168,19 +168,31 @@ def test_every_card_in_the_squad_carries_a_face(app):
     at = app.run()
     assert not at.exception
     pitch = _pitch(at)
-    assert pitch.count('<img class="mug"') == 15, "eleven starters and four on the bench"
+    assert pitch.count('<span class="mug"') == 15, "eleven starters and four on the bench"
     assert "photos/players/110x140/p500" in pitch, "built from the player's code, not his id"
 
 
-def test_a_missing_face_falls_back_to_the_club_kit(app):
+def test_the_kit_sits_behind_every_face(app):
     """Roughly half the cheapest players have no photograph and the CDN answers
-    403, and cheap players are exactly what the optimiser puts on a bench.
-    Without this the bench renders as holes."""
+    403, and cheap players are exactly what the optimiser puts on a bench. The
+    kit is a second background layer rather than a swap, so a face that fails
+    is simply not painted and the kit shows through."""
     at = app.run()
     pitch = _pitch(at)
-    assert "onerror=" in pitch
-    assert "this.onerror=null" in pitch, "a failing kit must not loop"
-    assert "dist/img/shirts/standard/shirt_" in pitch
+    assert pitch.count("dist/img/shirts/standard/shirt_") == 15, "one kit per card"
+    for card in pitch.split('<span class="mug"')[1:]:
+        head = card.split("</span>")[0]
+        assert head.index("photos/players") < head.index("shirts/standard"), (
+            "the face has to be the first background layer or the kit hides it"
+        )
+
+
+def test_no_pitch_image_relies_on_a_script_handler(app):
+    """Streamlit strips every on* attribute from the HTML it renders, so an
+    onerror fallback here is removed before it can run and fails silently.
+    That is exactly how this shipped broken once."""
+    at = app.run()
+    assert "onerror" not in _pitch(at)
 
 
 def test_the_keeper_wears_a_different_kit_from_the_outfielders(app):
@@ -197,7 +209,7 @@ def test_the_drill_down_shows_the_player_s_face(midseason_app):
     assert not at.exception
     head = next(m.value for m in at.get("dialog")[0].markdown if 'class="pd-head"' in m.value)
     assert "photos/players" in head
-    assert "onerror=" in head
+    assert "shirts/standard" in head, "the kit has to back the face here too"
 
 
 def test_the_pool_carries_a_club_badge(app):
@@ -206,6 +218,17 @@ def test_the_pool_carries_a_club_badge(app):
     pool = _pool(at)
     assert "badge" in pool.columns
     assert pool["badge"].str.contains("badges/70/t").all()
+
+
+def test_club_tables_carry_badges_too(app):
+    """The fixture ticker and the swing tables are club-keyed, so the badge
+    reads faster than the three letter short name does."""
+    at = app.run()
+    assert not at.exception
+    badged = [d.value for d in at.dataframe if "badge" in d.value.columns]
+    assert len(badged) >= 3, "the pool, the ticker and at least one swing table"
+    for frame in badged:
+        assert frame["badge"].dropna().str.contains("badges/70/t").all()
 
 
 def test_the_status_bar_carries_the_deadline_and_the_data_age(midseason_app):

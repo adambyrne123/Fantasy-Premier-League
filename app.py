@@ -85,7 +85,9 @@ POSITION_COLOURS = {"GKP": "#FFB020", "DEF": "#00C2FF", "MID": "#00E87B", "FWD":
 FACE_URL = "https://resources.premierleague.com/premierleague/photos/players/110x140/p{}.png"
 KIT_URL = "https://fantasy.premierleague.com/dist/img/shirts/standard/shirt_{}{}-66.png"
 BADGE_URL = "https://resources.premierleague.com/premierleague/badges/70/t{}.png"
+BADGE_COLUMN = st.column_config.ImageColumn("", width="small")
 SWING_COLUMNS = {
+    "badge": BADGE_COLUMN,
     "club": "Club",
     "now": st.column_config.NumberColumn("Now", format="%.2f"),
     "later": st.column_config.NumberColumn("Later", format="%.2f"),
@@ -153,10 +155,15 @@ PITCH_CSS = """
   border-radius: var(--radius);
   padding: 16px 10px 4px;
 }
+/* Two layers: the face on top, the club kit under it. If the face 403s, and
+   for roughly half the cheap players it does, that layer is not painted and
+   the kit shows instead. */
 .mug {
   display:block; width:44px; height:56px; margin:0 auto 2px;
-  object-fit:cover; object-position:top center;
-  border-radius:6px; background:rgba(55,0,60,.10);
+  border-radius:6px; background-color:rgba(55,0,60,.08);
+  background-repeat:no-repeat, no-repeat;
+  background-position:top center, center 60%;
+  background-size:cover, 82% auto;
 }
 .pitch.compact .mug, .bench-strip.compact .mug { width:34px; height:43px; }
 .state {
@@ -334,6 +341,31 @@ def player_images(_season: Season) -> pd.DataFrame:
         },
         index=players.index,
     )
+
+
+@st.cache_data(show_spinner=False)
+def club_badges(_season: Season) -> pd.Series:
+    """Badge URL for every club, keyed by the short name the tables show.
+
+    Taken off the player frame rather than the club frame, because `team_code`
+    rides along there while `_build_teams` subsets its columns and drops it.
+    Going the long way round keeps this to the front end, where a schema change
+    costs a missing badge rather than a broken page.
+    """
+    players = _season.players
+    if not {"club", "team_code"} <= set(players.columns):
+        return pd.Series(dtype="object")
+    codes = players.groupby("club")["team_code"].first()
+    return codes.map(BADGE_URL.format)
+
+
+def with_badges(frame: pd.DataFrame, badges: pd.Series, on: str = "club") -> pd.DataFrame:
+    """Put a badge column in front of a club-keyed table."""
+    if badges.empty or on not in frame.columns:
+        return frame
+    out = frame.copy()
+    out.insert(0, "badge", out[on].map(badges))
+    return out
 
 
 @st.cache_data(show_spinner=False)
@@ -613,19 +645,27 @@ def _mug(images: pd.DataFrame | None, player_id, css: str = "mug") -> str:
     """A player's face, falling back to his club kit if there is no photograph.
 
     Roughly half of the cheapest players have no photograph and the CDN answers
-    403 for them, which is the bench of any squad the optimiser builds. Hiding
-    a missing image, which is what the sites doing this tend to do, would leave
-    a hole exactly where you most need to tell two cheap defenders apart.
+    403 for them, which is the bench of any squad the optimiser builds. Leaving
+    a hole there is the worst case, since a cheap defender is exactly who you
+    cannot identify from the name alone.
 
-    `onerror` clears itself before swapping, so a kit that also fails cannot put
-    the browser in a loop.
+    Face and kit are two background layers on one element rather than an `img`
+    with an `onerror` handler. Streamlit sanitises the HTML it renders and
+    strips every `on*` attribute, so a handler is removed before it ever runs
+    and the fallback silently never fires.
+
+    Stacked backgrounds need no script and do not depend on how a browser
+    chooses to paint a broken `img`: a background layer that fails to load is
+    simply not painted, so the kit underneath shows through. They are also only
+    fetched when the element is actually rendered, which keeps the images in
+    Streamlit's hidden tabs off the wire entirely.
     """
     if images is None or player_id not in images.index:
         return ""
     face, kit = images.loc[player_id, "face"], images.loc[player_id, "kit"]
     return (
-        f'<img class="{css}" src="{escape(face)}" alt="" loading="lazy" '
-        f"onerror=\"this.onerror=null;this.src='{escape(kit)}'\">"
+        f'<span class="{css}" '
+        f"style=\"background-image:url('{escape(face)}'),url('{escape(kit)}')\"></span>"
     )
 
 
@@ -816,6 +856,7 @@ with st.sidebar.expander("Squad building", expanded=False):
 
 season = load_season(st.session_state.refresh_token)
 images = player_images(season)
+badges = club_badges(season)
 projections, by_gameweek = load_projections(season, horizon, use_prior)
 lookup = name_lookup(projections)
 
@@ -1191,8 +1232,9 @@ with roi_tab:
             best, movers_up = st.columns([3, 2])
             with best:
                 st.caption("Best return per million")
+                config["badge"] = BADGE_COLUMN
                 st.dataframe(
-                    roi_view.head(40)[roi_cols],
+                    with_badges(roi_view.head(40)[roi_cols], badges),
                     hide_index=True,
                     width="stretch",
                     column_config=config,
@@ -1253,10 +1295,11 @@ with fixtures_tab:
     st.caption("Kindest runs over the horizon")
     ticker = season.fixture_ticker(horizon).reset_index(drop=True)
     st.dataframe(
-        ticker.head(10),
+        with_badges(ticker.head(10), badges),
         hide_index=True,
         width="stretch",
         column_config={
+            "badge": BADGE_COLUMN,
             "club": "Club",
             "fixtures": st.column_config.NumberColumn("Games", format="%d"),
             "avg_difficulty": st.column_config.NumberColumn("Avg difficulty", format="%.2f"),
@@ -1319,7 +1362,7 @@ with fixtures_tab:
         with easing:
             st.caption("Hard now, easier later. Worth waiting for.")
             st.dataframe(
-                swings[swings["swing"] >= SWING_THRESHOLD].head(8),
+                with_badges(swings[swings["swing"] >= SWING_THRESHOLD].head(8), badges),
                 hide_index=True,
                 width="stretch",
                 column_config=SWING_COLUMNS,
@@ -1327,7 +1370,7 @@ with fixtures_tab:
         with worsening:
             st.caption("Easy now, harder later. Use them, then plan the exit.")
             st.dataframe(
-                swings[swings["swing"] <= -SWING_THRESHOLD].tail(8).iloc[::-1],
+                with_badges(swings[swings["swing"] <= -SWING_THRESHOLD].tail(8).iloc[::-1], badges),
                 hide_index=True,
                 width="stretch",
                 column_config=SWING_COLUMNS,
