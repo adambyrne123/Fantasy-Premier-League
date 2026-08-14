@@ -11,8 +11,11 @@ lineup and captain already chosen optimally for that gameweek. Playing Bench
 Boost is worth your bench, not your whole squad, and quoting the larger figure
 would be flattering the chip.
 
-Wildcard is deliberately absent. It has no gameweek of its own to be spent on
-and it is already `build_squad` at your current team value.
+Wildcard is the exception to the one-gameweek framing. You keep the squad, so
+what it is worth is not one week but everything from the week you play it to
+the end of the horizon, and its gain therefore falls the longer you leave it.
+That makes it comparable with the others without pretending it is the same
+kind of thing, and it is still `build_squad` at your team value underneath.
 """
 
 from __future__ import annotations
@@ -21,11 +24,11 @@ import pandas as pd
 
 # lives in optimiser.py because the multi-week planner needs it too and chips
 # already depends on the optimiser rather than the other way round
-from .optimiser import build_squad, gameweek_frame, pick_xi
+from .optimiser import build_squad, gameweek_frame, pick_xi, window_frame
 
-CHIPS = ("bench_boost", "triple_captain", "free_hit")
+CHIPS = ("bench_boost", "triple_captain", "free_hit", "wildcard")
 
-__all__ = ["CHIPS", "best_per_chip", "evaluate", "gameweek_frame"]
+__all__ = ["CHIPS", "best_per_chip", "evaluate", "gameweek_frame", "window_frame"]
 
 
 def _best_lineup(frame: pd.DataFrame) -> tuple[float, pd.DataFrame, pd.Series]:
@@ -108,9 +111,66 @@ def evaluate(
                 }
             )
 
+        if "wildcard" in chips:
+            row = _wildcard(
+                projections, by_gameweek, event, owned, budget_tenths, min_minutes_share
+            )
+            if row is not None:
+                rows.append(row)
+
     if not rows:
         return pd.DataFrame(columns=["chip", "event", "gain", "baseline", "detail"])
     return pd.DataFrame(rows).sort_values("gain", ascending=False).reset_index(drop=True)
+
+
+def _wildcard(
+    projections: pd.DataFrame,
+    by_gameweek: pd.DataFrame,
+    event: int,
+    owned: list[int],
+    budget_tenths: int,
+    min_minutes_share: float,
+) -> dict | None:
+    """What a wildcard played in `event` is worth over the rest of the horizon.
+
+    Measured differently from the other three on purpose. They buy you one
+    gameweek, so their gain is that gameweek. A wildcard is kept, so its gain
+    is every remaining gameweek, and it falls the longer you leave it simply
+    because there is less season left to spend it on. Comparing a one-week gain
+    with a rest-of-horizon one is not like for like, which is why the detail
+    column says how many weeks are being counted.
+
+    The horizon still bounds the answer. A wildcard is usually played for
+    fixtures beyond six weeks out, so a short horizon understates it.
+    """
+    held = window_frame(projections, by_gameweek, event, ids=owned)
+    if len(held) < 15:
+        return None
+
+    xi, _, captain = pick_xi(held, points_col="xpts_gw")
+    baseline = float(xi["xpts_gw"].sum() + captain["xpts_gw"])
+
+    pool = window_frame(projections, by_gameweek, event)
+    try:
+        fresh = build_squad(
+            pool,
+            budget_tenths=budget_tenths,
+            bench_weight=0.0,
+            points_col="xpts_gw",
+            captain_col="xpts_gw",
+            min_minutes_share=min_minutes_share,
+        )
+    except RuntimeError:
+        return None
+
+    weeks = int(by_gameweek.loc[by_gameweek["event"] >= event, "event"].nunique())
+    return {
+        "chip": "Wildcard",
+        "event": event,
+        "gain": float(fresh.projected - baseline),
+        "baseline": baseline,
+        "detail": f"over {weeks} weeks, captain {fresh.captain['name']}",
+    }
 
 
 def best_per_chip(evaluated: pd.DataFrame) -> pd.DataFrame:

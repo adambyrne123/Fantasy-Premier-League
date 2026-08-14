@@ -5,6 +5,7 @@ python -m fpl_manager ticker --horizon 8
 python -m fpl_manager players --position MID --top 25
 python -m fpl_manager transfers --squad squad.json --free 1 --max 2
 python -m fpl_manager xi --squad squad.json
+python -m fpl_manager live --entry 1234567
 python -m fpl_manager find haaland
 """
 
@@ -15,10 +16,11 @@ import sys
 
 import pandas as pd
 
-from . import chips
+from . import chips, live
 from .api import FplApi
 from .data import Season
-from .optimiser import build_squad, pick_xi, suggest_transfers
+from .optimiser import MAX_PLAN_WEEKS, build_squad, pick_xi, plan_transfers, suggest_transfers
+from .prices import is_dormant, movers, price_pressure
 from .projections import BUNDLED_PRIOR, PRIOR_CACHE, load_prior, project
 from .squad import MySquad, load_squad, write_squad_file
 
@@ -40,6 +42,8 @@ def _fmt(df: pd.DataFrame, cols: list[str]) -> str:
 
 
 SQUAD_COLS = ["name", "position", "club", "price", "xpts_next", "xpts_total", "ownership"]
+LIVE_COLS = ["name", "position", "club", "minutes", "points", "provisional_bonus", "bps"]
+PRICE_COLS = ["name", "position", "club", "price", "owners", "net_transfers", "pressure"]
 
 
 def _print_squad(result, label: str) -> None:
@@ -157,7 +161,7 @@ def cmd_chips(args, season, projections, by_gw):
         return
 
     print(f"\nChips over GW{season.next_gameweek} for {args.horizon} weeks")
-    print(f"Free Hit budget is your team value, {budget / 10:.1f}m\n")
+    print(f"Free Hit and Wildcard are budgeted at your team value, {budget / 10:.1f}m\n")
     print("Best gameweek for each chip")
     print(_fmt(chips.best_per_chip(table), ["chip", "event", "gain", "baseline", "detail"]))
 
@@ -165,8 +169,107 @@ def cmd_chips(args, season, projections, by_gw):
         print("\nEvery gameweek, best first")
         print(_fmt(table, ["chip", "event", "gain", "baseline"]))
 
-    print("\nGain is on top of what that squad scores anyway. The model cannot see")
-    print("rotation or press conferences, so treat a close call as a coin toss.")
+    print("\nGain is on top of what that squad scores anyway. Wildcard is the one")
+    print("measured over every remaining gameweek rather than one, since you keep")
+    print("the squad. The model cannot see rotation or press conferences, so treat")
+    print("a close call as a coin toss.")
+
+
+def cmd_plan(args, season, projections, by_gw):
+    squad = load_squad(season, args.squad, args.entry)
+    bank = round(args.bank * 10) if args.bank is not None else squad.bank_tenths
+    free = args.free if args.free is not None else squad.free_transfers
+
+    weeks = min(args.weeks, MAX_PLAN_WEEKS)
+    if args.weeks > MAX_PLAN_WEEKS:
+        print(f"Capped at {MAX_PLAN_WEEKS} weeks, past which the solve takes seconds.")
+
+    plan = plan_transfers(
+        projections,
+        by_gw,
+        squad.player_ids,
+        selling_prices=squad.selling_prices,
+        bank_tenths=bank,
+        free_transfers=free,
+        weeks=weeks,
+        max_transfers_per_week=args.max,
+        bench_weight=args.bench_weight,
+    )
+
+    print(f"\nPlan over {len(plan.weeks)} gameweeks, projected {plan.projected:.1f} pts")
+    if plan.hits:
+        print(f"Taking {plan.hits} hits, costing {plan.hits * 4} points.")
+    if plan.approximate_money:
+        print("Some selling prices are unknown, so the money here is optimistic.")
+
+    for week in plan.weeks:
+        moves = len(week.transfers_in)
+        header = f"\nGW{week.event}: " + (f"{moves} transfer(s)" if moves else "roll")
+        print(f"{header}, bank {week.bank_tenths / 10:.1f}m, {week.free_transfers} free")
+        if moves:
+            print("  out " + ", ".join(week.transfers_out["name"].astype(str)))
+            print("  in  " + ", ".join(week.transfers_in["name"].astype(str)))
+        print(f"  captain {week.captain['name']}, projected {week.projected:.1f}")
+
+    print("\nPrices are held at today's across the horizon, so the further out a")
+    print("week is, the less its bank figure is worth.")
+
+
+def cmd_prices(args, season, projections, by_gw):
+    pressure = price_pressure(season)
+    if is_dormant(pressure):
+        print("\nNo meaningful transfer activity yet, so nothing is close to moving.")
+        print("Price pressure needs a gameweek or two of a live season to mean anything.")
+        return
+
+    for direction, label in (("rise", "Closest to a rise"), ("fall", "Closest to a fall")):
+        table = movers(pressure, direction=direction, top=args.top)
+        print(f"\n{label}")
+        print(_fmt(table, PRICE_COLS) if len(table) else "  nobody")
+
+    print("\nThe API gives a running total of net transfers since the gameweek opened,")
+    print("not a rate, so a player who took five days to gather his looks the same as")
+    print("one who did it this morning. Treat this as a watchlist, not a forecast.")
+
+
+def cmd_live(args, season, projections, by_gw):
+    gameweek = args.gameweek or season.current_gameweek
+    if gameweek < 1:
+        print("\nNo gameweek has started yet, so there is nothing live to show.")
+        return
+
+    state = live.load_live(season, gameweek)
+    if state.fixtures.empty:
+        print(f"\nGW{gameweek} has no fixtures published yet.")
+        return
+
+    played = int(state.fixtures["finished"].sum())
+    status = "in play" if state.in_play else ("all played" if state.all_settled else "not started")
+    print(f"\nGW{gameweek}, {status}. {played} of {len(state.fixtures)} fixtures finished.")
+    if not state.all_settled:
+        print("Bonus on unfinished matches is provisional and can still move.")
+
+    try:
+        squad = load_squad(season, args.squad, args.entry)
+    except (RuntimeError, ValueError) as exc:
+        print(f"\nNo squad to score: {exc}")
+        return
+
+    score = live.score_squad(state, season, squad)
+    print(f"\nYour score: {score.total} pts, {score.playing} playing, {score.to_play} to play")
+    if score.provisional_bonus:
+        print(f"Of which {score.provisional_bonus} is provisional bonus.")
+    if not score.lineup.settled:
+        print("Not every match is over, so autosubs below are a projection.")
+
+    print("\nStarting XI")
+    print(_fmt(live.player_view(state, season, score.lineup.starters), LIVE_COLS))
+    print("\nBench")
+    print(_fmt(live.player_view(state, season, score.lineup.bench), LIVE_COLS))
+
+    for out, came_in in score.lineup.subs:
+        names = season.players["name"]
+        print(f"\nAuto sub: {names.get(out, out)} off, {names.get(came_in, came_in)} on")
 
 
 def cmd_find(args, season, projections, by_gw):
@@ -214,7 +317,9 @@ def main(argv: list[str] | None = None) -> int:
     pl.add_argument("--max-price", type=float)
     pl.add_argument("--top", type=int, default=20)
     pl.add_argument(
-        "--sort", default="xpts_total", choices=["xpts_total", "xpts_next", "value", "ownership"]
+        "--sort",
+        default="xpts_total",
+        choices=["xpts_total", "xpts_next", "value", "ownership", "differential"],
     )
     pl.set_defaults(func=cmd_players)
 
@@ -239,6 +344,25 @@ def main(argv: list[str] | None = None) -> int:
     )
     ch.add_argument("--all", action="store_true", help="show every gameweek, not just the best")
     ch.set_defaults(func=cmd_chips)
+
+    pn = sub.add_parser("plan", help="transfers across several gameweeks as one problem")
+    pn.add_argument("--squad")
+    pn.add_argument("--entry", type=int)
+    pn.add_argument("--bank", type=float)
+    pn.add_argument("--free", type=int)
+    pn.add_argument("--weeks", type=int, default=3, help=f"up to {MAX_PLAN_WEEKS}")
+    pn.add_argument("--max", type=int, default=2, help="most transfers in any one week")
+    pn.set_defaults(func=cmd_plan)
+
+    pr = sub.add_parser("prices", help="who is closest to a price rise or fall")
+    pr.add_argument("--top", type=int, default=15)
+    pr.set_defaults(func=cmd_prices)
+
+    lv = sub.add_parser("live", help="what your squad is scoring right now")
+    lv.add_argument("--squad")
+    lv.add_argument("--entry", type=int)
+    lv.add_argument("--gameweek", type=int, help="defaults to the one under way")
+    lv.set_defaults(func=cmd_live)
 
     f = sub.add_parser("find", help="look up player ids by name")
     f.add_argument("query")

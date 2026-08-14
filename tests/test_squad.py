@@ -193,6 +193,67 @@ def test_reading_an_entry_fails_clearly_without_published_picks(season: Season):
         load_from_entry(season, entry_id=1234567)
 
 
+def _entry_season(played: int, picks: list[dict], gameweek_seen: list[int]) -> Season:
+    """A season whose entry endpoints return a fixed set of picks."""
+    from .conftest import FakeApi
+
+    class WithPicks(FakeApi):
+        def entry_picks(self, entry_id: int, gameweek: int) -> dict:
+            gameweek_seen.append(gameweek)
+            return {"picks": picks, "entry_history": {"bank": 12}}
+
+        def entry_history(self, entry_id: int) -> dict:
+            return {"current": []}
+
+    return Season(WithPicks(played=played))
+
+
+def _picks(elements: list[int]) -> list[dict]:
+    return [
+        {
+            "element": e,
+            "position": n + 1,
+            "multiplier": 2 if n == 0 else (1 if n < 11 else 0),
+            "is_captain": n == 0,
+            "is_vice_captain": n == 1,
+        }
+        for n, e in enumerate(elements)
+    ]
+
+
+def test_the_armband_survives_a_load_from_entry(owned):
+    """The picks payload is the only source of who is captain. Dropping it left
+    a live view guessing at the one player whose points are doubled."""
+    seen: list[int] = []
+    season = _entry_season(12, _picks(owned), seen)
+    squad = load_from_entry(season, entry_id=1234567)
+
+    assert squad.captain_id == owned[0]
+    assert squad.vice_captain_id == owned[1]
+    assert squad.player_ids == owned, "pick order is the bench order and must survive"
+
+
+def test_load_from_entry_reads_the_gameweek_under_way(owned):
+    """Picks are published from the deadline, so during play the last finished
+    gameweek is one behind and would show last week's team."""
+    seen: list[int] = []
+    season = _entry_season(12, _picks(owned), seen)
+    season.events["is_current"] = season.events.index == 13
+    season.events["finished"] = season.events.index <= 12
+
+    load_from_entry(season, entry_id=1234567)
+    assert seen == [13]
+
+
+def test_a_triple_captain_multiplier_is_kept(owned):
+    seen: list[int] = []
+    picks = _picks(owned)
+    picks[0]["multiplier"] = 3
+    squad = load_from_entry(_entry_season(12, picks, seen), entry_id=1234567)
+
+    assert squad.captain_multiplier == 3
+
+
 def test_load_squad_falls_back_to_the_file(tmp_path, season: Season, owned):
     path = tmp_path / "squad.json"
     write_squad_file(path, MySquad(player_ids=owned, bank_tenths=5), season)

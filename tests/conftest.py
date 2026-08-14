@@ -24,19 +24,13 @@ SQUAD_SIZE_PER_TEAM = sum(POS_COUNTS.values())
 class FakeApi:
     """Stands in for `FplApi`, generating a deterministic synthetic season."""
 
-    def __init__(self, n_teams: int = N_TEAMS, played: int = 0, seed: int = 7):
+    def __init__(
+        self, n_teams: int = N_TEAMS, played: int = 0, seed: int = 7, strengths: bool = True
+    ):
         self.rng = random.Random(seed)
         self.n_teams = n_teams
         self.played = played
-        self._teams = [
-            {
-                "id": t,
-                "name": f"Club {t}",
-                "short_name": f"C{t:02d}",
-                "strength": self.rng.randint(2, 5),
-            }
-            for t in range(1, n_teams + 1)
-        ]
+        self._teams = [self._make_team(t, strengths) for t in range(1, n_teams + 1)]
         self._elements = self._make_players()
         self._events = [
             {
@@ -51,6 +45,38 @@ class FakeApi:
             for gw in range(1, 39)
         ]
         self._fixtures = self._make_fixtures()
+
+    def _make_team(self, t: int, strengths: bool) -> dict:
+        """One club, optionally without the detailed strength ratings.
+
+        `strengths=False` is the payload an older or a trimmed API response
+        looks like, and is what the projection has to fall back to the 1-5
+        difficulty rating on. Worth being able to generate, since that fallback
+        is otherwise never exercised.
+        """
+        team = {
+            "id": t,
+            "name": f"Club {t}",
+            "short_name": f"C{t:02d}",
+            "strength": self.rng.randint(2, 5),
+        }
+        if not strengths:
+            return team
+
+        # spread across a realistic band, with home ratings above away ones
+        attack = self.rng.randint(1000, 1400)
+        defence = self.rng.randint(1000, 1400)
+        team.update(
+            {
+                "strength_overall_home": attack + 40,
+                "strength_overall_away": attack - 40,
+                "strength_attack_home": attack + 50,
+                "strength_attack_away": attack - 50,
+                "strength_defence_home": defence + 50,
+                "strength_defence_away": defence - 50,
+            }
+        )
+        return team
 
     def _make_players(self) -> list[dict]:
         elements, pid = [], 1
@@ -142,6 +168,81 @@ class FakeApi:
 
     def fixtures(self) -> list[dict]:
         return self._fixtures
+
+    def fixtures_for_event(self, gameweek: int) -> list[dict]:
+        """One gameweek's fixtures, with in-play stats on the live ones.
+
+        The first fixture of the gameweek is finished and has had its bonus
+        applied, the second is under way with bonus still to be decided, and
+        the rest have not kicked off. That is the mix a live view has to render
+        correctly on a Saturday afternoon.
+        """
+        rows = [dict(f) for f in self._fixtures if f["event"] == gameweek]
+        for i, fixture in enumerate(rows):
+            home = [e["id"] for e in self._elements if e["team"] == fixture["team_h"]][:4]
+            away = [e["id"] for e in self._elements if e["team"] == fixture["team_a"]][:4]
+            bps_h = [{"element": e, "value": 30 - n * 5} for n, e in enumerate(home)]
+            bps_a = [{"element": e, "value": 28 - n * 5} for n, e in enumerate(away)]
+
+            if i == 0:
+                fixture["started"] = True
+                fixture["finished"] = True
+                fixture["finished_provisional"] = True
+                fixture["stats"] = [
+                    {"identifier": "bps", "h": bps_h, "a": bps_a},
+                    {
+                        "identifier": "bonus",
+                        "h": [{"element": home[0], "value": 3}],
+                        "a": [{"element": away[0], "value": 2}],
+                    },
+                ]
+            elif i == 1:
+                fixture["started"] = True
+                fixture["finished"] = False
+                fixture["finished_provisional"] = False
+                fixture["stats"] = [{"identifier": "bps", "h": bps_h, "a": bps_a}]
+            else:
+                fixture["started"] = False
+                fixture["finished"] = False
+                fixture["finished_provisional"] = False
+                fixture["stats"] = []
+        return rows
+
+    def live(self, gameweek: int) -> dict:
+        """Per-player totals for the gameweek, summed across his fixtures."""
+        playing = set()
+        for fixture in self.fixtures_for_event(gameweek):
+            if fixture["started"]:
+                playing.update([fixture["team_h"], fixture["team_a"]])
+
+        elements = []
+        for element in self._elements:
+            on = element["team"] in playing and element["id"] % 3 != 0
+            elements.append(
+                {
+                    "id": element["id"],
+                    "stats": {
+                        "minutes": 90 if on else 0,
+                        "total_points": 2 + element["id"] % 9 if on else 0,
+                        "bonus": 0,
+                        "bps": 20 + element["id"] % 15 if on else 0,
+                        "goals_scored": 1 if on and element["id"] % 11 == 0 else 0,
+                        "assists": 0,
+                        "clean_sheets": 0,
+                        "goals_conceded": 0,
+                        "yellow_cards": 0,
+                        "red_cards": 0,
+                        "saves": 0,
+                    },
+                }
+            )
+        return {"elements": elements}
+
+    def event_status(self) -> dict:
+        return {"status": [], "leagues": "Updated"}
+
+    def fetched_at(self, key: str):
+        return None
 
     def entry(self, entry_id: int) -> dict:
         """A manager's public profile, with the leagues they are in.

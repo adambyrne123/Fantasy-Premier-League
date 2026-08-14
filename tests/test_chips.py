@@ -42,13 +42,13 @@ def test_every_chip_is_priced_in_every_gameweek(horizon_data, evaluated):
     _, by_gw = horizon_data
     events = sorted(int(e) for e in by_gw["event"].unique())
     assert set(evaluated["event"]) == set(events)
-    for chip in ("Bench Boost", "Triple Captain", "Free Hit"):
+    for chip in ("Bench Boost", "Triple Captain", "Free Hit", "Wildcard"):
         assert (evaluated["chip"] == chip).sum() == len(events)
 
 
 def test_best_per_chip_gives_one_row_each(evaluated):
     best = chips.best_per_chip(evaluated)
-    assert len(best) == 3
+    assert len(best) == len(chips.CHIPS)
     assert best["chip"].is_unique
 
 
@@ -136,3 +136,34 @@ def test_gameweek_frame_scores_a_blank_as_zero(horizon_data):
     playing = set(by_gw[by_gw["event"] == event]["id"])
     blanks = [i for i in frame.index if i not in playing]
     assert (frame.loc[blanks, "xpts_gw"] == 0).all()
+
+
+def test_a_wildcard_is_priced_over_the_rest_of_the_horizon(horizon_data, evaluated):
+    """The other three buy one gameweek. A wildcard is kept, so leaving it later
+    buys fewer weeks and has to be worth less, which is the whole reason it is
+    not priced the same way."""
+    _, by_gw = horizon_data
+    events = sorted(int(e) for e in by_gw["event"].unique())
+    wildcard = evaluated[evaluated["chip"] == "Wildcard"].set_index("event")
+
+    baselines = wildcard["baseline"].reindex(events)
+    assert baselines.is_monotonic_decreasing, "fewer weeks left means fewer points to compare"
+    assert f"over {len(events)} weeks" in wildcard.loc[events[0], "detail"]
+
+
+def test_a_wildcard_never_makes_a_squad_worse(horizon_data, evaluated):
+    """It re-solves from the whole game, so it cannot do worse than what you
+    already own. A negative gain means the pool or the budget is wrong."""
+    wildcard = evaluated[evaluated["chip"] == "Wildcard"]
+    assert (wildcard["gain"] >= -1e-9).all()
+
+
+def test_window_frame_sums_the_gameweeks_it_is_given(horizon_data):
+    from fpl_manager.optimiser import gameweek_frame, window_frame
+
+    projections, by_gw = horizon_data
+    events = sorted(int(e) for e in by_gw["event"].unique())
+
+    weekly = sum(gameweek_frame(projections, by_gw, e)["xpts_gw"] for e in events[:2])
+    windowed = window_frame(projections, by_gw, events[0], events[1])["xpts_gw"]
+    assert (weekly - windowed).abs().max() < 1e-9
