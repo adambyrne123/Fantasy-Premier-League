@@ -284,17 +284,145 @@ def test_the_average_fixture_scores_one(season: Season):
     assert 0.9 < strength.mean() < 1.1
 
 
-def test_a_strong_attack_against_a_weak_defence_beats_the_rating_alone(season: Season):
+def test_a_strong_attack_against_a_weak_defence_beats_a_hostile_one(season: Season):
+    """The multiplier rises with the strength ratio, every other input equal.
+
+    Deliberately not asserted against the difficulty-only value. The two
+    signals have different spreads, so on a fixture FPL already rates 5 the
+    rating alone is lower than anything the strength term produces, and
+    blending the two correctly moves it up. Monotonicity in strength is the
+    property that has to hold; agreement with the rating it is there to
+    correct is not.
+    """
     from fpl_manager.projections import fixture_multiplier
 
     fixtures = season.team_fixtures(horizon=4).head(1).copy()
     difficulty, is_home = fixtures["difficulty"], fixtures["is_home"]
 
-    plain = fixture_multiplier(difficulty, is_home)
-    favourable = fixture_multiplier(difficulty, is_home, pd.Series([1.4], index=fixtures.index))
-    hostile = fixture_multiplier(difficulty, is_home, pd.Series([0.7], index=fixtures.index))
+    def blended(ratio: float) -> float:
+        strength = pd.Series([ratio], index=fixtures.index)
+        return float(fixture_multiplier(difficulty, is_home, strength).iloc[0])
 
-    assert float(favourable.iloc[0]) > float(plain.iloc[0]) > float(hostile.iloc[0])
+    assert blended(1.4) > blended(1.0) > blended(0.7)
+
+
+def test_a_neutral_strength_pulls_the_fixture_towards_average(season: Season):
+    """Two clubs of exactly average rating say the fixture is unremarkable, so
+    the blend dilutes whatever the difficulty rating thought of it.
+
+    This is what `STRENGTH_WEIGHT` buys and the reason it is not 1.0: the term
+    can disagree with the rating, but only by its share. Asserted because the
+    alternative reading, that a neutral strength is a no-op, is the intuitive
+    one and is wrong."""
+    from fpl_manager.projections import HOME_BONUS, fixture_multiplier
+
+    fixtures = season.team_fixtures(horizon=4).head(1).copy()
+    difficulty, is_home = fixtures["difficulty"], fixtures["is_home"]
+    home_adjust = HOME_BONUS if bool(is_home.iloc[0]) else -HOME_BONUS
+
+    plain = float(fixture_multiplier(difficulty, is_home).iloc[0]) - home_adjust
+    neutral = (
+        float(
+            fixture_multiplier(difficulty, is_home, pd.Series([1.0], index=fixtures.index)).iloc[0]
+        )
+        - home_adjust
+    )
+
+    assert abs(neutral - 1.0) < abs(plain - 1.0), "a neutral rating should soften the rating"
+
+
+def test_the_component_rate_is_inert_pre_season(season: Season):
+    """FPL publishes the expected goals fields as zero until the season starts,
+    so in August this term has nothing to say and the projection has to rest on
+    last season exactly as it did before."""
+    from fpl_manager.projections import component_rate, team_defence_rate
+
+    if season.gameweeks_played:
+        pytest.skip("this is the pre-season half of the fixture")
+
+    rate = component_rate(season.players, team_defence_rate(season.players))
+    assert rate.isna().all(), "nothing played means nothing to rebuild a rate from"
+
+
+def test_a_penalty_taker_outprojects_an_identical_team_mate(season: Season):
+    """Spot kicks are a claim on chances still to come, so they cannot be read
+    off the expected goals a player has already accumulated."""
+    from fpl_manager.projections import component_rate, team_defence_rate
+
+    players = season.players.copy()
+    forwards = players[(players["position"] == "FWD") & (players["minutes"] >= 900)]
+    if len(forwards) < 2:
+        pytest.skip("needs two forwards with minutes")
+
+    taker, other = forwards.index[0], forwards.index[1]
+    # identical in every respect the model reads, then one takes the penalties
+    for column in ("minutes", "expected_goals", "expected_assists", "team"):
+        players.loc[other, column] = players.loc[taker, column]
+    players["penalties_order"] = np.nan
+    players.loc[taker, "penalties_order"] = 1
+
+    rate = component_rate(players, team_defence_rate(players))
+    assert rate[taker] > rate[other]
+
+
+def test_a_mean_defence_beats_a_leaky_one_for_a_defender(season: Season):
+    """The clean sheet half of the rate is the whole reason a defender and a
+    forward cannot share one scalar."""
+    from fpl_manager.projections import component_rate
+
+    players = season.players.copy()
+    defenders = players[(players["position"] == "DEF") & (players["minutes"] >= 900)]
+    # one per club, since the clean sheet term is keyed on the club and two
+    # defenders from the same one would be handed the same number
+    defenders = defenders.groupby("team").head(1)
+    if len(defenders) < 2:
+        pytest.skip("needs two defenders at different clubs")
+
+    tight, leaky = defenders.index[0], defenders.index[1]
+    for column in ("minutes", "expected_goals", "expected_assists"):
+        players.loc[leaky, column] = players.loc[tight, column]
+
+    defence = pd.Series(
+        {int(players.loc[tight, "team"]): 0.8, int(players.loc[leaky, "team"]): 2.4}
+    )
+    rate = component_rate(players, defence)
+    assert rate[tight] > rate[leaky]
+
+
+def test_a_forward_outscores_a_defender_on_the_same_expected_goals(season: Season):
+    """A goal is worth six to a defender and four to a forward, so the position
+    has to enter the rate rather than being averaged away."""
+    from fpl_manager.projections import component_rate
+
+    players = season.players.copy()
+    playing = players[players["minutes"] >= 900]
+    forward = playing[playing["position"] == "FWD"].index[:1]
+    defender = playing[playing["position"] == "DEF"].index[:1]
+    if not len(forward) or not len(defender):
+        pytest.skip("needs one of each with minutes")
+
+    f, d = forward[0], defender[0]
+    players.loc[d, ["minutes", "expected_goals", "expected_assists"]] = players.loc[
+        f, ["minutes", "expected_goals", "expected_assists"]
+    ].to_numpy()
+
+    # no clean sheet term, so the only difference left is what a goal is worth
+    rate = component_rate(players, None)
+    assert rate[d] > rate[f], "six points a goal beats four"
+
+
+def test_team_defence_is_read_off_the_keepers(season: Season):
+    """Expected goals conceded is charged per player per minute on the pitch,
+    so summing outfielders counts the same goals once per defender."""
+    from fpl_manager.projections import team_defence_rate
+
+    rate = team_defence_rate(season.players)
+    if not season.gameweeks_played:
+        assert rate.empty or rate.isna().all()
+        return
+
+    assert (rate.dropna() >= 0).all()
+    assert (rate.dropna() < 6).all(), "a club conceding six a game is a parsing error"
 
 
 def test_strength_is_clipped_rather_than_extrapolated(season: Season):

@@ -123,6 +123,21 @@ per-position fit of rate against price, which is a stand-in and nothing more:
 a promoted club's 5.5m midfielder gets a promoted-club-shaped number regardless
 of what they actually did in the Championship.
 
+By the same weight it also blends in a rate rebuilt from what a player is
+expected to do rather than what he happened to score: expected goals and assists
+priced at what FPL pays for them in his position, plus a clean sheet chance from
+how much his club concedes, taken as `exp(-xGC per 90)`. That is what stops a
+defender and a forward collapsing into the same number, which a single scalar
+rate cannot avoid. Penalty and free kick duty are added on top, because a player
+who has just been given the job has a claim on chances his past numbers cannot
+show yet.
+
+It contributes nothing in August, and deliberately. FPL publishes the expected
+goals fields as zero until the season is under way, and a player needs 270
+minutes this season before his own rates are used at all, so the term arrives
+around the fourth gameweek rather than pretending to know something in the
+first.
+
 **expected_minutes_share** is how often a player starts multiplied by how long
 he lasts when he does, rather than his share of the minutes available. The
 difference matters more than it sounds: minutes over minutes available cancels

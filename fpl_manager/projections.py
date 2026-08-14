@@ -56,6 +56,25 @@ STARTER_DURATION = 0.85  # share of 90 a starter lasts, absent anything better
 
 PRIOR_COLUMNS = ["prior_season", "prior_points", "prior_minutes", "prior_starts", "prior_end_cost"]
 
+# FPL's scoring, as far as the component rate reproduces it. Saves, cards and
+# defensive contributions are left out: they are small, and two of the three
+# are penalties for things the model has no way to anticipate.
+GOAL_POINTS = {"GKP": 6, "DEF": 6, "MID": 5, "FWD": 4}
+CLEAN_SHEET_POINTS = {"GKP": 4, "DEF": 4, "MID": 1, "FWD": 0}
+ASSIST_POINTS = 3
+APPEARANCE_POINTS = 2
+
+# A first choice penalty taker is worth roughly a goal every eight or nine
+# matches over someone otherwise identical, and a first choice direct free kick
+# taker rather less. Set by eye against how many spot kicks a season actually
+# produces, so they are a starting point to tune rather than a finding.
+PENALTY_XG_P90 = 0.055
+FREEKICK_XG_P90 = 0.012
+
+# Minutes a player needs this season before his own rates mean anything. Below
+# it the component rests on the team's defence and his set piece duty only.
+COMPONENT_MINUTES = 270
+
 
 def fetch_prior_season(season: Season, delay: float = 0.15) -> pd.DataFrame:
     """Pull last season's totals for every player via element-summary.
@@ -204,6 +223,90 @@ def _minutes_share(players: pd.DataFrame, start_rate: pd.Series, duration: pd.Se
     return (blended * lasts + (1 - blended) * SUB_SHARE).clip(0, 1)
 
 
+def team_defence_rate(players: pd.DataFrame) -> pd.Series:
+    """Goals each club is expected to concede per 90, by club id.
+
+    Taken off the keepers, because `expected_goals_conceded` is charged to a
+    player only while he was on the pitch, and a keeper is on it for all of it.
+    Summing outfielders instead would count the same goals once per defender
+    and give a number several times too large.
+
+    Empty when nobody has the column or nobody has played, which is what
+    pre-season looks like, and callers treat that as unknown rather than as a
+    league of clubs that concede nothing.
+    """
+    if "expected_goals_conceded" not in players.columns:
+        return pd.Series(dtype="float64")
+
+    keepers = players[players["position"] == "GKP"]
+    conceded = pd.to_numeric(keepers["expected_goals_conceded"], errors="coerce").fillna(0.0)
+    minutes = pd.to_numeric(keepers["minutes"], errors="coerce").fillna(0.0)
+
+    by_club = pd.DataFrame({"team": keepers["team"], "xgc": conceded, "minutes": minutes})
+    totals = by_club.groupby("team")[["xgc", "minutes"]].sum()
+    rate = totals["xgc"] / (totals["minutes"] / 90)
+    return rate.replace([np.inf, -np.inf], np.nan).dropna()
+
+
+def component_rate(players: pd.DataFrame, defence: pd.Series | None = None) -> pd.Series:
+    """Points per 90 rebuilt from what a player is expected to do, not what he scored.
+
+    A scalar `points_per_90` cannot tell apart a defender who keeps clean sheets
+    from a forward who scores, because both collapse into the same number. This
+    splits them by the thing FPL actually pays for:
+
+        appearance + expected goals * goal points + expected assists * 3
+                   + P(clean sheet) * clean sheet points
+
+    Clean sheet probability is the Poisson zero, `exp(-xGC per 90)`, on the
+    club's rate rather than the player's. The opponent adjustment deliberately
+    does not appear here. It belongs in the fixture term, where the strength
+    ratings already handle it, and applying it twice would double count.
+
+    Comes back as NaN for anyone the inputs cannot describe, so the caller can
+    fall back rather than being handed a confident zero.
+    """
+    index = players.index
+    needed = {"expected_goals", "expected_assists", "minutes", "position"}
+    if not needed <= set(players.columns):
+        return pd.Series(np.nan, index=index, dtype="float64")
+
+    minutes = pd.to_numeric(players["minutes"], errors="coerce").fillna(0.0)
+    ninetieths = minutes / 90
+    played_enough = minutes >= COMPONENT_MINUTES
+
+    xg = pd.to_numeric(players["expected_goals"], errors="coerce")
+    xa = pd.to_numeric(players["expected_assists"], errors="coerce")
+    xg90 = (xg / ninetieths).where(played_enough)
+    xa90 = (xa / ninetieths).where(played_enough)
+
+    # set piece duty is a claim on future chances rather than a record of past
+    # ones, which is why it is added rather than being left to the xG above
+    order = pd.to_numeric(players.get("penalties_order"), errors="coerce")
+    freekicks = pd.to_numeric(players.get("direct_freekicks_order"), errors="coerce")
+    xg90 = xg90.fillna(0.0) + (order == 1) * PENALTY_XG_P90 + (freekicks == 1) * FREEKICK_XG_P90
+    xa90 = xa90.fillna(0.0)
+
+    position = players["position"]
+    goal_points = position.map(GOAL_POINTS).astype("float64")
+    cs_points = position.map(CLEAN_SHEET_POINTS).astype("float64")
+
+    if defence is None or defence.empty:
+        clean_sheet = pd.Series(np.nan, index=index, dtype="float64")
+    else:
+        xgc = players["team"].map(defence).astype("float64")
+        clean_sheet = np.exp(-xgc) * cs_points
+
+    rate = APPEARANCE_POINTS + xg90 * goal_points + xa90 * ASSIST_POINTS
+    rate = rate + clean_sheet.fillna(0.0)
+
+    # Set piece duty adjusts a rate, it does not make one. Someone who has not
+    # played has no expected goals and no minutes to divide by, and calling the
+    # appearance points alone a scoring rate would be inventing a number rather
+    # than measuring one. Pre-season that is everybody.
+    return rate.where(played_enough).astype("float64")
+
+
 def build_rates(season: Season, prior: pd.DataFrame | None = None) -> pd.DataFrame:
     """Points per 90 and expected minutes share for every player."""
     p = season.players
@@ -244,7 +347,23 @@ def build_rates(season: Season, prior: pd.DataFrame | None = None) -> pd.DataFra
         out["prior_p90"],
         weight_now * np.nan_to_num(now_rate) + (1 - weight_now) * out["prior_p90"],
     )
-    out["points_per_90"] = np.clip(blended, 0, None)
+    observed = pd.Series(np.clip(blended, 0, None), index=p.index)
+
+    # What he is expected to do, blended over what he has been scoring, by the
+    # same weight that governs current against prior. Pre-season that weight is
+    # zero, so this contributes nothing and the old behaviour stands, which is
+    # the defined pre-season behaviour every new term needs. It also has to be:
+    # FPL publishes the expected goals fields as zero until the season starts.
+    out["component_p90"] = component_rate(p, team_defence_rate(p))
+    out["points_per_90"] = np.clip(
+        np.where(
+            out["component_p90"].isna(),
+            observed,
+            (1 - weight_now) * observed + weight_now * out["component_p90"],
+        ),
+        0,
+        None,
+    )
 
     # expected share of 90 minutes, from how often he starts rather than from
     # the same minutes total that already normalised the rate above
