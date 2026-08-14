@@ -73,6 +73,18 @@ UK = ZoneInfo("Europe/London")
 # point of difficulty the swing is inside the noise of FPL's own 1 to 5 rating.
 SWING_THRESHOLD = 0.6
 POSITION_COLOURS = {"GKP": "#FFB020", "DEF": "#00C2FF", "MID": "#00E87B", "FWD": "#FF4D6D"}
+
+# Player photographs and club kits, served by the same CDNs the FPL site uses.
+# Nothing here fetches them: these are strings handed to the browser, so the
+# cache in `api.py` is not involved and neither is the network from our side.
+#
+# A player with no photograph gets a 403 rather than a 404, and it is the cheap
+# fringe players who are missing, which is exactly who the optimiser buys to
+# enable a squad. So a face always carries a fallback to the club kit and never
+# stands on its own.
+FACE_URL = "https://resources.premierleague.com/premierleague/photos/players/110x140/p{}.png"
+KIT_URL = "https://fantasy.premierleague.com/dist/img/shirts/standard/shirt_{}{}-66.png"
+BADGE_URL = "https://resources.premierleague.com/premierleague/badges/70/t{}.png"
 SWING_COLUMNS = {
     "club": "Club",
     "now": st.column_config.NumberColumn("Now", format="%.2f"),
@@ -116,8 +128,24 @@ PITCH_CSS = """
   .statusbar .cell { flex-basis:44%; min-width:0; padding:8px 10px; }
   .statusbar .v { font-size:.8rem; }
 }
+/* Markings as an SVG background layer rather than pseudo-elements, since the
+   element has only two and the shape has to stretch to whatever height the
+   formation ends up being. preserveAspectRatio="none" is what allows that. */
 .pitch {
   background:
+    url('data:image/svg+xml;utf8,\
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 140" preserveAspectRatio="none">\
+<g fill="none" stroke="rgba(255,255,255,.20)" stroke-width="0.5">\
+<rect x="1" y="1" width="98" height="138"/>\
+<line x1="1" y1="70" x2="99" y2="70"/>\
+<circle cx="50" cy="70" r="13"/>\
+<rect x="28" y="1" width="44" height="20"/>\
+<rect x="39" y="1" width="22" height="8"/>\
+<rect x="28" y="119" width="44" height="20"/>\
+<rect x="39" y="131" width="22" height="8"/>\
+</g><g fill="rgba(255,255,255,.20)">\
+<circle cx="50" cy="70" r="1"/>\
+</g></svg>') center/100% 100% no-repeat,
     repeating-linear-gradient(to bottom,
       rgba(255,255,255,.05) 0 7%, rgba(0,0,0,0) 7% 14%),
     linear-gradient(180deg, #10794a 0%, #0a5733 100%);
@@ -125,6 +153,22 @@ PITCH_CSS = """
   border-radius: var(--radius);
   padding: 16px 10px 4px;
 }
+.mug {
+  display:block; width:44px; height:56px; margin:0 auto 2px;
+  object-fit:cover; object-position:top center;
+  border-radius:6px; background:rgba(55,0,60,.10);
+}
+.pitch.compact .mug, .bench-strip.compact .mug { width:34px; height:43px; }
+.state {
+  border:1px solid var(--line-soft); border-radius:var(--radius);
+  background:var(--card); padding:18px 20px; margin:4px 0 8px;
+}
+.state h4 { margin:0 0 6px; font-size:1rem; font-weight:700; }
+.state p { margin:0; color:var(--muted); font-size:.86rem; line-height:1.5; }
+.pd-head { display:flex; align-items:center; gap:14px; margin-bottom:4px; }
+.pd-head h4 { margin:0; font-size:1.25rem; font-weight:700; }
+.pd-head p { margin:2px 0 0; color:var(--muted); font-size:.86rem; }
+.mug.big { width:66px; height:84px; margin:0; border-radius:8px; }
 .pitch-line { display:flex; justify-content:center; gap:10px; flex-wrap:wrap; margin-bottom:14px; }
 .pitch-cap, .bench-cap {
   text-align:center; font-size:.68rem; letter-spacing:.12em; text-transform:uppercase;
@@ -168,6 +212,22 @@ PITCH_CSS = """
   background:rgba(255,255,255,.05); border:1px dashed var(--line);
 }
 .bench-strip .shirt { width:100px; background:rgba(255,255,255,.8); }
+/* Last in the sheet on purpose. These override the card rules above, and at
+   equal specificity the later rule is the one that wins.
+
+   A phone leaves about 320px of pitch. At the full card width only three fit
+   on a row, so a five man midfield wraps onto two and the formation stops
+   being readable, which is the one thing this layout exists to show. Five
+   across has to clear the gaps as well as the cards, which leaves 58px each. */
+@media (max-width: 640px) {
+  .pitch .shirt, .bench-strip .shirt { width:58px; padding:5px 2px; }
+  .pitch .mug, .bench-strip .mug { width:30px; height:38px; }
+  .pitch-line { gap:5px; margin-bottom:10px; }
+  .shirt .nm { font-size:.6rem; }
+  .shirt .meta { font-size:.5rem; }
+  .shirt .pts { font-size:.8rem; margin-top:2px; }
+  .badge { font-size:.5rem; padding:0 3px; margin-left:2px; }
+}
 </style>
 """
 st.markdown(PITCH_CSS, unsafe_allow_html=True)
@@ -239,6 +299,41 @@ def load_projections(
     """Per-player totals and the per-gameweek frame chip timing needs."""
     prior = cached_prior(_season) if use_prior else None
     return project(_season, horizon=horizon, prior=prior)
+
+
+@st.cache_data(show_spinner=False)
+def player_images(_season: Season) -> pd.DataFrame:
+    """Face, club kit and club badge URL for every player, keyed by player id.
+
+    Built from `code` and `team_code`, which ride along on the player frame
+    because `_build_players` keeps every column the payload came with. Keyed by
+    id so it reindexes onto any projection-derived frame without a merge, ids
+    being the join key everywhere here.
+
+    Keepers wear a different kit from the outfielders, which is the `_1` in the
+    filename and the only reason position matters to this.
+
+    Comes back empty if either id is missing rather than raising. This is an
+    undocumented API and the whole feature is decoration, so losing the faces is
+    a fair price for a schema change. Taking the page down over a photograph is
+    not.
+    """
+    players = _season.players
+    if not {"code", "team_code"} <= set(players.columns):
+        return pd.DataFrame(columns=["face", "kit", "badge"])
+
+    keeper = players["position"].eq("GKP").map({True: "_1", False: ""})
+    return pd.DataFrame(
+        {
+            "face": players["code"].map(FACE_URL.format),
+            "kit": [
+                KIT_URL.format(code, suffix)
+                for code, suffix in zip(players["team_code"], keeper, strict=True)
+            ],
+            "badge": players["team_code"].map(BADGE_URL.format),
+        },
+        index=players.index,
+    )
 
 
 @st.cache_data(show_spinner=False)
@@ -350,6 +445,7 @@ def pool_column_config(horizon: int, gw_cols: list[str], max_xpts: float) -> dic
     the fixture run makes the table wider than a phone.
     """
     config = {
+        "badge": st.column_config.ImageColumn("", width="small", pinned=True),
         "name": st.column_config.TextColumn("Player", pinned=True),
         "position": st.column_config.TextColumn("Pos", width="small"),
         "club": st.column_config.TextColumn("Club", width="small"),
@@ -384,6 +480,7 @@ def pool_table(
     columns: list[str],
     horizon: int,
     key: str,
+    images: pd.DataFrame | None = None,
 ) -> int | None:
     """The pool, with each player's fixture run beside his numbers.
 
@@ -392,6 +489,12 @@ def pool_table(
     """
     gw_cols = [f"GW{int(c)}" for c in labels.columns]
     table = view[["name", "position", "club", *columns]]
+
+    # the badge goes first so the club reads before the name, which is how you
+    # scan a list of players you half recognise
+    if images is not None and not images.empty:
+        table = table.copy()
+        table.insert(0, "badge", images["badge"].reindex(table.index))
 
     if gw_cols:
         runs = labels.reindex(view["team"]).set_axis(view.index)
@@ -419,7 +522,9 @@ def pool_table(
 
 
 @st.dialog("Player detail", width="large")
-def player_detail(row: pd.Series, weeks: pd.DataFrame, horizon: int) -> None:
+def player_detail(
+    row: pd.Series, weeks: pd.DataFrame, horizon: int, images: pd.DataFrame | None = None
+) -> None:
     """Why this player is ranked where he is.
 
     The projection is three terms multiplied together and the total says
@@ -429,9 +534,12 @@ def player_detail(row: pd.Series, weeks: pd.DataFrame, horizon: int) -> None:
     tell you which you are looking at.
     """
     severity, note = availability(row)
-    st.markdown(f"#### {escape(str(row['name']))}")
-    st.caption(
-        f"{row['club']} · {row['position']} · {row['price']:.1f}m · {row['ownership']:.1f}% owned"
+    st.markdown(
+        f'<div class="pd-head">{_mug(images, row.name, "mug big")}'
+        f"<div><h4>{escape(str(row['name']))}</h4>"
+        f"<p>{escape(str(row['club']))} · {escape(str(row['position']))} · "
+        f"{row['price']:.1f}m · {row['ownership']:.1f}% owned</p></div></div>",
+        unsafe_allow_html=True,
     )
     if severity:
         {"out": st.error, "doubt": st.warning, "note": st.info}[severity](note)
@@ -501,13 +609,35 @@ def availability(row: pd.Series) -> tuple[str, str]:
     return "", ""
 
 
-def _shirt(row: pd.Series, badge: str = "", highlight: str = "") -> str:
+def _mug(images: pd.DataFrame | None, player_id, css: str = "mug") -> str:
+    """A player's face, falling back to his club kit if there is no photograph.
+
+    Roughly half of the cheapest players have no photograph and the CDN answers
+    403 for them, which is the bench of any squad the optimiser builds. Hiding
+    a missing image, which is what the sites doing this tend to do, would leave
+    a hole exactly where you most need to tell two cheap defenders apart.
+
+    `onerror` clears itself before swapping, so a kit that also fails cannot put
+    the browser in a loop.
+    """
+    if images is None or player_id not in images.index:
+        return ""
+    face, kit = images.loc[player_id, "face"], images.loc[player_id, "kit"]
+    return (
+        f'<img class="{css}" src="{escape(face)}" alt="" loading="lazy" '
+        f"onerror=\"this.onerror=null;this.src='{escape(kit)}'\">"
+    )
+
+
+def _shirt(
+    row: pd.Series, badge: str = "", highlight: str = "", images: pd.DataFrame | None = None
+) -> str:
     mark = f'<span class="badge {badge.lower()}">{badge}</span>' if badge else ""
     severity, note = availability(row)
     flag = f'<span class="flag {severity}" title="{escape(note)}"></span>' if severity else ""
     ring = f" ring-{highlight}" if highlight else ""
     return (
-        f'<div class="shirt{ring}">{flag}'
+        f'<div class="shirt{ring}">{flag}{_mug(images, row.name)}'
         f'<div class="nm">{escape(str(row["name"]))}{mark}</div>'
         f'<div class="meta">{escape(str(row["club"]))} · {row["price"]:.1f}m</div>'
         f'<div class="pts">{row["xpts_next"]:.1f}</div>'
@@ -523,6 +653,7 @@ def formation_view(
     *,
     compact: bool = False,
     highlight: dict | None = None,
+    images: pd.DataFrame | None = None,
 ) -> None:
     """Lay the XI out on a pitch, in formation, the way the FPL site does.
 
@@ -530,6 +661,10 @@ def formation_view(
     work out the shape, which is the one thing the layout should tell you at a
     glance. `highlight` rings individual players, which is how the transfer
     view shows what is leaving and what is arriving.
+
+    `images` is passed in rather than read from a global because this has three
+    call sites and a global that one of them forgot would fail silently, as a
+    pitch of nameless cards rather than an error.
     """
     highlight = highlight or {}
     lines = []
@@ -542,6 +677,7 @@ def formation_view(
                 row,
                 "C" if pid == captain_id else "V" if pid == vice_id else "",
                 highlight.get(pid, ""),
+                images,
             )
             for pid, row in line.iterrows()
         )
@@ -555,13 +691,29 @@ def formation_view(
     )
 
     if bench is not None and not bench.empty:
-        strip = "".join(_shirt(row, "", highlight.get(pid, "")) for pid, row in bench.iterrows())
+        strip = "".join(
+            _shirt(row, "", highlight.get(pid, ""), images) for pid, row in bench.iterrows()
+        )
         markup += (
             f'<div class="bench-strip{size}"><div class="bench-cap">Bench, in order</div>'
             f'<div class="pitch-line">{strip}</div></div>'
         )
 
     st.markdown(markup, unsafe_allow_html=True)
+
+
+def empty_state(title: str, body: str) -> None:
+    """Say what is missing, why, and when it will fill.
+
+    Most of the empty places in this app are empty for a reason that is not the
+    user's doing: no gameweek has been scored, or no postponement has been
+    announced yet. A one line info bar reads as something being broken, which
+    for the months before a season starts is most of the page.
+    """
+    st.markdown(
+        f'<div class="state"><h4>{escape(title)}</h4><p>{escape(body)}</p></div>',
+        unsafe_allow_html=True,
+    )
 
 
 def flag_legend() -> None:
@@ -663,6 +815,7 @@ with st.sidebar.expander("Squad building", expanded=False):
     budget = st.number_input("Budget (m)", 80.0, 120.0, 100.0, 0.1)
 
 season = load_season(st.session_state.refresh_token)
+images = player_images(season)
 projections, by_gameweek = load_projections(season, horizon, use_prior)
 lookup = name_lookup(projections)
 
@@ -742,7 +895,9 @@ with build_tab:
     b.metric(f"Projected over {horizon} GW", f"{result.projected:.0f} pts")
     c.metric("Captain", result.captain["name"])
 
-    formation_view(result.xi, result.bench, result.captain.name, result.vice_captain.name)
+    formation_view(
+        result.xi, result.bench, result.captain.name, result.vice_captain.name, images=images
+    )
     flag_legend()
 
     st.download_button(
@@ -793,7 +948,11 @@ with players_tab:
     # an empty filter result is an ordinary thing to do, not an error, so it
     # must not reach st.stop() and take the other four tabs down with it
     if view.empty:
-        st.info("Nothing matches those filters. Widen them to see players again.")
+        empty_state(
+            "No players match",
+            "Nothing in the pool clears every filter at once. Widen the price or ownership "
+            "range, or clear the search, to see players again.",
+        )
     else:
         stat_view = st.segmented_control(
             "Stat view", list(STAT_VIEWS), default="Projection", label_visibility="collapsed"
@@ -812,12 +971,14 @@ with players_tab:
             f"{sort_by.replace('_', ' ')}. Click a row for the working behind the projection."
         )
         labels, difficulty = fixture_runs(season, horizon)
-        chosen = pool_table(shown, labels, difficulty, columns, horizon, key="pool")
+        chosen = pool_table(shown, labels, difficulty, columns, horizon, key="pool", images=images)
 
         # only open on a change, or closing the dialog would reopen it at once
         if chosen is not None and st.session_state.get("inspected") != chosen:
             st.session_state.inspected = chosen
-            player_detail(view.loc[chosen], player_weeks(by_gameweek, chosen), horizon)
+            player_detail(
+                view.loc[chosen], player_weeks(by_gameweek, chosen), horizon, images=images
+            )
         elif chosen is None:
             st.session_state.inspected = None
 
@@ -877,9 +1038,11 @@ with players_tab:
     st.subheader("Price pressure")
     pressure = load_prices(season)
     if is_dormant(pressure):
-        st.info(
-            "No transfers have been made yet this gameweek, so there is nothing to read. "
-            "This fills in once the season is under way."
+        empty_state(
+            "No transfer activity yet",
+            "Price pressure is read from how many people have transferred a player in or "
+            "out this gameweek, and nobody has yet. This fills in once the season is under "
+            "way and the counters start moving.",
         )
     else:
         st.caption(
@@ -1112,9 +1275,12 @@ with fixtures_tab:
     shape = load_gameweek_shape(season, radar_weeks)
 
     if shape.empty:
-        st.info(
-            f"No blanks or doubles in the next {radar_weeks} gameweeks on the published "
-            "fixture list. This fills in on its own as postponements are announced."
+        empty_state(
+            "Nothing irregular coming",
+            f"Every club plays exactly once in each of the next {radar_weeks} gameweeks on "
+            "the published fixture list. Blanks and doubles appear mid-season, when cup "
+            "ties and European fixtures force postponements, and this fills in on its own "
+            "as they are announced.",
         )
     else:
         summary = (
@@ -1317,6 +1483,7 @@ with transfers_tab:
                 None,
                 compact=True,
                 highlight={i: "out" for i in plan.transfers_out.index},
+                images=images,
             )
         with after:
             st.caption(f"After · captain {plan.captain['name']}")
@@ -1327,6 +1494,7 @@ with transfers_tab:
                 plan.vice_captain.name,
                 compact=True,
                 highlight={i: "in" for i in plan.transfers_in.index},
+                images=images,
             )
         flag_legend()
 
@@ -1460,9 +1628,11 @@ with leagues_tab:
             table, info = standings(season, names[picked])
 
             if table.empty:
-                st.info(
-                    f"{info['name']} has no table yet. Classic leagues fill in once the first "
-                    "gameweek has been scored."
+                empty_state(
+                    f"{info['name']} has no table yet",
+                    "Nobody has a rank before anyone has scored, so the FPL API returns an "
+                    "empty league until the first gameweek is settled. The league itself is "
+                    "real and this fills in then.",
                 )
             else:
                 st.caption(f"{info['name']}, page {info['page']}")

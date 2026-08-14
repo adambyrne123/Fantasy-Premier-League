@@ -66,6 +66,13 @@ class FakeApi:
                     elements.append(
                         {
                             "id": pid,
+                            # `code` is the photograph id and `team_code` the
+                            # kit id, both distinct from the ids beside them.
+                            # The front end builds image URLs off these, so the
+                            # fake has to keep them apart the way the real
+                            # payload does or a swapped pair would pass here.
+                            "code": 500_000 + pid,
+                            "team_code": 100 + team,
                             "first_name": f"First{pid}",
                             "second_name": f"Last{pid}",
                             "web_name": f"P{pid}",

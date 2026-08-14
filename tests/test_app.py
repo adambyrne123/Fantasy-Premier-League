@@ -9,6 +9,7 @@ somewhere down a tab the developer did not click on before shipping.
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
 
 import pytest
@@ -47,7 +48,12 @@ def _app(monkeypatch, tmp_path, played: int):
 
     st.cache_data.clear()
     st.cache_resource.clear()
-    return AppTest.from_file(str(APP), default_timeout=120)
+    # Every run here solves the full squad MILP, and there are enough of these
+    # now that a loaded machine can push one past a two minute budget. AppTest
+    # reports that as a bare RuntimeError, which reads like a broken app rather
+    # than a slow one, so the budget is generous on purpose. It costs nothing
+    # when the run is healthy.
+    return AppTest.from_file(str(APP), default_timeout=400)
 
 
 @pytest.fixture
@@ -73,6 +79,11 @@ def test_every_tab_renders(app):
     labels = [tab.label for tab in at.tabs] if at.tabs else []
     for expected in ["Squad", "Players", "ROI", "Fixtures", "Transfers", "Chips", "Leagues"]:
         assert expected in labels
+
+
+def _states(at):
+    """Text of every empty-state card. They are markdown, not st.info."""
+    return [m.value for m in at.markdown if 'class="state"' in m.value]
 
 
 def _leagues_entry(at):
@@ -110,7 +121,7 @@ def test_an_empty_league_table_says_so(app):
     at = app.run()
     _leagues_entry(at).set_value(1).run()
     assert not at.exception
-    assert any("no table yet" in info.value for info in at.info)
+    assert any("has no table yet" in card for card in _states(at))
 
 
 def test_a_bad_manager_id_is_an_error_not_a_traceback(app, monkeypatch):
@@ -143,6 +154,58 @@ def _pool(at):
     return next(
         d.value for d in at.dataframe if any(str(c).startswith("GW") for c in d.value.columns)
     )
+
+
+def _pitch(at):
+    return next(m.value for m in at.markdown if 'class="pitch' in m.value)
+
+
+def test_every_card_in_the_squad_carries_a_face(app):
+    """Fifteen identical white rectangles tell you nothing about who is in the
+    side, which is the one thing a pitch view exists to say. The bench is part
+    of that: it renders in the same block and is where the players you least
+    recognise sit."""
+    at = app.run()
+    assert not at.exception
+    pitch = _pitch(at)
+    assert pitch.count('<img class="mug"') == 15, "eleven starters and four on the bench"
+    assert "photos/players/110x140/p500" in pitch, "built from the player's code, not his id"
+
+
+def test_a_missing_face_falls_back_to_the_club_kit(app):
+    """Roughly half the cheapest players have no photograph and the CDN answers
+    403, and cheap players are exactly what the optimiser puts on a bench.
+    Without this the bench renders as holes."""
+    at = app.run()
+    pitch = _pitch(at)
+    assert "onerror=" in pitch
+    assert "this.onerror=null" in pitch, "a failing kit must not loop"
+    assert "dist/img/shirts/standard/shirt_" in pitch
+
+
+def test_the_keeper_wears_a_different_kit_from_the_outfielders(app):
+    """Keepers have their own kit image, the `_1` variant. Getting this wrong
+    puts an outfield shirt on the one player guaranteed to be on the pitch."""
+    at = app.run()
+    pitch = _pitch(at)
+    assert "_1-66.png" in pitch, "the keeper should have the keeper kit"
+    assert re.search(r"shirt_\d+-66\.png", pitch), "outfielders should not"
+
+
+def test_the_drill_down_shows_the_player_s_face(midseason_app):
+    at = _select_row(midseason_app.run())
+    assert not at.exception
+    head = next(m.value for m in at.get("dialog")[0].markdown if 'class="pd-head"' in m.value)
+    assert "photos/players" in head
+    assert "onerror=" in head
+
+
+def test_the_pool_carries_a_club_badge(app):
+    at = app.run()
+    assert not at.exception
+    pool = _pool(at)
+    assert "badge" in pool.columns
+    assert pool["badge"].str.contains("badges/70/t").all()
 
 
 def test_the_status_bar_carries_the_deadline_and_the_data_age(midseason_app):
@@ -200,7 +263,7 @@ def test_filtering_to_nothing_leaves_the_other_tabs_alone(app):
     at = app.run()
     at.text_input[0].set_value("no such player anywhere").run()
     assert not at.exception
-    assert any("Nothing matches" in info.value for info in at.info)
+    assert any("No players match" in card for card in _states(at))
     assert any("Squad cost" in m.label for m in at.metric), "the Squad tab should still render"
 
 
@@ -293,7 +356,7 @@ def test_the_radar_says_nothing_is_coming_rather_than_showing_a_blank_table(app)
     is also what a real fixture list looks like until postponements start."""
     at = app.run()
     assert not at.exception
-    assert any("No blanks or doubles" in info.value for info in at.info)
+    assert any("Nothing irregular coming" in card for card in _states(at))
 
 
 def test_the_radar_lists_clubs_once_a_double_exists(monkeypatch, tmp_path):
@@ -384,14 +447,14 @@ def test_roi_ranks_players_once_points_exist(midseason_app):
 def test_price_pressure_says_nothing_before_the_season(app):
     at = app.run()
     assert not at.exception
-    assert any("nothing to read" in info.value for info in at.info)
+    assert any("No transfer activity yet" in card for card in _states(at))
 
 
 def test_price_pressure_renders_once_transfers_exist(midseason_app):
     """The populated branch is unreachable pre-season, so it needs its own run."""
     at = midseason_app.run()
     assert not at.exception
-    assert not any("nothing to read" in info.value for info in at.info)
+    assert not any("No transfer activity yet" in card for card in _states(at))
     assert any("Closest to rising" in caption.value for caption in at.caption)
 
 
