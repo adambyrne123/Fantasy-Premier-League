@@ -247,6 +247,18 @@ def test_club_tables_carry_badges_too(app):
         assert frame["badge"].dropna().str.contains("badges/70/t").all()
 
 
+def test_the_roi_tables_are_badged_once_there_are_points_to_rank(midseason_app):
+    """Both ROI tables only fill in once a gameweek has been scored, and the
+    projected-against-returned one needs a club column to map a badge from,
+    which it did not originally select."""
+    at = midseason_app.run()
+    assert not at.exception
+    badged = [d.value for d in at.dataframe if "badge" in d.value.columns]
+    projected = [f for f in badged if "projected_roi" in f.columns]
+    assert projected, "the projected against returned table should carry badges"
+    assert projected[0]["badge"].str.contains("badges/70/t").all()
+
+
 def test_the_status_bar_carries_the_deadline_and_the_data_age(midseason_app):
     """Neither was on screen anywhere before, and they are what say whether the
     projections are still worth acting on."""

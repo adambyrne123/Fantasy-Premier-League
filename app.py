@@ -1255,12 +1255,19 @@ with roi_tab:
                 if "gap" in roi_view.columns:
                     st.caption("Projected to return more than they have")
                     st.dataframe(
-                        roi_view.nlargest(15, "gap")[["name", "position", "roi", "projected_roi"]],
+                        with_badges(
+                            roi_view.nlargest(15, "gap")[
+                                ["name", "position", "club", "roi", "projected_roi"]
+                            ],
+                            badges,
+                        ),
                         hide_index=True,
                         width="stretch",
                         column_config={
+                            "badge": BADGE_COLUMN,
                             "name": "Player",
                             "position": "Pos",
+                            "club": "Club",
                             "roi": st.column_config.NumberColumn("Returned", format="%.1f"),
                             "projected_roi": st.column_config.NumberColumn(
                                 "Projected", format="%.2f"
