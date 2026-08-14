@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import os
+import threading
 import time
 from datetime import UTC, datetime
 from pathlib import Path
@@ -71,18 +72,41 @@ class FplApi:
             return None
         return datetime.fromtimestamp(cached.stat().st_mtime, tz=UTC)
 
+    def _write_cache(self, cached: Path, payload: Any) -> None:
+        """Replace the cached file in one step rather than two.
+
+        Writing in place truncates before it fills, so a reader arriving in
+        between gets half a file. Rare enough to ignore while every fetch was
+        driven by a page load, and no longer rare once anything polls a live
+        endpoint every minute. `os.replace` is atomic within a directory, and
+        the destination inherits the temporary file's mtime, so `fetched_at`
+        still reports when the response arrived.
+        """
+        tmp = cached.with_name(f"{cached.name}.{os.getpid()}.{threading.get_ident()}.tmp")
+        try:
+            tmp.write_text(json.dumps(payload))
+            os.replace(tmp, cached)
+        finally:
+            tmp.unlink(missing_ok=True)
+
     def _get(self, path: str, key: str | None = None, ttl: int | None = None) -> Any:
         key = key or path.strip("/")
         ttl = self.ttl if ttl is None else ttl
         cached = self._cache_path(key)
 
         if ttl and cached.exists() and (time.time() - cached.stat().st_mtime) < ttl:
-            return json.loads(cached.read_text())
+            try:
+                return json.loads(cached.read_text())
+            except (json.JSONDecodeError, OSError):
+                # a file left half written by an older build, or by a process
+                # killed mid-write. Refetching repairs it, so it is not worth
+                # raising over.
+                pass
 
         resp = self.session.get(f"{BASE}/{path.lstrip('/')}", timeout=30)
         resp.raise_for_status()
         payload = resp.json()
-        cached.write_text(json.dumps(payload))
+        self._write_cache(cached, payload)
         return payload
 
     # ------------------------------------------------------------------
@@ -125,5 +149,32 @@ class FplApi:
         return self._get(f"entry/{entry_id}/history/", key=f"history_{entry_id}", ttl=3600)
 
     def live(self, gameweek: int) -> dict:
-        """Live points for every player in a gameweek. Short TTL by design."""
+        """Live points for every player in a gameweek. Short TTL by design.
+
+        Stats are summed across a player's fixtures, so in a double gameweek
+        this is the right source for what he has scored and the wrong one for
+        anything decided per fixture. See `fixtures_for_event`.
+        """
         return self._get(f"event/{gameweek}/live/", key=f"live_{gameweek}", ttl=60)
+
+    def fixtures_for_event(self, gameweek: int) -> list[dict]:
+        """One gameweek's fixtures, carrying in-play stats once they kick off.
+
+        Cached under its own key rather than `fixtures`, or a live fetch every
+        minute would keep overwriting the whole season's fixture list that the
+        projection reads on a six hour ttl.
+        """
+        return self._get(
+            f"fixtures/?event={gameweek}",
+            key=f"fixtures_gw_{gameweek}",
+            ttl=60,
+        )
+
+    def event_status(self) -> dict:
+        """Per day, whether the games are done and whether bonus has landed.
+
+        Keyed by date rather than by fixture, so it answers a headline question
+        and never the question of whether one particular match has had its
+        bonus applied.
+        """
+        return self._get("event-status/", key="event_status", ttl=60)

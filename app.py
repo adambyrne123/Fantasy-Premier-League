@@ -21,6 +21,7 @@ from fpl_manager.api import FplApi
 from fpl_manager.chips import best_per_chip
 from fpl_manager.chips import evaluate as evaluate_chips
 from fpl_manager.data import MAX_PER_CLUB, Season
+from fpl_manager.live import LiveGameweek, load_live, player_view, score_squad
 from fpl_manager.optimiser import (
     MAX_PLAN_WEEKS,
     POOL_SIZE,
@@ -42,6 +43,10 @@ from fpl_manager.squad import (
 st.set_page_config(page_title="FPL Manager", page_icon="⚽", layout="wide")
 
 CACHE_TTL = 6 * 3600
+# shorter than the sixty seconds api.live holds on disk, or the memory cache
+# outlives the disk cache behind it and every poll serves stale data twice over
+LIVE_MEMORY_TTL = 30
+LIVE_POLL = "60s"
 POSITIONS_IN_ORDER = ("GKP", "DEF", "MID", "FWD")
 
 # One table answering several questions, rather than one wide table answering
@@ -49,7 +54,7 @@ POSITIONS_IN_ORDER = ("GKP", "DEF", "MID", "FWD")
 # the point of ours: the three separable terms laid out so a ranking that looks
 # wrong can be argued with instead of taken on faith.
 STAT_VIEWS = {
-    "Projection": ["price", "xpts_next", "xpts_total", "value", "ownership"],
+    "Projection": ["price", "xpts_next", "xpts_total", "value", "differential", "ownership"],
     "Model terms": ["price", "points_per_90", "minutes_share", "start_rate", "prior_p90"],
     "Form and attack": [
         "price",
@@ -186,11 +191,15 @@ def fdr_css(value: float) -> str:
 # ----------------------------------------------------------------------
 # loading
 # ----------------------------------------------------------------------
-@st.cache_resource(show_spinner="Loading season data")
+@st.cache_resource(ttl=CACHE_TTL, show_spinner="Loading season data")
 def load_season(refresh_token: int) -> Season:
     """Season holds an HTTP session, so it is a resource rather than data.
 
     `refresh_token` exists only to give the cache something to invalidate on.
+
+    The ttl is what makes the disk cache expiring mean anything. Without it a
+    process keeps its first Season forever, nothing re-enters the fetch, and
+    the six hour disk ttl quietly never fires on a long running deploy.
 
     The forced refresh lasts only as long as construction, which is where the
     two calls worth refreshing happen. Leaving ttl at 0 afterwards would make
@@ -204,27 +213,63 @@ def load_season(refresh_token: int) -> Season:
     return season
 
 
+# Everything below takes `stamp` as its last argument and never reads it.
+# Streamlit is told not to hash the Season, so a rebuilt one looks identical to
+# the one it replaced and these would keep serving results computed from data
+# that has since been refetched. `season.data_stamp` is the hashable stand-in.
 @st.cache_data(show_spinner="Fetching last season's totals, this takes a few minutes")
-def cached_prior(_season: Season) -> pd.DataFrame | None:
+def cached_prior(_season: Season, stamp: str) -> pd.DataFrame | None:
     return load_prior(_season)
 
 
 @st.cache_data(show_spinner="Reading transfer activity")
-def load_prices(_season: Season) -> pd.DataFrame:
+def load_prices(_season: Season, stamp: str) -> pd.DataFrame:
     return price_pressure(_season)
 
 
 @st.cache_data(show_spinner="Projecting")
 def load_projections(
-    _season: Season, horizon: int, use_prior: bool
+    _season: Season, horizon: int, use_prior: bool, stamp: str
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     """Per-player totals and the per-gameweek frame chip timing needs."""
-    prior = cached_prior(_season) if use_prior else None
+    prior = cached_prior(_season, stamp) if use_prior else None
     return project(_season, horizon=horizon, prior=prior)
 
 
+@st.cache_data(show_spinner="Pricing chips")
+def cached_chips(
+    projections: pd.DataFrame,
+    by_gameweek: pd.DataFrame,
+    squad_ids: tuple[int, ...],
+    budget_tenths: int,
+) -> pd.DataFrame:
+    """Chip timing, cached because it is two solves per gameweek.
+
+    Six seconds over a six week horizon, which is fine once and far too slow
+    to sit behind a slider that re-runs the tab on every nudge. Takes the ids
+    as a tuple so the cache can hash them.
+    """
+    return evaluate_chips(projections, by_gameweek, list(squad_ids), budget_tenths)
+
+
+@st.cache_data(ttl=LIVE_MEMORY_TTL, show_spinner=False)
+def load_live_gw(_season: Season, gameweek: int) -> LiveGameweek:
+    """This gameweek's live state, on its own short lease.
+
+    Deliberately not routed through `load_season`, which holds bootstrap for
+    six hours. Rebuilding the season every minute would drag the whole
+    projection through a recompute for data that did not change.
+
+    The ttl is shorter than the sixty seconds `api.live` holds on disk, since a
+    memory cache outliving the disk cache behind it serves stale data twice
+    over. It takes no stamp, because it is keyed on the gameweek and expires on
+    its own rather than when bootstrap moves.
+    """
+    return load_live(_season, gameweek)
+
+
 @st.cache_data(show_spinner=False)
-def fixture_runs(_season: Season, horizon: int) -> tuple[pd.DataFrame, pd.DataFrame]:
+def fixture_runs(_season: Season, horizon: int, stamp: str) -> tuple[pd.DataFrame, pd.DataFrame]:
     """Opponent labels and difficulty per club per gameweek, keyed by club id.
 
     Home is upper case and away is lower case, which is how fixture tickers
@@ -293,7 +338,7 @@ def status_bar(season: Season, players: int) -> None:
     if deadline is None:
         cells.append(_cell("Deadline", "None left this season"))
     elif deadline <= now:
-        cells.append(_cell("Deadline", "Passed, gameweek under way"))
+        cells.append(_cell("Deadline", "Passed, see Live", "soon"))
     else:
         gap = deadline - now
         tone = "soon" if gap < pd.Timedelta(hours=24) else ""
@@ -331,6 +376,12 @@ def pool_column_config(horizon: int, gw_cols: list[str], max_xpts: float) -> dic
             f"xPts {horizon} GW", format="%.1f", min_value=0.0, max_value=max_xpts
         ),
         "value": st.column_config.NumberColumn("Pts per m", format="%.2f"),
+        "differential": st.column_config.NumberColumn(
+            "Differential",
+            format="%+.2f",
+            help="Projection percentile minus ownership percentile. Positive means "
+            "the model rates him higher than the crowd does.",
+        ),
         "ownership": st.column_config.NumberColumn("Owned %", format="%.1f"),
         "points_per_90": st.column_config.NumberColumn("Pts per 90", format="%.2f"),
         "minutes_share": st.column_config.NumberColumn("Mins share", format="%.2f"),
@@ -613,7 +664,8 @@ with st.sidebar.expander("Squad building", expanded=False):
     budget = st.number_input("Budget (m)", 80.0, 120.0, 100.0, 0.1)
 
 season = load_season(st.session_state.refresh_token)
-projections, by_gameweek = load_projections(season, horizon, use_prior)
+stamp = season.data_stamp
+projections, by_gameweek = load_projections(season, horizon, use_prior, stamp)
 lookup = name_lookup(projections)
 
 st.sidebar.divider()
@@ -665,8 +717,8 @@ with st.sidebar.expander("Your squad", expanded=True):
 # ----------------------------------------------------------------------
 status_bar(season, len(projections))
 
-build_tab, players_tab, fixtures_tab, transfers_tab, chips_tab = st.tabs(
-    ["Squad", "Players", "Fixtures", "Transfers", "Chips"]
+build_tab, players_tab, fixtures_tab, transfers_tab, chips_tab, live_tab = st.tabs(
+    ["Squad", "Players", "Fixtures", "Transfers", "Chips", "Live"]
 )
 
 with build_tab:
@@ -725,7 +777,18 @@ with players_tab:
     max_price = f3.slider("Max price", 3.5, 16.0, 16.0, 0.1)
     max_own = f4.slider("Max ownership %", 0.0, 100.0, 100.0, 1.0)
     sort_by = f5.selectbox(
-        "Sort by", ["xpts_total", "xpts_next", "value", "ownership", "form", "points_per_game"]
+        "Sort by",
+        [
+            "xpts_total",
+            "xpts_next",
+            "value",
+            "differential",
+            "ownership",
+            "form",
+            "points_per_game",
+        ],
+        help="Differential ranks a player's projection against how many people own "
+        "him. Positive means the model rates him higher than the crowd does.",
     )
 
     view = pool[(pool["price"] <= max_price) & (pool["ownership"] <= max_own)]
@@ -761,7 +824,7 @@ with players_tab:
             f"Showing {len(shown)} of {len(view)} players, ranked by "
             f"{sort_by.replace('_', ' ')}. Click a row for the working behind the projection."
         )
-        labels, difficulty = fixture_runs(season, horizon)
+        labels, difficulty = fixture_runs(season, horizon, stamp)
         chosen = pool_table(shown, labels, difficulty, columns, horizon, key="pool")
 
         # only open on a change, or closing the dialog would reopen it at once
@@ -825,7 +888,7 @@ with players_tab:
 
     st.divider()
     st.subheader("Price pressure")
-    pressure = load_prices(season)
+    pressure = load_prices(season, stamp)
     if is_dormant(pressure):
         st.info(
             "No transfers have been made yet this gameweek, so there is nothing to read. "
@@ -1077,7 +1140,7 @@ with chips_tab:
         st.info("Load your squad in the sidebar to price your chips.")
     else:
         team_value = my_squad.value_tenths(season)
-        table = evaluate_chips(projections, by_gameweek, my_squad.player_ids, team_value)
+        table = cached_chips(projections, by_gameweek, tuple(my_squad.player_ids), team_value)
 
         if table.empty:
             st.warning("Not enough of the squad is known to price a chip.")
@@ -1091,7 +1154,12 @@ with chips_tab:
                     delta_color="off",
                 )
 
-            st.caption(f"Free Hit is priced against your team value, {team_value / 10:.1f}m.")
+            st.caption(
+                f"Free Hit and Wildcard are priced against your team value, "
+                f"{team_value / 10:.1f}m. Wildcard is the odd one out: you keep the "
+                f"squad, so it is worth every remaining gameweek rather than one, "
+                f"and its gain falls the longer you leave it."
+            )
             st.line_chart(
                 table.pivot(index="event", columns="chip", values="gain"),
                 height=320,
@@ -1112,3 +1180,116 @@ with chips_tab:
                 "Rotation, press conferences and minutes management are not in the API. "
                 "A gap of a point or two between gameweeks is inside the noise."
             )
+
+with live_tab:
+    st.subheader("Live scoring")
+    live_gw = season.current_gameweek
+
+    if live_gw < 1:
+        st.info("No gameweek has started yet, so there is nothing to score.")
+    else:
+        # Polling is gated on a match actually being in progress. Left running
+        # it costs every visitor a request a minute forever, including on a
+        # Tuesday. The state is read once here, outside the fragment, purely to
+        # decide the interval.
+        opening = load_live_gw(season, live_gw)
+        polling = LIVE_POLL if opening.in_play else None
+
+        @st.fragment(run_every=polling)
+        def live_panel() -> None:
+            """Reruns on its own, so a poll never re-enters the projection.
+
+            Everything it needs beyond the live state is closed over from the
+            enclosing script run, and it holds no widgets: one inside a fragment
+            writing state read outside it forces a full rerun, which is the
+            whole thing this avoids.
+            """
+            state = load_live_gw(season, live_gw)
+
+            if state.fixtures.empty:
+                st.info(f"GW{live_gw} has no fixtures published yet.")
+                return
+
+            finished = int(state.fixtures["finished"].sum())
+            total = len(state.fixtures)
+            fetched = state.fetched_at
+            age = _relative(pd.Timestamp(fetched) - pd.Timestamp.now(tz="UTC")) if fetched else "-"
+
+            cells = [
+                _cell("Gameweek", f"GW{live_gw}"),
+                _cell(
+                    "Fixtures",
+                    f"{finished} of {total} finished",
+                    "soon" if state.in_play else "",
+                ),
+                _cell("Bonus", "Final" if state.all_settled else "Provisional"),
+                _cell("Updated", age if polling else "Not polling"),
+            ]
+            st.markdown(f'<div class="statusbar">{"".join(cells)}</div>', unsafe_allow_html=True)
+
+            if my_squad is None:
+                st.info("Load your squad in the sidebar to see what it is scoring.")
+                return
+
+            score = score_squad(state, season, my_squad)
+            cols = st.columns(3)
+            cols[0].metric("Points", score.total)
+            cols[1].metric("Playing", f"{score.playing} of {len(score.lineup.starters)}")
+            cols[2].metric("Provisional bonus", score.provisional_bonus, delta_color="off")
+
+            if not score.lineup.settled:
+                st.caption(
+                    "Matches are still being played, so bonus and any automatic "
+                    "substitutions below can still change."
+                )
+            if my_squad.captain_id is None:
+                st.caption(
+                    "This squad came from a file, which records no captain and no bench "
+                    "order. Load an entry id for the real lineup."
+                )
+
+            for out, came_in in score.lineup.subs:
+                names = season.players["name"]
+                st.caption(f"Auto sub: {names.get(out, out)} off, {names.get(came_in, came_in)} on")
+
+            for label, ids in (
+                ("Starting XI", score.lineup.starters),
+                ("Bench", score.lineup.bench),
+            ):
+                st.markdown(f"**{label}**")
+                st.dataframe(
+                    player_view(state, season, ids),
+                    hide_index=True,
+                    width="stretch",
+                    column_config={
+                        "name": "Player",
+                        "position": "Pos",
+                        "club": "Club",
+                        "minutes": st.column_config.NumberColumn("Mins", format="%d"),
+                        "points": st.column_config.NumberColumn("Pts", format="%d"),
+                        "provisional_bonus": st.column_config.NumberColumn(
+                            "Prov bonus", format="%d"
+                        ),
+                        "bps": st.column_config.NumberColumn("BPS", format="%d"),
+                        "goals_scored": st.column_config.NumberColumn("G", format="%d"),
+                        "assists": st.column_config.NumberColumn("A", format="%d"),
+                    },
+                    column_order=[
+                        "name",
+                        "position",
+                        "club",
+                        "minutes",
+                        "goals_scored",
+                        "assists",
+                        "bps",
+                        "provisional_bonus",
+                        "points",
+                    ],
+                )
+
+        live_panel()
+        st.caption(
+            "Bonus is worked out from the bonus points system the same way FPL does, "
+            "and is a projection until a match ends. Automatic substitutions only "
+            "resolve once a player's fixtures are over."
+        )

@@ -20,9 +20,7 @@ from pathlib import Path
 
 import pandas as pd
 
-from .data import Season
-
-SQUAD_SIZE = 15
+from .data import SQUAD_SIZE, Season
 
 
 def selling_price_tenths(purchase_tenths: int, now_tenths: int) -> int:
@@ -55,6 +53,12 @@ class MySquad:
     explicit_selling: dict[int, int] = field(default_factory=dict)
     entry_id: int | None = None
     gameweek: int | None = None
+    # only an entry knows these. A squad file carries who you own and what you
+    # paid, and says nothing about who wears the armband or what order the
+    # bench is in, so they stay optional.
+    captain_id: int | None = None
+    vice_captain_id: int | None = None
+    captain_multiplier: int = 2
     _selling_prices: dict[int, int] = field(default_factory=dict, repr=False)
 
     def __post_init__(self):
@@ -306,11 +310,16 @@ def load_from_entry(season: Season, entry_id: int, gameweek: int | None = None) 
     the first deadline of a season and the caller should fall back to a squad
     file. Selling prices are not public either, so they come back empty and the
     plan will be slightly optimistic about spending power.
+
+    Defaults to the gameweek under way rather than the last finished one. Picks
+    are published from the deadline, so on a Saturday afternoon the finished
+    count is one behind and would show last week's team while this week's is
+    being played.
     """
     if entry_id is None:
         raise ValueError("No entry id given and no squad file to fall back on.")
 
-    gameweek = gameweek or season.gameweeks_played
+    gameweek = gameweek or season.current_gameweek or season.gameweeks_played
     if gameweek < 1:
         raise RuntimeError(
             "No gameweek has finished yet, so the FPL API publishes no picks. "
@@ -327,9 +336,17 @@ def load_from_entry(season: Season, entry_id: int, gameweek: int | None = None) 
         ) from exc
 
     picks = picks_payload.get("picks") or []
+    picks = sorted(picks, key=lambda p: p.get("position") or 0)
     ids = [int(p["element"]) for p in picks if p.get("element") is not None]
     if len(ids) != SQUAD_SIZE:
         raise RuntimeError(f"Expected {SQUAD_SIZE} picks for entry {entry_id}, got {len(ids)}.")
+
+    # pick order carries the bench order, and the armband decides what doubles.
+    # None of it can be reconstructed from the ids alone, so a live view that
+    # dropped it would have to guess at both.
+    captain = next((int(p["element"]) for p in picks if p.get("is_captain")), None)
+    vice = next((int(p["element"]) for p in picks if p.get("is_vice_captain")), None)
+    multiplier = max((int(p.get("multiplier") or 0) for p in picks), default=2)
 
     bank = (picks_payload.get("entry_history") or {}).get("bank")
     if bank is None:
@@ -348,6 +365,9 @@ def load_from_entry(season: Season, entry_id: int, gameweek: int | None = None) 
         free_transfers=free,
         entry_id=int(entry_id),
         gameweek=int(gameweek),
+        captain_id=captain,
+        vice_captain_id=vice,
+        captain_multiplier=max(multiplier, 2),
     )
 
 

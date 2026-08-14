@@ -30,9 +30,16 @@ falls back to the bundled x64 build under emulation. That is handled in
 `optimiser.py` and needs nothing from you.
 
 The Streamlit app is the main way in: sliders for horizon, budget and bench
-weight, lock and ban lists, a fixture heatmap and a transfer planner, all
-re-solving as you change them. The CLI below does the same things without a
-browser.
+weight, lock and ban lists, a fixture heatmap, a transfer planner and a live
+matchday view, all re-solving as you change them. The CLI below does the same
+things without a browser.
+
+Responses are cached on disk under `FPL_CACHE_DIR`, defaulting to
+`~/.cache/fpl_manager`. On Streamlit Community Cloud set it to a writable path,
+which makes reruns cheap within one container. It does not survive a restart or
+a wake from sleep, and nothing can make it: what keeps a cold boot fast is the
+committed `prior_season.parquet` and the fact that a fresh start is two
+requests.
 
 ## CLI
 
@@ -55,10 +62,14 @@ Other commands:
 uv run fpl-manager ticker --horizon 8              # fixture difficulty by club
 uv run fpl-manager players --position MID --top 25 # ranked player list
 uv run fpl-manager players --sort value --max-price 6.0
+uv run fpl-manager players --sort differential     # who the crowd underrates
 uv run fpl-manager find salah                      # look up player ids
 uv run fpl-manager transfers --squad squad.json --free 1 --max 2
+uv run fpl-manager plan --squad squad.json --weeks 3   # several weeks at once
 uv run fpl-manager xi --squad squad.json           # lineup and captain
 uv run fpl-manager chips --squad squad.json        # when to play each chip
+uv run fpl-manager prices                          # who is close to moving
+uv run fpl-manager live --entry 1234567            # what you are scoring now
 ```
 
 Once the season is running you can pull your squad straight from the API with
@@ -128,9 +139,18 @@ seasons and nothing else, so for someone who spent last year in another league
 its most recent entry can be years old. Those players are treated as having no
 history rather than being credited with form from three seasons ago.
 
-**fixture_multiplier** maps FPL's own 1 to 5 difficulty rating onto a scaling
-factor of roughly 0.84 to 1.16, plus a small home adjustment. Constants sit at
-the top of `projections.py` if you want a different shape.
+**fixture_multiplier** blends two views of how hard a fixture is. FPL's own 1
+to 5 difficulty rating maps onto a scaling factor of roughly 0.84 to 1.16 plus
+a small home adjustment, and that is combined with the clubs' attack and
+defence ratings, which are continuous, split by home and away, and move during
+the season. The second is what tells apart two fixtures FPL rates the same. It
+is normalised so the average fixture is exactly 1.0, which keeps the headline
+number in points.
+
+FPL publishes those ratings as zero until the season is under way, so in August
+the fixture term is the difficulty rating alone, exactly as it was before. Any
+club missing a rating falls back the same way rather than failing. Constants
+sit at the top of `projections.py` if you want a different shape.
 
 Because the projection is built per fixture rather than per gameweek, doubles
 and blanks come out correctly without any special casing. A club with two
@@ -170,13 +190,33 @@ The horizon bounds the answer. If the best Bench Boost week is GW12 and you are
 projecting six weeks, the tool cannot see it, so widen `--horizon` before
 trusting a recommendation to play a chip now.
 
+## Live scoring
+
+`live` and the app's Live tab score your squad while the matches are on. Bonus
+is worked out from the bonus points system exactly as FPL does, three, two and
+one per fixture with ties sharing, so it is right before the official points
+land and stops being a guess as soon as they do. Automatic substitutions are
+applied by the same rule FPL uses, walking your bench in the order you set it
+and taking the first legal replacement, rather than picking the best available
+one. Nothing is substituted until a player's matches are actually over, since a
+player on no minutes at half past three has not blanked yet.
+
+The app polls once a minute, and only while a match is in progress. Load your
+squad with an entry id rather than a file if you want the real captain and
+bench order, since a squad file records neither.
+
 ## What it does not do
 
 - Plan two chips together, or weigh a chip now against a better week later than
-  the horizon reaches.
-- Plan transfers more than one gameweek ahead. Each week is solved on its own,
-  so it will not bank a transfer or route to a target player over two weeks.
-- Price change prediction. Worth adding if you care about team value.
+  the horizon reaches. Wildcard is priced over the rest of the horizon rather
+  than for one week, since you keep the squad, but the horizon still bounds it.
+- Plan transfers further than four gameweeks ahead. `plan` holds every week in
+  one problem, so it can bank a transfer or take a loss now to reach a player
+  later, but five weeks takes five or six seconds against under one for three.
+  It also chooses from a trimmed pool rather than the whole game.
+- Predict price changes. `prices` reads net transfers, which the API gives as a
+  running total rather than a rate, so somebody who took five days to gather
+  his looks identical to somebody who did it this morning. It is a watchlist.
 - Anything a press conference tells you. Rotation risk, a manager hinting at
   resting someone, a returning player easing back in: none of that is in the
   API. Treat the output as a ranked shortlist to argue with, not an answer.

@@ -27,6 +27,7 @@ uv run fpl-manager transfers --squad squad.json --free 1 --max 2
 uv run fpl-manager xi --squad squad.json
 uv run fpl-manager find salah              # resolve player ids by name
 uv run fpl-manager chips --squad squad.json   # when to play each chip
+uv run fpl-manager live --entry 1234567    # what your squad is scoring now
 ```
 
 Global flags live on the parent parser, not the subcommands. `--horizon`,
@@ -41,10 +42,13 @@ Data flows one way. Nothing downstream writes back.
 
 ```
 api.py  ──▶  data.py  ──▶  projections.py  ──▶  optimiser.py  ──▶  cli.py
-               │              ▲                       ▲
-               ▼          squad.py                chips.py
-           prices.py  (current holdings, money)   (chip timing)
-        (price pressure)
+             │  │  │           ▲                       ▲
+             │  │  ▼       squad.py                chips.py
+             │  │ prices.py  (current holdings)   (chip timing)
+             │  ▼
+             │ live.py  (in-play scoring, this gameweek only)
+             ▼
+          (raw frames)
 ```
 
 | Module | Responsibility | Do not put here |
@@ -55,9 +59,15 @@ api.py  ──▶  data.py  ──▶  projections.py  ──▶  optimiser.py  
 | `optimiser.py` | MILP formulation and solving, single week and multi. | Anything that fetches or estimates |
 | `chips.py` | What a chip is worth, and in which gameweek. | New MILP formulations, which go in `optimiser.py` |
 | `prices.py` | Who is close to a price rise or fall. | Anything the points model reads |
+| `live.py` | In-play scoring: live stats, provisional bonus, autosubs. | Anything forward looking, and any selection logic |
 | `squad.py` | Loading the user's 15, bank, selling prices. | Projections or optimisation |
 | `cli.py` | Argument parsing and printing. | Model logic of any kind |
 | `app.py` | Streamlit view: widgets, layout, caching. | Model logic of any kind |
+
+**`live.py` is a leaf and must stay one.** `projections.py`, `optimiser.py` and
+`chips.py` may not import it. They look forward on a six hour cache, it looks at
+the last sixty seconds, and joining the two puts numbers that disagree on the
+same screen. Live points are a realised outcome, not evidence for a projection.
 
 `Season` (in `data.py`) is the single object holding a loaded season. Pass it
 around rather than re-instantiating, since construction does two API calls.
@@ -132,6 +142,25 @@ a loop from anywhere else.
 Anything running in a container or CI runner must set it to a persisted path,
 or every run re-fetches. `PRIOR_CACHE` in `projections.py` derives from it.
 
+**The live panel polls on a gate, and the gate matters.** `app.py` runs the
+live tab inside `@st.fragment(run_every=...)`, and the interval is `None` unless
+a match is actually in progress. Left on it costs every visitor a request a
+minute forever, including in February on a Tuesday. The fragment holds no
+widgets and calls only `load_live_gw`: a widget inside it writing state read
+outside forces a full rerun, which is exactly the projection recompute the
+fragment exists to avoid.
+
+**Two-level cache TTLs must nest the right way round.** `LIVE_MEMORY_TTL` is 30
+seconds against the 60 `api.live` holds on disk. A memory cache that outlives
+the disk cache behind it serves stale data twice over.
+
+**`load_season` carries a ttl, and cached functions take `season.data_stamp`.**
+Without the ttl, a process keeps its first `Season` forever and the disk ttl
+expiring accomplishes nothing, because nothing re-enters `_get`. Without the
+stamp, Streamlit is told to skip hashing the `Season`, so a rebuilt one looks
+identical to the one it replaced and the old projections keep being served. New
+cached functions taking `_season` need the stamp as their last argument.
+
 **Streamlit caching splits by type.** `Season` holds an HTTP session, so it uses
 `@st.cache_resource`. Frames use `@st.cache_data`. Passing `Season` into a
 cached function needs the `_season` underscore prefix so Streamlit skips hashing
@@ -143,21 +172,48 @@ per club per fixture, so a club with two fixtures in a gameweek gets two rows
 and a club with none gets zero. Do not add special casing. If you find yourself
 writing `if is_double_gameweek`, the design has gone wrong.
 
+**The two live endpoints answer different questions and both are needed.**
+`event/{gw}/live/` sums a player's stats across his fixtures, which is the right
+answer to "what has he scored" and the wrong one for anything decided per match.
+Bonus is awarded per fixture, so it comes from `fixtures/?event=`, where the
+bonus points scores arrive already grouped. Mixing them up produces wrong bonus
+in exactly the gameweeks people care most about. The per-fixture payload is
+cached under `fixtures_gw_{gw}`, deliberately not `fixtures`, so a poll every
+minute cannot overwrite the season fixture list the projection reads.
+
+**Whether bonus has landed is a per-fixture question.** A gameweek spread over
+two days has real bonus on the first day's matches while the second is still
+provisional, so any gameweek-wide flag is wrong for half the screen.
+`live._has_real_bonus` looks for a `bonus` block in that fixture's stats array.
+`event-status/` is keyed by calendar date, so it is fit for a headline and never
+for deciding one player's total.
+
+**Parse the fixture `stats` array by `identifier`, never by index.** The order
+is not guaranteed and the array is absent entirely before kickoff.
+
+**Autosubs are a rule, not an optimisation.** `live.resolve_autosubs` walks the
+bench in the order the manager set it and takes the first legal replacement.
+Routing it through `optimiser.pick_xi` would field a better XI than FPL actually
+will, which is a wrong answer stated confidently, and would import the optimiser
+into a module that must stay a leaf.
+
 **Pre-season means no current data.** `gameweeks_played` is 0 until late August,
 so the shrinkage weight is 0 and projections rest entirely on last season. Any
 new model term needs a defined pre-season behaviour.
 
-**PuLP is pinned below 4.0.** The current formulation uses `LpVariable.dicts`
-and `PULP_CBC_CMD`, both deprecated in the 3.x line. Unpinning means migrating
-to `prob.add_variable_dicts` and `COIN_CMD` first. That is a contained job in
-`optimiser.py` and worth doing, but not as a side effect of something else.
+**PuLP is on the 4.0 API already, while still pinned below 4.0.** Variables are
+created through `prob.add_variable` and `prob.add_variable_dicts`, and solves go
+through `COIN_CMD`. `LpVariable.dicts` and `PULP_CBC_CMD` are both deprecated in
+the 3.x line and neither is used any more, so the suite runs without a single
+deprecation warning. Keep it that way: the pin can now be lifted on its own
+merits rather than needing a migration first.
 
 **PuLP has no CBC binary for Windows on ARM.** It looks for `solverdir/cbc/win/
 arm64/cbc.exe`, which was never shipped, and every solve fails before it starts.
-`optimiser.solver()` falls back to the bundled x64 build, which Windows runs
-under emulation. Route new solves through `solver()` rather than constructing
-`PULP_CBC_CMD` inline, or they will work everywhere except this machine. Note
-that `PULP_CBC_CMD` rejects an explicit path, so the fallback uses `COIN_CMD`.
+`optimiser.solver()` finds the bundled x64 build instead, which Windows runs
+under emulation, and hands `COIN_CMD` its explicit path. Route new solves
+through `solver()` rather than constructing a solver inline, or they will work
+everywhere except this machine.
 
 ## The model
 
@@ -169,7 +225,30 @@ xPts(player, gw) = sum over that club's fixtures in gw of
 Three terms, deliberately separable so any one can be replaced without touching
 the others. Tuning constants sit at the top of `projections.py`:
 `SHRINKAGE_GAMES`, `DIFFICULTY_ALPHA`, `HOME_BONUS`, `START_RATE_TRUST`,
-`SUB_SHARE`, `STARTER_DURATION`.
+`SUB_SHARE`, `STARTER_DURATION`, `STRENGTH_WEIGHT`, `STRENGTH_ALPHA`.
+
+**The fixture term blends two difficulty signals.** FPL's 1 to 5 rating is a
+five step function set by hand and rarely revised. The six team strength
+ratings are continuous, separate for attack and defence and for home and away,
+and they move during the season, so they tell apart fixtures the difficulty
+rating calls identical. `strength_multiplier` forms
+`(own attack / league mean attack) * (league mean defence / opponent defence)`,
+clipped to `[STRENGTH_FLOOR, STRENGTH_CEILING]`.
+
+**That normalisation to a league mean of 1.0 is load bearing.** Without it
+every projection shifts by a constant factor, the headline number stops being
+points, and the chip comparison and the greedy baseline both move underneath
+you.
+
+**Passing `strength=None` to `fixture_multiplier` reproduces the old output
+exactly**, which is the fallback whenever the ratings are missing. There is a
+test asserting it.
+
+**Pre-season the strength ratings are all zero.** FPL publishes them that way
+until the season is under way, so in August the term contributes nothing and
+the projection rests on the difficulty rating as it always did. A zero is
+treated as unrated rather than as a club with no attack, so one late-rated
+promoted club cannot divide the rest of the term by zero.
 
 **The minutes term must not be derived from minutes.** This is the trap the
 model already fell into once. If `expected_minutes_share` is computed as
@@ -251,10 +330,31 @@ speculatively.
 
 ## Not built yet
 
-- Chips are advisory only, in `chips.py`. Bench Boost, Triple Captain and Free
-  Hit are priced per gameweek across the horizon, and wildcard is still `build`
-  at current budget. What is missing is planning two chips together, and any
-  sense of a chip being worth saving for a gameweek beyond the horizon.
+- Chips are advisory only, in `chips.py`. All four are priced per gameweek
+  across the horizon. Wildcard is the odd one, measured over every remaining
+  gameweek rather than one, since you keep the squad, so its gain falls the
+  later you play it and is not directly comparable with the other three. What
+  is missing is planning two chips together, any sense of a chip being worth
+  saving for a gameweek beyond the horizon, and the assistant manager chip.
+  Nothing reads which chips you have already used, either.
+- Variance. Everything is a point estimate, which matters most for captaincy
+  and Triple Captain, both of which are decisions about a ceiling rather than a
+  mean. A haul probability per player would be the smallest useful version and
+  wants the xG plumbing below first. Do not reach for a mean-variance or
+  chance-constrained MILP on a model this rough.
+- Position-specific scoring. A defender's clean sheet and a striker's goal both
+  collapse into one scalar `points_per_90`. The inputs to fix it are parsed and
+  unused: `expected_goals`, `expected_assists`, `expected_goals_conceded`. The
+  shape that preserves the three-term separation is a component rate inside
+  `points_per_90` (Poisson clean sheets from xGC for GKP and DEF, xGI rates for
+  attackers) blended in by the existing `played / (played + SHRINKAGE_GAMES)`
+  weight, with the opponent adjustment left in the fixture term where the
+  strength ratings already handle it. `_minutes_share` must not be touched.
+  Note `FakeApi` emits those three fields as constant zero, so a component
+  model would silently evaluate to nothing across the whole suite unless the
+  fake is extended in the same commit. Set-piece and penalty duty
+  (`penalties_order`, `direct_freekicks_order`,
+  `corners_and_indirect_freekicks_order`) are not parsed at all.
 - Price change prediction is advisory only, in `prices.py`, and deliberately
   does not reach the optimiser. Feeding expected price movement into the MILP
   needs a points-per-0.1m exchange rate, and a wrong one quietly degrades squad
@@ -267,10 +367,11 @@ speculatively.
   into one MILP, so it can roll a free transfer or take a loss now to reach a
   player later, but five weeks takes five or six seconds against under a second
   for three, and the app caps at `MAX_PLAN_WEEKS`. It also chooses from a
-  trimmed pool rather than the whole game, so a cheap enabler ranked just
-  outside `POOL_SIZE` is invisible to it. Prices are held constant across the
-  horizon, which is the assumption most worth removing once `prices.py` has a
-  rate rather than a running total.
+  trimmed pool rather than the whole game. `ENABLER_SHARE` reserves part of
+  each position's places for the best points per million so the cheap enablers
+  survive the trim, but it is still a shortlist. Prices are held constant
+  across the horizon, which is the assumption most worth removing once
+  `prices.py` has a rate rather than a running total.
 - Deployment itself. The prerequisites are done: `prior_season.parquet` is
   committed so a cold boot reads it instead of making 700 requests, and
   `requirements.txt` is exported from `uv.lock`, since Community Cloud cannot
@@ -286,7 +387,11 @@ speculatively.
   the checkout, so `fpl_manager` is already importable and emitting it would put
   an unresolvable local file path in the file. What is left is outside the code,
   being a git repo, a GitHub remote and the Community Cloud app itself. Set
-  `FPL_CACHE_DIR` to a persisted path there or every run re-fetches.
+  `FPL_CACHE_DIR` to a writable path there or every rerun re-fetches. Be honest
+  about what that buys: the Community Cloud filesystem does not survive a
+  container restart or a wake from sleep, so it makes reruns cheap within one
+  container and nothing more. What keeps a cold boot fast is the committed
+  `prior_season.parquet` and a fresh start being two requests.
 - Refreshing the committed `prior_season.parquet` between seasons. Nothing does
   it automatically, so in August it needs `--refresh` and a manual copy, or the
   projection quietly rests on a season that is two years old.

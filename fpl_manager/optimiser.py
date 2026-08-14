@@ -30,6 +30,12 @@ MAX_FREE_TRANSFERS = 5
 POOL_SIZE = 140
 MIN_POOL_PER_POSITION = 10
 
+# Share of each position's places reserved for the best points per million
+# rather than the best points outright. Ranking on points alone drops cheap
+# enablers first, and whether the fifteenth slot is affordable is usually what
+# decides a route, not whether the first is optimal.
+ENABLER_SHARE = 0.3
+
 # Measured against the real season on a 140 player pool: three weeks solves in
 # about 0.7s and four in about 1.5s, but five jumps to five or six seconds,
 # which is past what a slider can re-solve on. Pool size barely moves any of
@@ -47,7 +53,27 @@ def gameweek_frame(
     nothing, because `by_gameweek` already holds one row per fixture. That is
     why doubles and blanks need no special casing here either.
     """
-    points = by_gameweek[by_gameweek["event"] == event].groupby("id")["xpts"].sum()
+    return window_frame(projections, by_gameweek, event, event, ids)
+
+
+def window_frame(
+    projections: pd.DataFrame,
+    by_gameweek: pd.DataFrame,
+    start: int,
+    end: int | None = None,
+    ids: list[int] | None = None,
+) -> pd.DataFrame:
+    """Projections summed over a run of gameweeks, in the same `xpts_gw` column.
+
+    A wildcard is kept rather than played for a week, so what it is worth is
+    everything from the gameweek you play it to the end of the horizon. One
+    gameweek is the special case where start and end are the same, which is
+    what `gameweek_frame` asks for.
+    """
+    events = by_gameweek["event"]
+    window = by_gameweek[(events >= start) & (events <= (end if end is not None else events.max()))]
+    points = window.groupby("id")["xpts"].sum()
+
     frame = (
         projections if ids is None else projections.loc[[i for i in ids if i in projections.index]]
     )
@@ -62,27 +88,27 @@ def solver() -> pulp.LpSolver:
 
     PuLP bundles CBC for x86 only, so on Windows for ARM it looks for a build
     that was never shipped and every solve dies before it starts. Windows runs
-    x64 executables under emulation, so falling back to the bundled x64 binary
-    keeps this to one solver dependency rather than two. On any platform PuLP
-    ships a binary for, this is the default and the fallback never runs.
+    x64 executables under emulation, so pointing at the bundled x64 binary keeps
+    this to one solver dependency rather than two.
 
-    The fallback goes through COIN_CMD because PULP_CBC_CMD refuses an explicit
-    path. That is the only part of the PuLP 4.0 migration done here, and it is
-    deliberately confined to this function.
+    Everything goes through COIN_CMD with an explicit path, which is both the
+    only way to reach that binary and what PULP_CBC_CMD becomes in PuLP 4.0.
+    PULP_CBC_CMD is kept as a last resort for an install that ships CBC
+    somewhere this does not look.
     """
-    default = pulp.PULP_CBC_CMD(msg=False)
-    if default.available():
-        return default
-
     solverdir = Path(pulp.__file__).parent / "solverdir"
     # 64 bit first, since the 32 bit build runs out of memory on big models
     candidates = sorted(solverdir.rglob("cbc*"), key=lambda p: ("64" not in p.parent.name, str(p)))
     for candidate in candidates:
         if not candidate.is_file() or candidate.suffix not in {".exe", ""}:
             continue
-        fallback = pulp.COIN_CMD(path=str(candidate), msg=False)
-        if fallback.available():
-            return fallback
+        found = pulp.COIN_CMD(path=str(candidate), msg=False)
+        if found.available():
+            return found
+
+    legacy = pulp.PULP_CBC_CMD(msg=False)
+    if legacy.available():
+        return legacy
 
     raise RuntimeError(
         "No CBC binary available for this platform. Install one with "
@@ -125,9 +151,9 @@ def _base_problem(
     ids = list(pool.index)
     prob = pulp.LpProblem("fpl_squad", pulp.LpMaximize) if prob is None else prob
 
-    x = pulp.LpVariable.dicts(f"pick{suffix}", ids, cat="Binary")
-    y = pulp.LpVariable.dicts(f"start{suffix}", ids, cat="Binary")
-    c = pulp.LpVariable.dicts(f"captain{suffix}", ids, cat="Binary")
+    x = prob.add_variable_dicts(f"pick{suffix}", ids, cat="Binary")
+    y = prob.add_variable_dicts(f"start{suffix}", ids, cat="Binary")
+    c = prob.add_variable_dicts(f"captain{suffix}", ids, cat="Binary")
 
     prob += pulp.lpSum(x.values()) == 15
 
@@ -265,7 +291,7 @@ def suggest_transfers(
     prob, x, y, c, objective = _base_problem(pool, points_col, bench_weight, captain_col)
 
     transfers = 15 - pulp.lpSum(x[i] for i in owned)
-    hits = pulp.LpVariable("hits", lowBound=0, cat="Integer")
+    hits = prob.add_variable("hits", lowBound=0, cat="Integer")
     prob += hits >= transfers - free_transfers
     prob += transfers <= max_transfers
 
@@ -356,14 +382,30 @@ def planning_pool(
 
     Players you already own are always kept, whatever they are projected to do,
     since a plan that cannot see them cannot sell them.
+
+    Each position's places are split between the best by points and the best by
+    points per million. Ranking on points alone drops the cheap enablers first,
+    which are exactly what the pool exists to preserve: the binding constraint
+    on a route is usually whether the fifteenth slot is affordable, not whether
+    the first is optimal. `ENABLER_SHARE` sets the split.
     """
     playing = projections[projections["minutes_share"] >= min_minutes_share]
+    value = playing[points_col] / (playing["now_cost"] / 10)
+
     keep = []
     for pos, count in SQUAD_LIMITS.items():
         take = max(MIN_POOL_PER_POSITION, round(pool_size * count / 15))
-        keep.append(playing[playing["position"] == pos].nlargest(take, points_col))
+        here = playing[playing["position"] == pos]
+
+        by_points = here.nlargest(take - round(take * ENABLER_SHARE), points_col)
+        by_value = here.loc[value.reindex(here.index).nlargest(take).index]
+        keep.append(by_points)
+        keep.append(
+            by_value[~by_value.index.isin(by_points.index)].head(round(take * ENABLER_SHARE))
+        )
 
     pool = pd.concat(keep)
+    pool = pool[~pool.index.duplicated()]
     owned = projections.loc[[i for i in current_ids if i in projections.index]]
     return pd.concat([pool, owned[~owned.index.isin(pool.index)]])
 
@@ -423,8 +465,8 @@ def plan_transfers(
         )
         picks[event], starts[event], captains[event] = x, y, c
 
-        tin = pulp.LpVariable.dicts(f"in{tag}", list(pool.index), cat="Binary")
-        tout = pulp.LpVariable.dicts(f"out{tag}", list(pool.index), cat="Binary")
+        tin = prob.add_variable_dicts(f"in{tag}", list(pool.index), cat="Binary")
+        tout = prob.add_variable_dicts(f"out{tag}", list(pool.index), cat="Binary")
         moves_in[event], moves_out[event] = tin, tout
 
         for i in pool.index:
@@ -434,7 +476,7 @@ def plan_transfers(
         made = pulp.lpSum(tin.values())
         prob += made <= max_transfers_per_week
 
-        taken = pulp.LpVariable(f"hits{tag}", lowBound=0, cat="Integer")
+        taken = prob.add_variable(f"hits{tag}", lowBound=0, cat="Integer")
         prob += taken >= made - free[event]
         prob += taken <= made
         hits[event] = taken
@@ -453,7 +495,7 @@ def plan_transfers(
             # what is left rolls with one more added, capped at five. A solver
             # could in principle inflate `taken` to bank a free transfer, but
             # that costs four points to save at most four, so it never pays.
-            rolled = pulp.LpVariable(
+            rolled = prob.add_variable(
                 f"free_w{events[position + 1]}", lowBound=0, upBound=MAX_FREE_TRANSFERS
             )
             prob += rolled <= free[event] - made + taken + 1
@@ -553,8 +595,8 @@ def pick_xi(
     pool = squad_projections
     prob = pulp.LpProblem("fpl_xi", pulp.LpMaximize)
     ids = list(pool.index)
-    y = pulp.LpVariable.dicts("start", ids, cat="Binary")
-    c = pulp.LpVariable.dicts("captain", ids, cat="Binary")
+    y = prob.add_variable_dicts("start", ids, cat="Binary")
+    c = prob.add_variable_dicts("captain", ids, cat="Binary")
 
     prob += pulp.lpSum(y.values()) == 11
     prob += pulp.lpSum(c.values()) == 1

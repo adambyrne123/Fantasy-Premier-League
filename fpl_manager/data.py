@@ -7,6 +7,9 @@ integers and avoids floating point drift against the 100.0m budget.
 
 from __future__ import annotations
 
+from collections import Counter
+from collections.abc import Iterable
+
 import pandas as pd
 
 from .api import FplApi
@@ -17,6 +20,21 @@ XI_MIN = {"GKP": 1, "DEF": 3, "MID": 2, "FWD": 1}
 XI_MAX = {"GKP": 1, "DEF": 5, "MID": 5, "FWD": 3}
 BUDGET_TENTHS = 1000
 MAX_PER_CLUB = 3
+SQUAD_SIZE = sum(SQUAD_LIMITS.values())
+XI_SIZE = 11
+
+
+def is_legal_xi(positions: Iterable[str]) -> bool:
+    """Whether eleven positions make a formation FPL would accept.
+
+    Lives here beside the limits it reads rather than with either caller, since
+    the optimiser has to respect it when choosing a lineup and the live view has
+    to respect it when working out which substitutions actually happened.
+    """
+    counts = Counter(positions)
+    if sum(counts.values()) != XI_SIZE:
+        return False
+    return all(XI_MIN[pos] <= counts.get(pos, 0) <= XI_MAX[pos] for pos in XI_MIN)
 
 
 class Season:
@@ -157,6 +175,32 @@ class Season:
         return int(self.events["finished"].sum())
 
     @property
+    def current_gameweek(self) -> int:
+        """The gameweek under way, or 0 before the season starts.
+
+        `gameweeks_played` counts finished gameweeks, so between a deadline and
+        the last final whistle it is one behind. Anything reading a live squad
+        wants this one, since picks are published as soon as the deadline
+        passes.
+        """
+        current = self.events.index[self.events["is_current"]]
+        if len(current):
+            return int(current[0])
+        return self.gameweeks_played
+
+    @property
+    def data_stamp(self) -> str:
+        """A token that changes when the underlying bootstrap was refetched.
+
+        Callers that cache on a Season have to pass this alongside it. Streamlit
+        is told to skip hashing the Season itself, since it holds an HTTP
+        session, which means a rebuilt Season would otherwise keep being served
+        results computed from the old one.
+        """
+        fetched = self.api.fetched_at("bootstrap")
+        return "unknown" if fetched is None else fetched.isoformat()
+
+    @property
     def next_deadline(self) -> pd.Timestamp | None:
         """When transfers for `next_gameweek` lock, in UTC.
 
@@ -206,7 +250,43 @@ class Season:
         out = pd.concat([home, away], ignore_index=True)
         out["event"] = out["event"].astype(int)
         out["opponent_short"] = out["opponent"].map(self.teams["short_name"])
-        return out.sort_values(["team", "event"]).reset_index(drop=True)
+        return self._attach_strength(out).sort_values(["team", "event"]).reset_index(drop=True)
+
+    def _attach_strength(self, fixtures: pd.DataFrame) -> pd.DataFrame:
+        """Both sides' attack and defence ratings for each fixture.
+
+        FPL rates a club's attack and defence separately, and differently at
+        home and away, on a continuous scale. That is four numbers per fixture
+        where the difficulty rating is one integer from five.
+
+        Every column is NaN when the payload does not carry the ratings, which
+        is what the projection falls back to the difficulty rating on. They are
+        optional fields on an undocumented API, so their absence is a case to
+        handle rather than an error.
+        """
+        wanted = [
+            "strength_attack_home",
+            "strength_attack_away",
+            "strength_defence_home",
+            "strength_defence_away",
+        ]
+        columns = ("attack_for", "defence_for", "attack_against", "defence_against")
+        if not all(c in self.teams.columns for c in wanted):
+            for column in columns:
+                fixtures[column] = float("nan")
+            return fixtures
+
+        # a club is rated by its home numbers when it is the home side, so the
+        # away club in the same fixture is rated by its away numbers
+        for side in ("for", "against"):
+            team = fixtures["team"] if side == "for" else fixtures["opponent"]
+            playing_home = fixtures["is_home"] if side == "for" else ~fixtures["is_home"]
+            for what in ("attack", "defence"):
+                at_home = team.map(self.teams[f"strength_{what}_home"])
+                at_away = team.map(self.teams[f"strength_{what}_away"])
+                fixtures[f"{what}_{side}"] = at_home.where(playing_home, at_away).astype("float64")
+
+        return fixtures
 
     def fixture_grid(self, horizon: int = 6) -> tuple[pd.DataFrame, pd.DataFrame]:
         """Club by gameweek grids of difficulty and opponent.

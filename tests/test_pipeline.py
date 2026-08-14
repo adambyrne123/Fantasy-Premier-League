@@ -19,7 +19,20 @@ from fpl_manager.optimiser import (
 )
 from fpl_manager.projections import project
 
-from .conftest import N_TEAMS, SQUAD_SIZE_PER_TEAM
+from .conftest import N_TEAMS, SQUAD_SIZE_PER_TEAM, FakeApi
+
+
+class _FakeResponse:
+    """What `requests` would have returned, for the cache tests below."""
+
+    def __init__(self, payload):
+        self._payload = payload
+
+    def raise_for_status(self) -> None:
+        pass
+
+    def json(self):
+        return self._payload
 
 
 # ----------------------------------------------------------------------
@@ -68,6 +81,168 @@ def test_fetched_at_reads_the_cache_file(tmp_path):
     fetched = api.fetched_at("bootstrap")
     assert fetched is not None
     assert abs((datetime.now(UTC) - fetched).total_seconds()) < 60
+
+
+def test_a_half_written_cache_file_is_refetched(tmp_path, monkeypatch):
+    """A truncated file used to take the whole page down with a JSON error.
+
+    Refetching repairs it, which matters once anything polls a live endpoint
+    often enough for a reader to catch a writer mid-write.
+    """
+    from fpl_manager.api import FplApi
+
+    api = FplApi(cache_dir=tmp_path)
+    (tmp_path / "bootstrap.json").write_text('{"events": [')
+
+    monkeypatch.setattr(api.session, "get", lambda *a, **kw: _FakeResponse({"events": []}))
+    assert api._get("bootstrap-static/", key="bootstrap") == {"events": []}
+    assert (tmp_path / "bootstrap.json").read_text() == '{"events": []}'
+
+
+def test_a_fetch_leaves_no_temporary_files(tmp_path, monkeypatch):
+    """The cache is written through a temporary file so readers never see a
+    partial one. Leaving those behind would fill a deploy's disk instead."""
+    from fpl_manager.api import FplApi
+
+    api = FplApi(cache_dir=tmp_path)
+    monkeypatch.setattr(api.session, "get", lambda *a, **kw: _FakeResponse({"ok": True}))
+    api._get("bootstrap-static/", key="bootstrap")
+
+    assert [p.name for p in tmp_path.iterdir()] == ["bootstrap.json"]
+
+
+def test_data_stamp_changes_when_the_cache_is_rewritten(tmp_path, monkeypatch):
+    """Cached functions take the stamp because Streamlit will not hash a Season.
+    If it did not move, a rebuilt season would keep serving stale projections."""
+    import time
+
+    from fpl_manager.api import FplApi
+
+    api = FplApi(cache_dir=tmp_path)
+    monkeypatch.setattr(api.session, "get", lambda *a, **kw: _FakeResponse({"ok": True}))
+
+    api._get("bootstrap-static/", key="bootstrap")
+    first = api.fetched_at("bootstrap")
+    time.sleep(0.01)
+    api._get("bootstrap-static/", key="bootstrap", ttl=0)
+
+    assert api.fetched_at("bootstrap") != first
+
+
+def test_current_gameweek_is_the_one_under_way(season: Season):
+    """Between a deadline and the last final whistle, `gameweeks_played` is one
+    behind. Live views want the gameweek being played, not the last finished."""
+    played = season.gameweeks_played
+    under_way = played + 1
+    season.events["is_current"] = season.events.index == under_way
+
+    assert season.current_gameweek == under_way
+    assert season.gameweeks_played == played
+
+
+def test_current_gameweek_is_zero_before_the_season(season: Season):
+    season.events["is_current"] = False
+    season.events["finished"] = False
+    assert season.current_gameweek == 0
+
+
+def test_the_fixture_term_is_unchanged_without_strength_ratings(season: Season):
+    """The strength columns are optional on an undocumented API. With none of
+    them the multiplier has to be exactly what it always was, or a trimmed
+    payload silently reshapes every projection."""
+    from fpl_manager.projections import fixture_multiplier
+
+    fixtures = season.team_fixtures(horizon=4)
+    plain = fixture_multiplier(fixtures["difficulty"], fixtures["is_home"])
+    expected = 1.0 + (3 - fixtures["difficulty"]) * 0.09
+    expected = expected + np.where(fixtures["is_home"], 0.03, -0.03)
+
+    assert np.allclose(plain, expected)
+
+
+def test_a_team_frame_without_strength_falls_back_rather_than_raising():
+    from fpl_manager.projections import strength_multiplier
+
+    season = Season(FakeApi(played=12, strengths=False))
+    fixtures = season.team_fixtures(horizon=4)
+
+    assert strength_multiplier(fixtures).isna().all()
+
+
+def test_zero_ratings_are_treated_as_absent(season: Season):
+    """FPL publishes all six ratings as zero until the season is under way, so
+    this is what the term actually meets in August. A zero is a club that has
+    not been rated, not one with no attack, and dividing by it is worse than
+    falling back."""
+    from fpl_manager.projections import fixture_multiplier, strength_multiplier
+
+    fixtures = season.team_fixtures(horizon=4)
+    for column in ("attack_for", "defence_for", "attack_against", "defence_against"):
+        fixtures[column] = 0.0
+
+    strength = strength_multiplier(fixtures)
+    assert strength.isna().all()
+
+    blended = fixture_multiplier(fixtures["difficulty"], fixtures["is_home"], strength)
+    plain = fixture_multiplier(fixtures["difficulty"], fixtures["is_home"])
+    assert np.allclose(blended, plain)
+
+
+def test_one_unrated_club_does_not_poison_the_rest(season: Season):
+    """A promoted club can be rated later than the others, and that must not
+    take the whole term down with it."""
+    from fpl_manager.projections import strength_multiplier
+
+    fixtures = season.team_fixtures(horizon=4).copy()
+    fixtures.loc[fixtures.index[:2], "defence_against"] = 0.0
+
+    strength = strength_multiplier(fixtures)
+    assert strength.iloc[:2].isna().all()
+    assert strength.iloc[2:].notna().any()
+
+
+def test_the_average_fixture_scores_one(season: Season):
+    """The normalisation is what keeps the headline number in points. Drop it
+    and every projection shifts by a constant, which moves the chip comparison
+    and the budget the greedy baseline is measured against."""
+    from fpl_manager.projections import strength_multiplier
+
+    fixtures = season.team_fixtures(horizon=6)
+    strength = strength_multiplier(fixtures)
+
+    assert strength.notna().all()
+    assert 0.9 < strength.mean() < 1.1
+
+
+def test_a_strong_attack_against_a_weak_defence_beats_the_rating_alone(season: Season):
+    from fpl_manager.projections import fixture_multiplier
+
+    fixtures = season.team_fixtures(horizon=4).head(1).copy()
+    difficulty, is_home = fixtures["difficulty"], fixtures["is_home"]
+
+    plain = fixture_multiplier(difficulty, is_home)
+    favourable = fixture_multiplier(difficulty, is_home, pd.Series([1.4], index=fixtures.index))
+    hostile = fixture_multiplier(difficulty, is_home, pd.Series([0.7], index=fixtures.index))
+
+    assert float(favourable.iloc[0]) > float(plain.iloc[0]) > float(hostile.iloc[0])
+
+
+def test_strength_is_clipped_rather_than_extrapolated(season: Season):
+    """A rating ratio far off 1.0 is a mismatch, not evidence for a projection
+    three times the size."""
+    from fpl_manager.projections import STRENGTH_CEILING, STRENGTH_FLOOR, strength_multiplier
+
+    fixtures = season.team_fixtures(horizon=6)
+    strength = strength_multiplier(fixtures)
+
+    assert strength.between(STRENGTH_FLOOR, STRENGTH_CEILING).all()
+
+
+def test_team_fixtures_carries_both_sides_strength(season: Season):
+    fixtures = season.team_fixtures(horizon=4)
+    for column in ("attack_for", "defence_for", "attack_against", "defence_against"):
+        assert column in fixtures.columns
+        assert fixtures[column].notna().all()
 
 
 def test_team_fixtures_emits_one_row_per_fixture(season: Season):
@@ -518,3 +693,57 @@ def test_rate_and_minutes_can_move_independently(season: Season):
     populated = buckets[buckets["size"] >= 3]
     assert len(populated) > 0
     assert (populated["std"].fillna(0) > 0).any()
+
+
+def test_differential_ranks_projection_against_ownership(projections: pd.DataFrame):
+    """Percentiles on both sides, so the number has no units to argue about and
+    no constant to tune."""
+    assert projections["differential"].between(-1, 1).all()
+    assert projections["differential"].abs().sum() > 0
+
+
+def test_a_differential_is_a_player_the_crowd_underrates(projections: pd.DataFrame):
+    best = projections["differential"].idxmax()
+    worst = projections["differential"].idxmin()
+
+    assert projections.loc[best, "ownership"] <= projections.loc[worst, "ownership"]
+
+
+def test_differential_ignores_price(projections: pd.DataFrame):
+    """It is about who owns him, not what he costs. Value already covers price,
+    and folding it in here would make two columns say the same thing."""
+    from fpl_manager.projections import differential_score
+
+    doubled = projections.copy()
+    doubled["now_cost"] = doubled["now_cost"] * 2
+    assert (differential_score(doubled) == differential_score(projections)).all()
+
+
+def test_the_planning_pool_keeps_cheap_enablers(projections: pd.DataFrame):
+    """Ranking on points alone drops the cheapest players first, which are the
+    ones that decide whether a route is affordable at all."""
+    from fpl_manager.data import SQUAD_LIMITS
+    from fpl_manager.optimiser import MIN_POOL_PER_POSITION, POOL_SIZE, planning_pool
+
+    pool = planning_pool(projections, current_ids=[])
+    playing = projections[projections["minutes_share"] >= 0.05]
+
+    cheaper = 0
+    for pos, count in SQUAD_LIMITS.items():
+        take = max(MIN_POOL_PER_POSITION, round(POOL_SIZE * count / 15))
+        by_points = playing[playing["position"] == pos].nlargest(take, "xpts_total")
+        here = pool[pool["position"] == pos]
+        cheaper += int(here["price"].min() < by_points["price"].min())
+
+    assert cheaper, "no position gained a player cheaper than a points ranking would keep"
+
+
+def test_the_planning_pool_still_keeps_the_best_players(projections: pd.DataFrame):
+    """Reserving places for value must not cost the pool its top scorers."""
+    from fpl_manager.optimiser import planning_pool
+
+    pool = planning_pool(projections, current_ids=[])
+    playing = projections[projections["minutes_share"] >= 0.05]
+    for pos in ("GKP", "DEF", "MID", "FWD"):
+        best = playing[playing["position"] == pos].nlargest(5, "xpts_total").index
+        assert all(i in pool.index for i in best), f"{pos} lost a top scorer"

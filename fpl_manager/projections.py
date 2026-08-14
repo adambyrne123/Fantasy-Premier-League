@@ -37,6 +37,15 @@ SHRINKAGE_GAMES = 6.0  # gameweeks of current data needed to half-trust it
 DIFFICULTY_ALPHA = 0.09  # points swing per unit of FDR away from average
 HOME_BONUS = 0.03
 
+# How much of the fixture term comes from the clubs' attack and defence ratings
+# rather than FPL's 1-5 difficulty rating. The rest stays on difficulty, which
+# is set by hand and occasionally knows something the ratings do not.
+STRENGTH_WEIGHT = 0.6
+STRENGTH_ALPHA = 0.35  # how far a full strength gap moves the multiplier
+# a rating ratio past these is a mismatch the model should not extrapolate from
+STRENGTH_FLOOR = 0.6
+STRENGTH_CEILING = 1.5
+
 # How much of a player's start rate comes from what he did last season, with
 # the rest coming from what his price implies. Anything short of 1.0 is what
 # stops the projection collapsing back into last season's points, see
@@ -267,10 +276,69 @@ def build_rates(season: Season, prior: pd.DataFrame | None = None) -> pd.DataFra
     return out
 
 
-def fixture_multiplier(difficulty: pd.Series, is_home: pd.Series) -> pd.Series:
-    """Convert FPL's 1-5 difficulty rating into a scaling factor."""
-    mult = 1.0 + (3 - difficulty) * DIFFICULTY_ALPHA
-    return mult + np.where(is_home, HOME_BONUS, -HOME_BONUS)
+def strength_multiplier(fixtures: pd.DataFrame) -> pd.Series:
+    """A fixture's difficulty from the clubs' attack and defence ratings.
+
+    FPL's own 1 to 5 rating is a five step function set before the season and
+    rarely revised. The strength ratings are continuous, separate for attack
+    and defence and for home and away, and they move as the season goes on, so
+    they can tell apart two fixtures the difficulty rating calls identical.
+
+    Normalised so the league average fixture is exactly 1.0. Without that every
+    projection shifts by a constant factor and the headline number stops being
+    points, which would quietly move the chip comparisons and the budget that
+    the greedy baseline is measured against.
+
+    NaN for any fixture missing a rating, which the caller reads as "use the
+    difficulty rating instead".
+
+    Pre-season that is every fixture. FPL publishes all six ratings as zero
+    until the season is under way, so this term contributes nothing in August
+    and the projection rests on the difficulty rating exactly as it did before.
+    A zero is treated as absent rather than as a genuinely rated club with no
+    attack, which would otherwise divide by it.
+    """
+    needed = ["attack_for", "defence_against", "attack_against", "defence_for"]
+    if not all(c in fixtures.columns for c in needed):
+        return pd.Series(np.nan, index=fixtures.index)
+
+    values = fixtures[needed].astype("float64")
+    values = values.where(values > 0)
+
+    mean_attack = pd.concat([values["attack_for"], values["attack_against"]]).mean()
+    mean_defence = pd.concat([values["defence_for"], values["defence_against"]]).mean()
+    if not (mean_attack > 0 and mean_defence > 0):
+        return pd.Series(np.nan, index=fixtures.index)
+
+    attack = values["attack_for"] / mean_attack
+    defence = mean_defence / values["defence_against"]
+    return (attack * defence).clip(STRENGTH_FLOOR, STRENGTH_CEILING)
+
+
+def fixture_multiplier(
+    difficulty: pd.Series,
+    is_home: pd.Series,
+    strength: pd.Series | None = None,
+    weight: float = STRENGTH_WEIGHT,
+) -> pd.Series:
+    """Convert a fixture's difficulty into a scaling factor.
+
+    With no strength ratings this is FPL's 1 to 5 rating alone, unchanged, so
+    a payload without the columns degrades to what the model did before rather
+    than failing.
+
+    Where ratings exist the two are blended. Keeping some of the difficulty
+    rating is deliberate: FPL sets it by hand and it sometimes carries a view
+    on a fixture that the season-long ratings have not caught up with.
+    """
+    base = 1.0 + (3 - difficulty) * DIFFICULTY_ALPHA
+
+    if strength is not None and weight:
+        scaled = 1.0 + (strength - 1.0) * STRENGTH_ALPHA
+        blended = base * (1 - weight) + scaled * weight
+        base = blended.where(scaled.notna(), base)
+
+    return base + np.where(is_home, HOME_BONUS, -HOME_BONUS)
 
 
 def project(
@@ -298,7 +366,10 @@ def project(
         return rates, pd.DataFrame(columns=["id", "event", "xpts"])
 
     fixtures = fixtures.copy()
-    fixtures["multiplier"] = fixture_multiplier(fixtures["difficulty"], fixtures["is_home"])
+    fixtures["strength"] = strength_multiplier(fixtures)
+    fixtures["multiplier"] = fixture_multiplier(
+        fixtures["difficulty"], fixtures["is_home"], fixtures["strength"]
+    )
 
     merged = rates.reset_index().merge(fixtures, on="team", how="left")
     merged["xpts"] = (
@@ -316,4 +387,26 @@ def project(
     rates["xpts_total"] = totals.reindex(rates.index).fillna(0.0)
     rates["xpts_next"] = next_gw.reindex(rates.index).fillna(0.0)
     rates["value"] = rates["xpts_total"] / (rates["now_cost"] / 10)
+    rates["differential"] = differential_score(rates)
     return rates, by_gw
+
+
+def differential_score(rates: pd.DataFrame) -> pd.Series:
+    """How well a player projects relative to how many people own him.
+
+    Both sides are turned into percentiles before subtracting, so the number
+    has no units to argue about and no constant to tune. Positive means the
+    projection ranks him higher than the crowd does, which is the definition of
+    a differential worth taking.
+
+    It says nothing about whether he is good, only about how contrarian owning
+    him is. A punt nobody owns and the model does not rate either scores near
+    zero, the same as a premium everybody owns and the model also rates. Read
+    it beside `xpts_total`, never instead of it.
+    """
+    if rates.empty:
+        return pd.Series(dtype="float64")
+
+    projected = rates["xpts_total"].rank(pct=True)
+    owned = rates["ownership"].fillna(0.0).rank(pct=True)
+    return (projected - owned).astype("float64")

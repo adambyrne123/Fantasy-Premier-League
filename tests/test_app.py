@@ -63,7 +63,7 @@ def test_every_tab_renders(app):
     at = app.run()
     assert not at.exception
     labels = [tab.label for tab in at.tabs] if at.tabs else []
-    for expected in ["Squad", "Players", "Fixtures", "Transfers", "Chips"]:
+    for expected in ["Squad", "Players", "Fixtures", "Transfers", "Chips", "Live"]:
         assert expected in labels
 
 
@@ -336,6 +336,46 @@ def test_the_multi_week_planner_runs(app_with_squad):
     planner.set_value(True).run()
     assert not at.exception
     assert any("Projected over" in m.label for m in at.metric)
+
+
+def test_the_live_tab_survives_empty_live_endpoints(app):
+    """The harness stubs every endpoint but bootstrap and fixtures to `{}`,
+    which is also what the real API gives out of season. The tab has to say so
+    rather than take the page down."""
+    at = app.run()
+    assert not at.exception
+    assert any(tab.label == "Live" for tab in at.tabs)
+
+
+def test_the_live_tab_renders_mid_season(midseason_app, monkeypatch):
+    from fpl_manager import api
+
+    from .conftest import FakeApi
+
+    fake = FakeApi(played=12)
+    monkeypatch.setattr(api.FplApi, "live", lambda self, gw: fake.live(gw))
+    monkeypatch.setattr(
+        api.FplApi, "fixtures_for_event", lambda self, gw: fake.fixtures_for_event(gw)
+    )
+
+    at = midseason_app.run()
+    assert not at.exception
+
+
+def test_the_live_tab_scores_a_loaded_squad(app_with_squad, monkeypatch):
+    from fpl_manager import api
+
+    from .conftest import FakeApi
+
+    fake = FakeApi(played=12)
+    monkeypatch.setattr(api.FplApi, "live", lambda self, gw: fake.live(gw))
+    monkeypatch.setattr(
+        api.FplApi, "fixtures_for_event", lambda self, gw: fake.fixtures_for_event(gw)
+    )
+
+    at = _load_the_squad(app_with_squad.run())
+    assert not at.exception
+    assert any(m.label == "Points" for m in at.metric)
 
 
 def test_app_holds_no_model_logic():
