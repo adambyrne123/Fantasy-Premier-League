@@ -155,17 +155,23 @@ PITCH_CSS = """
   border-radius: var(--radius);
   padding: 16px 10px 4px;
 }
-/* Two layers: the face on top, the club kit under it. If the face 403s, and
-   for roughly half the cheap players it does, that layer is not painted and
-   the kit shows instead. */
+/* The kit is the object's fallback, so it renders only when the photograph
+   does not. Both are sized to fill the box, since an object takes its natural
+   size otherwise and the photographs are 220 by 280. */
 .mug {
   display:block; width:44px; height:56px; margin:0 auto 2px;
-  border-radius:6px; background-color:rgba(55,0,60,.08);
-  background-repeat:no-repeat, no-repeat;
-  background-position:top center, center 60%;
-  background-size:cover, 82% auto;
+  border-radius:6px; background-color:rgba(55,0,60,.08); overflow:hidden;
 }
+.mug object, .mug img {
+  display:block; width:100%; height:100%; pointer-events:none;
+  object-fit:cover; object-position:top center;
+}
+.mug img { object-fit:contain; object-position:center; padding:3px; }
 .pitch.compact .mug, .bench-strip.compact .mug { width:34px; height:43px; }
+/* FPL's photographs go stale after a transfer, so a player can appear in the
+   kit of the club he has just left. The crest is read off the live team code
+   and is always current, which makes it the thing to trust on the card. */
+.crest { position:absolute; top:5px; left:5px; width:15px; height:15px; opacity:.95; }
 .state {
   border:1px solid var(--line-soft); border-radius:var(--radius);
   background:var(--card); padding:18px 20px; margin:4px 0 8px;
@@ -649,23 +655,26 @@ def _mug(images: pd.DataFrame | None, player_id, css: str = "mug") -> str:
     a hole there is the worst case, since a cheap defender is exactly who you
     cannot identify from the name alone.
 
-    Face and kit are two background layers on one element rather than an `img`
-    with an `onerror` handler. Streamlit sanitises the HTML it renders and
-    strips every `on*` attribute, so a handler is removed before it ever runs
-    and the fallback silently never fires.
+    The kit is `object` fallback content rather than a layer behind the face or
+    an `onerror` swap. Two earlier attempts got this wrong and both are worth
+    recording, because neither failed loudly:
 
-    Stacked backgrounds need no script and do not depend on how a browser
-    chooses to paint a broken `img`: a background layer that fails to load is
-    simply not painted, so the kit underneath shows through. They are also only
-    fetched when the element is actually rendered, which keeps the images in
-    Streamlit's hidden tabs off the wire entirely.
+    Streamlit sanitises the HTML it renders and strips every `on*` attribute, so
+    an `onerror` handler is removed before it can run.
+
+    Putting the kit behind the face as a second background does fire, but every
+    FPL photograph is a cut-out with a transparent background, so the kit shows
+    through around the player on every card rather than only the missing ones.
+
+    `object` is the only one of the three that is genuinely conditional: the
+    fallback renders when, and only when, the photograph fails to load.
     """
     if images is None or player_id not in images.index:
         return ""
     face, kit = images.loc[player_id, "face"], images.loc[player_id, "kit"]
     return (
-        f'<span class="{css}" '
-        f"style=\"background-image:url('{escape(face)}'),url('{escape(kit)}')\"></span>"
+        f'<span class="{css}"><object data="{escape(face)}" type="image/png">'
+        f'<img src="{escape(kit)}" alt=""></object></span>'
     )
 
 
@@ -676,8 +685,11 @@ def _shirt(
     severity, note = availability(row)
     flag = f'<span class="flag {severity}" title="{escape(note)}"></span>' if severity else ""
     ring = f" ring-{highlight}" if highlight else ""
+    crest = ""
+    if images is not None and row.name in images.index:
+        crest = f'<img class="crest" src="{escape(images.loc[row.name, "badge"])}" alt="">'
     return (
-        f'<div class="shirt{ring}">{flag}{_mug(images, row.name)}'
+        f'<div class="shirt{ring}">{flag}{crest}{_mug(images, row.name)}'
         f'<div class="nm">{escape(str(row["name"]))}{mark}</div>'
         f'<div class="meta">{escape(str(row["club"]))} · {row["price"]:.1f}m</div>'
         f'<div class="pts">{row["xpts_next"]:.1f}</div>'

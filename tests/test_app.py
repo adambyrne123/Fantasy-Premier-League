@@ -172,19 +172,35 @@ def test_every_card_in_the_squad_carries_a_face(app):
     assert "photos/players/110x140/p500" in pitch, "built from the player's code, not his id"
 
 
-def test_the_kit_sits_behind_every_face(app):
+def test_the_kit_is_the_fallback_and_not_a_backdrop(app):
     """Roughly half the cheapest players have no photograph and the CDN answers
-    403, and cheap players are exactly what the optimiser puts on a bench. The
-    kit is a second background layer rather than a swap, so a face that fails
-    is simply not painted and the kit shows through."""
+    403, and cheap players are exactly what the optimiser puts on a bench.
+
+    The kit has to be `object` fallback content, which renders only when the
+    photograph fails. Putting it behind the face instead looks right until you
+    notice every FPL photograph is a cut-out with a transparent background, so
+    the kit shows through around every player rather than only the missing ones.
+    """
     at = app.run()
     pitch = _pitch(at)
+    assert pitch.count("<object ") == 15, "one per card, starters and bench"
     assert pitch.count("dist/img/shirts/standard/shirt_") == 15, "one kit per card"
     for card in pitch.split('<span class="mug"')[1:]:
-        head = card.split("</span>")[0]
-        assert head.index("photos/players") < head.index("shirts/standard"), (
-            "the face has to be the first background layer or the kit hides it"
+        mug = card.split("</span>")[0]
+        assert "background-image" not in mug, "a kit behind the face bleeds through it"
+        assert mug.index("photos/players") < mug.index("shirts/standard"), (
+            "the photograph is the object, the kit is what it falls back to"
         )
+
+
+def test_every_card_carries_its_club_crest(app):
+    """FPL's photographs go stale after a transfer, so a player can appear in
+    the kit of the club he has just left. The crest comes off the live team
+    code, so it stays right when the photograph does not."""
+    at = app.run()
+    pitch = _pitch(at)
+    assert pitch.count('class="crest"') == 15
+    assert "badges/70/t" in pitch
 
 
 def test_no_pitch_image_relies_on_a_script_handler(app):
