@@ -89,6 +89,10 @@ class FakeApi:
                     # payload is, since the minutes model now reads starts
                     starts = min(self.played, round(minutes / 90)) if self.played else 0
                     ppg = self.rng.uniform(1.0, 6.5)
+                    # per 90 attacking output by position, so the component
+                    # model has something to separate a forward from a keeper
+                    xg90 = {1: 0.0, 2: 0.04, 3: 0.16, 4: 0.38}[etype] * self.rng.uniform(0.4, 1.8)
+                    xa90 = {1: 0.0, 2: 0.05, 3: 0.15, 4: 0.11}[etype] * self.rng.uniform(0.4, 1.8)
                     elements.append(
                         {
                             "id": pid,
@@ -120,8 +124,36 @@ class FakeApi:
                             "news": "",
                             "chance_of_playing_next_round": None,
                             "ep_next": "0.0",
-                            "expected_goals": "0.0",
-                            "expected_assists": "0.0",
+                            # Attackers out-shoot defenders and keepers do not
+                            # shoot at all, because a component model that saw
+                            # one flat rate could not be told apart from no
+                            # model. Zero before a ball is kicked, the way the
+                            # real payload is: FPL publishes these as zero
+                            # until the season is under way.
+                            "expected_goals": f"{minutes / 90 * xg90:.2f}"
+                            if self.played
+                            else "0.0",
+                            "expected_assists": f"{minutes / 90 * xa90:.2f}"
+                            if self.played
+                            else "0.0",
+                            # charged only while the player was on the pitch, so
+                            # a keeper's figure is his club's and an outfielder's
+                            # is a fraction of it
+                            "expected_goals_conceded": f"{minutes / 90 * 1.35:.2f}"
+                            if self.played
+                            else "0.0",
+                            # one taker per club per duty, the way the real
+                            # payload is, and absent for everyone else
+                            **(
+                                {"penalties_order": 1}
+                                if etype == 4 and pid % SQUAD_SIZE_PER_TEAM == 19
+                                else {}
+                            ),
+                            **(
+                                {"direct_freekicks_order": 1}
+                                if etype == 3 and pid % SQUAD_SIZE_PER_TEAM == 11
+                                else {}
+                            ),
                             # zero before a ball is kicked, the way the real
                             # payload is, so price pressure reads as dormant
                             "transfers_in_event": self.rng.randint(0, 90_000) if self.played else 0,

@@ -238,6 +238,17 @@ the data rather than the calendar, because the reset does not line up neatly
 with `gameweeks_played`. Anything new that divides by or ranks on
 `total_points` has the same problem and should go through it.
 
+**The rollover catches the expected goals fields too, and `COMPONENT_MINUTES` is
+what saves them.** Like `total_points`, `minutes` and `expected_goals` still hold
+last season's figures before the first deadline, so pre-season
+`component_rate` happily builds a rate for 331 players out of data that is a
+year old. It does no harm only because the blend weight is 0 until a gameweek
+is played. Once one is, minutes reset to this season's and the 270 minute gate
+fails for everybody, so the term stays out until roughly GW4 when there is
+enough of this season to mean anything. That is the intended progression rather
+than a happy accident, and anything new reading these fields needs the same
+guard or it will read a year-old number as though it were current.
+
 **Pre-season means no current data.** `gameweeks_played` is 0 until late August,
 so the shrinkage weight is 0 and projections rest entirely on last season. Any
 new model term needs a defined pre-season behaviour.
@@ -266,7 +277,42 @@ xPts(player, gw) = sum over that club's fixtures in gw of
 Three terms, deliberately separable so any one can be replaced without touching
 the others. Tuning constants sit at the top of `projections.py`:
 `SHRINKAGE_GAMES`, `DIFFICULTY_ALPHA`, `HOME_BONUS`, `START_RATE_TRUST`,
-`SUB_SHARE`, `STARTER_DURATION`, `STRENGTH_WEIGHT`, `STRENGTH_ALPHA`.
+`SUB_SHARE`, `STARTER_DURATION`, `STRENGTH_WEIGHT`, `STRENGTH_ALPHA`,
+`PENALTY_XG_P90`, `FREEKICK_XG_P90`, `COMPONENT_MINUTES`.
+
+**`points_per_90` is part rate observed and part rate rebuilt.**
+`component_rate` reconstructs what FPL actually pays a player for, rather than
+reading back what he happened to score:
+
+```
+appearance + xG90 * goal points for his position + xA90 * 3
+           + P(clean sheet) * clean sheet points for his position
+```
+
+Clean sheet probability is the Poisson zero, `exp(-xGC per 90)`, on the club's
+rate rather than the player's. That is what stops a defender and a forward
+collapsing into the same scalar, which is what the old single rate did.
+
+**The club's conceding rate comes off the keepers, and it has to.**
+`expected_goals_conceded` is charged to a player only while he is on the pitch,
+so summing outfielders counts the same goals once per defender and lands several
+times too high. A keeper is on the pitch for all of it.
+
+**The opponent adjustment is deliberately not in the component rate.** It lives
+in the fixture term, where the strength ratings already handle it. Putting a
+defender's opponent into both terms would count it twice.
+
+**Set piece duty adjusts a rate and never creates one.** `penalties_order` and
+`direct_freekicks_order` add expected goals, because a taker who has just been
+given the job has a claim on chances his past xG cannot show. Someone with no
+minutes still gets no rate at all: appearance points on their own are an
+invented number, not a measured one.
+
+**The component blends in by the same `played / (played + SHRINKAGE_GAMES)`
+weight** that governs current against prior, so no new constant appears and a
+bad component estimate can only move the answer partway. Pre-season that weight
+is 0 and this contributes nothing, which is also required: FPL publishes the
+expected goals fields as zero until the season is under way.
 
 **The fixture term blends two difficulty signals.** FPL's 1 to 5 rating is a
 five step function set by hand and rarely revised. The six team strength
@@ -414,19 +460,14 @@ speculatively.
   mean. A haul probability per player would be the smallest useful version and
   wants the xG plumbing below first. Do not reach for a mean-variance or
   chance-constrained MILP on a model this rough.
-- Position-specific scoring. A defender's clean sheet and a striker's goal both
-  collapse into one scalar `points_per_90`. The inputs to fix it are parsed and
-  unused: `expected_goals`, `expected_assists`, `expected_goals_conceded`. The
-  shape that preserves the three-term separation is a component rate inside
-  `points_per_90` (Poisson clean sheets from xGC for GKP and DEF, xGI rates for
-  attackers) blended in by the existing `played / (played + SHRINKAGE_GAMES)`
-  weight, with the opponent adjustment left in the fixture term where the
-  strength ratings already handle it. `_minutes_share` must not be touched.
-  Note `FakeApi` emits those three fields as constant zero, so a component
-  model would silently evaluate to nothing across the whole suite unless the
-  fake is extended in the same commit. Set-piece and penalty duty
-  (`penalties_order`, `direct_freekicks_order`,
-  `corners_and_indirect_freekicks_order`) are not parsed at all.
+- The rest of position-specific scoring. `component_rate` covers goals, assists
+  and clean sheets, which is most of where the positions differ. Saves are not
+  modelled, so a shot-stopper at a bad club reads the same as a spectator at a
+  good one, and `saves` is not parsed. Nor are cards, or the defensive
+  contribution points added in 2025/26. `corners_and_indirect_freekicks_order`
+  is parsed and unused, since a corner taker's assists are already in his xA.
+  `PENALTY_XG_P90` and `FREEKICK_XG_P90` are set by eye against how many spot
+  kicks a season produces, not fitted, so they are a starting point to tune.
 - Live scoring across a mini league. `live.py` scores your own squad and
   `leagues.py` reads league tables, but nothing joins them to show what a whole
   league is scoring in progress. The thing worth knowing when it is built is

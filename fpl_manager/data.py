@@ -107,6 +107,11 @@ class Season:
             "expected_goals_conceded",
             "ep_next",
             "chance_of_playing_next_round",
+            # who takes what. 1 is first choice, and the field is absent for
+            # everyone who takes nothing, so it stays NaN rather than becoming 0
+            "penalties_order",
+            "direct_freekicks_order",
+            "corners_and_indirect_freekicks_order",
             # what price moves are worked out from, see prices.py
             "transfers_in_event",
             "transfers_out_event",
