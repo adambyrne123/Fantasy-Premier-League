@@ -90,6 +90,34 @@ def test_every_tab_renders(app):
         assert expected in labels
 
 
+def test_every_tab_explains_what_its_numbers_mean(app):
+    """One "How to read this" per tab, since the numbers are not self evident.
+
+    `xpts_next` and `xpts_total` are both called projected points and are not
+    the same thing, and the headline on the Squad tab counts the eleven while
+    the shirts under it count one gameweek. None of that is guessable.
+    """
+    at = app.run()
+    assert not at.exception
+
+    # an expander with an icon comes back through `status`, not `expander`
+    notes = [e for e in at.status if e.label == "How to read this"]
+    assert len(notes) == len(at.tabs), "every tab should carry one"
+
+
+def test_the_pool_columns_say_what_they_are():
+    """A column header on its own does not distinguish points per million from
+    points per 90, and the table has both."""
+    import re
+
+    source = APP.read_text(encoding="utf-8")
+    glossary = re.search(r"^GLOSSARY = \{.*?^\}", source, re.S | re.M)
+    assert glossary, "the one place a number is defined"
+
+    for column in ("xpts_next", "xpts_total", "value", "points_per_90", "minutes_share"):
+        assert f'"{column}"' in glossary.group(0), f"{column} is not self explanatory"
+
+
 def _states(at):
     """Text of every empty-state card. They are markdown, not st.info."""
     return [m.value for m in at.markdown if 'class="state"' in m.value]
