@@ -88,27 +88,36 @@ def solver() -> pulp.LpSolver:
 
     PuLP bundles CBC for x86 only, so on Windows for ARM it looks for a build
     that was never shipped and every solve dies before it starts. Windows runs
-    x64 executables under emulation, so pointing at the bundled x64 binary keeps
-    this to one solver dependency rather than two.
+    x64 executables under emulation, so falling back to the bundled x64 binary
+    keeps this to one solver dependency rather than two. On any platform PuLP
+    ships a binary for, this is the default and the fallback never runs.
 
-    Everything goes through COIN_CMD with an explicit path, which is both the
-    only way to reach that binary and what PULP_CBC_CMD becomes in PuLP 4.0.
-    PULP_CBC_CMD is kept as a last resort for an install that ships CBC
-    somewhere this does not look.
+    **The order matters and must not be flipped to silence a deprecation
+    warning.** Doing exactly that took the deployed app down: every solve died
+    in `posix_spawn` with an OSError. `PULP_CBC_CMD` is not merely a deprecated
+    alias for a pathed `COIN_CMD`. It resolves the bundled binary for the
+    running platform, chmods it executable on anything that is not Windows, and
+    reports through `_permissions_ok` when that failed. Searching `solverdir`
+    by hand skips all of it, and hands `COIN_CMD` whichever file happens to
+    sort first.
+
+    The fallback goes through COIN_CMD because PULP_CBC_CMD refuses an explicit
+    path. That is the only part of the PuLP 4.0 migration done here, and it is
+    deliberately confined to this function.
     """
+    default = pulp.PULP_CBC_CMD(msg=False)
+    if default.available():
+        return default
+
     solverdir = Path(pulp.__file__).parent / "solverdir"
     # 64 bit first, since the 32 bit build runs out of memory on big models
     candidates = sorted(solverdir.rglob("cbc*"), key=lambda p: ("64" not in p.parent.name, str(p)))
     for candidate in candidates:
         if not candidate.is_file() or candidate.suffix not in {".exe", ""}:
             continue
-        found = pulp.COIN_CMD(path=str(candidate), msg=False)
-        if found.available():
-            return found
-
-    legacy = pulp.PULP_CBC_CMD(msg=False)
-    if legacy.available():
-        return legacy
+        fallback = pulp.COIN_CMD(path=str(candidate), msg=False)
+        if fallback.available():
+            return fallback
 
     raise RuntimeError(
         "No CBC binary available for this platform. Install one with "
