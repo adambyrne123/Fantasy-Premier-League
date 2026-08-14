@@ -537,6 +537,46 @@ def test_exclusions_are_honoured(projections: pd.DataFrame):
     assert banned not in result.squad.index
 
 
+def test_the_bundled_solver_is_preferred_over_a_hand_found_one():
+    """PuLP's own solver comes first wherever it has a binary, and reordering
+    this to quieten a deprecation warning took the deployed app down.
+
+    `PULP_CBC_CMD` resolves the right binary for the platform and chmods it
+    executable, which a `COIN_CMD` pointed at a path found by globbing does
+    not. On Linux, where the wheel ships the binary without the execute bit,
+    skipping it means every solve dies in `posix_spawn`.
+    """
+    import pulp
+
+    from fpl_manager.optimiser import solver
+
+    solver.cache_clear()
+    try:
+        if not pulp.PULP_CBC_CMD(msg=False).available():
+            pytest.skip("no bundled binary on this platform, which is the fallback's job")
+        assert isinstance(solver(), pulp.PULP_CBC_CMD)
+    finally:
+        solver.cache_clear()
+
+
+def test_the_solver_falls_back_when_nothing_is_bundled(monkeypatch):
+    """Windows on ARM, where PuLP looks for a build that was never shipped."""
+    import pulp
+
+    from fpl_manager.optimiser import solver
+
+    monkeypatch.setattr(pulp.PULP_CBC_CMD, "available", lambda self: False)
+    solver.cache_clear()
+    try:
+        found = solver()
+        assert isinstance(found, pulp.COIN_CMD)
+        assert found.available(), "a fallback that cannot run is worse than none"
+    except RuntimeError as exc:
+        assert "No CBC binary" in str(exc)
+    finally:
+        solver.cache_clear()
+
+
 def test_solver_beats_greedy_value_picking(projections: pd.DataFrame, squad):
     """The reason selection is a MILP rather than a sort.
 
