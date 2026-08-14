@@ -197,6 +197,55 @@ def _pitch(at):
     return next(m.value for m in at.markdown if 'class="pitch' in m.value)
 
 
+def test_every_card_carries_both_projections_labelled(app):
+    """One unlabelled number meant the shirts never added up to the headline
+    above them, and nothing on screen said why. Both spans, both named."""
+    at = app.run()
+    assert not at.exception
+    pitch = _pitch(at)
+
+    assert pitch.count('<span class="box">') == 30, "two spans on each of fifteen cards"
+    assert pitch.count('class="v next"') == 15
+    assert pitch.count('class="v span"') == 15
+    assert pitch.count('<span class="k">GW1</span>') == 15, "the next gameweek names itself"
+    assert pitch.count('<span class="k">6 GW</span>') == 15, "so does the horizon"
+
+
+def test_the_card_labels_follow_the_horizon(app):
+    """The right hand figure is whatever the slider says, so a label naming a
+    fixed span would go quietly wrong the moment anyone moved it."""
+    at = app.run()
+    assert '<span class="k">6 GW</span>' in _pitch(at)
+
+    # by label, not by index: this page has six sliders and adding a seventh
+    # should not silently point this test at the wrong one
+    horizon = next(s for s in at.slider if s.label == "Gameweeks to project over")
+    horizon.set_value(3).run()
+    assert not at.exception
+    pitch = _pitch(at)
+    assert '<span class="k">3 GW</span>' in pitch
+    assert "6 GW" not in pitch
+
+
+def test_the_squad_headline_is_the_cards_added_up(app):
+    """The one number a reader will try to reconcile by hand. It is the eleven
+    horizon figures plus the captain's next gameweek, not the captain doubled,
+    and the caption under the pitch says exactly that."""
+    import re
+
+    at = app.run()
+    pitch = _pitch(at)
+    xi = pitch.split('class="bench-strip')[0]
+
+    spans = [float(v) for v in re.findall(r'class="v span">([\d.]+)<', xi)]
+    captain_card = next(c for c in xi.split('<div class="shirt') if 'class="badge c"' in c)
+    captain_next = float(re.search(r'class="v next">([\d.]+)<', captain_card).group(1))
+
+    assert len(spans) == 11
+    headline = next(m for m in at.metric if "Projected over" in m.label)
+    assert abs(sum(spans) + captain_next - float(headline.value.split()[0])) < 1.0
+
+
 def test_every_card_in_the_squad_carries_a_face(app):
     """Fifteen identical white rectangles tell you nothing about who is in the
     side, which is the one thing a pitch view exists to say. The bench is part

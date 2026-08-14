@@ -246,7 +246,8 @@ PITCH_CSS = """
 .pitch.compact .shirt, .bench-strip.compact .shirt { width:80px; padding:6px 4px; }
 .pitch.compact .shirt .nm { font-size:.7rem; }
 .pitch.compact .shirt .meta { font-size:.58rem; }
-.pitch.compact .shirt .pts { font-size:.92rem; }
+.pitch.compact .shirt .pts .v { font-size:.84rem; }
+.pitch.compact .shirt .pts .k { font-size:.45rem; }
 .shirt.ring-out { box-shadow:0 0 0 2px #ff2d55, 0 2px 6px rgba(0,0,0,.35); opacity:.72; }
 .shirt.ring-in { box-shadow:0 0 0 2px #00E87B, 0 2px 8px rgba(0,232,123,.45); }
 .flag, .dot {
@@ -263,7 +264,22 @@ PITCH_CSS = """
   overflow:hidden; text-overflow:ellipsis;
 }
 .shirt .meta { font-size:.67rem; color:#5d4d69; margin-top:2px; }
-.shirt .pts { font-size:1.1rem; font-weight:700; margin-top:4px; color:#0a5733; }
+/* Two projections per card, each labelled. They are different spans and the
+   card has to say so, or the shirts silently disagree with the total above. */
+.shirt .pts {
+  display:flex; gap:4px; margin-top:5px;
+  border-top:1px solid rgba(0,0,0,.10); padding-top:4px;
+}
+.shirt .pts .box { flex:1 1 0; min-width:0; }
+.shirt .pts .k {
+  display:block; font-size:.5rem; letter-spacing:.05em;
+  text-transform:uppercase; color:#7c6d88; white-space:nowrap;
+}
+.shirt .pts .v { display:block; font-size:1rem; font-weight:700; line-height:1.15; }
+.shirt .pts .v.next { color:#0a5733; }
+/* the horizon reads as the quieter of the two, since the week in front of you
+   is what a lineup decision turns on */
+.shirt .pts .v.span { color:#4a3a57; }
 .badge {
   display:inline-block; font-size:.58rem; font-weight:800; border-radius:999px;
   padding:1px 5px; margin-left:4px; vertical-align:middle;
@@ -288,7 +304,9 @@ PITCH_CSS = """
   .pitch-line { gap:5px; margin-bottom:10px; }
   .shirt .nm { font-size:.6rem; }
   .shirt .meta { font-size:.5rem; }
-  .shirt .pts { font-size:.8rem; margin-top:2px; }
+  .shirt .pts { margin-top:3px; gap:2px; padding-top:3px; }
+  .shirt .pts .v { font-size:.7rem; }
+  .shirt .pts .k { font-size:.42rem; letter-spacing:0; }
   .badge { font-size:.5rem; padding:0 3px; margin-left:2px; }
 }
 </style>
@@ -815,8 +833,22 @@ def _mug(images: pd.DataFrame | None, player_id, css: str = "mug") -> str:
 
 
 def _shirt(
-    row: pd.Series, badge: str = "", highlight: str = "", images: pd.DataFrame | None = None
+    row: pd.Series,
+    badge: str = "",
+    highlight: str = "",
+    images: pd.DataFrame | None = None,
+    labels: tuple[str, str] = ("Next", "Span"),
 ) -> str:
+    """One player's card, carrying both projections rather than one.
+
+    The next gameweek and the whole horizon are different numbers and both
+    matter: the first decides who starts this week, the second decides who is
+    worth owning at all. Showing one unlabelled meant the shirts never added up
+    to the headline above them and nothing on screen said why.
+
+    `labels` names the two spans, so the card says GW1 and 6 GW rather than
+    leaving the reader to work out which is which.
+    """
     mark = f'<span class="badge {badge.lower()}">{badge}</span>' if badge else ""
     severity, note = availability(row)
     flag = f'<span class="flag {severity}" title="{escape(note)}"></span>' if severity else ""
@@ -824,11 +856,24 @@ def _shirt(
     crest = ""
     if images is not None and row.name in images.index:
         crest = f'<img class="crest" src="{escape(images.loc[row.name, "badge"])}" alt="">'
+
+    # a frame without the horizon column still renders, showing the one span it
+    # does have, since the transfer views build their own frames
+    next_label, span_label = labels
+    spans = [(next_label, row["xpts_next"], "next")]
+    if "xpts_total" in row.index and pd.notna(row["xpts_total"]):
+        spans.append((span_label, row["xpts_total"], "span"))
+    cells = "".join(
+        f'<span class="box"><span class="k">{escape(label)}</span>'
+        f'<span class="v {tone}">{value:.1f}</span></span>'
+        for label, value, tone in spans
+    )
+
     return (
         f'<div class="shirt{ring}">{flag}{crest}{_mug(images, row.name)}'
         f'<div class="nm">{escape(str(row["name"]))}{mark}</div>'
         f'<div class="meta">{escape(str(row["club"]))} · {row["price"]:.1f}m</div>'
-        f'<div class="pts">{row["xpts_next"]:.1f}</div>'
+        f'<div class="pts">{cells}</div>'
         "</div>"
     )
 
@@ -842,6 +887,7 @@ def formation_view(
     compact: bool = False,
     highlight: dict | None = None,
     images: pd.DataFrame | None = None,
+    labels: tuple[str, str] = ("Next", "Span"),
 ) -> None:
     """Lay the XI out on a pitch, in formation, the way the FPL site does.
 
@@ -866,6 +912,7 @@ def formation_view(
                 "C" if pid == captain_id else "V" if pid == vice_id else "",
                 highlight.get(pid, ""),
                 images,
+                labels,
             )
             for pid, row in line.iterrows()
         )
@@ -880,7 +927,7 @@ def formation_view(
 
     if bench is not None and not bench.empty:
         strip = "".join(
-            _shirt(row, "", highlight.get(pid, ""), images) for pid, row in bench.iterrows()
+            _shirt(row, "", highlight.get(pid, ""), images, labels) for pid, row in bench.iterrows()
         )
         markup += (
             f'<div class="bench-strip{size}"><div class="bench-cap">Bench, in order</div>'
@@ -1008,6 +1055,9 @@ images = player_images(season)
 badges = club_badges(season)
 projections, by_gameweek = load_projections(season, horizon, use_prior, stamp)
 lookup = name_lookup(projections)
+# Named once, so the three pitches and the caption under them cannot disagree
+# about which span is which. Both follow the horizon slider.
+span_labels = (f"GW{season.next_gameweek}", f"{horizon} GW")
 
 st.sidebar.divider()
 # the gameweek, player count and data age used to live here as a caption, and
@@ -1082,10 +1132,14 @@ with build_tab:
         "picking the best points per million one at a time is reliably a few "
         "points worse, because what binds is having enough cheap players to "
         "afford the expensive ones.\n\n"
-        "- **Projected over the horizon** counts the starting eleven with the "
-        "captain doubled. The bench is not in it.\n"
-        "- **The number on each shirt** is the next gameweek alone, so the "
-        "shirts and the headline are different units.\n"
+        "- **Each card shows two projections.** The left is the next gameweek "
+        "on its own, the right is the whole horizon. Both are labelled on the "
+        "card, and they answer different questions: who to start and captain "
+        "this week, against who is worth owning at all.\n"
+        "- **Projected over the horizon** at the top is the eleven right hand "
+        "figures added together, plus the captain's next gameweek once more. "
+        "The armband is a weekly decision, so it counts for one gameweek rather "
+        "than the whole run, and the bench is not in the number at all.\n"
         "- **Bench weight** in the sidebar decides how much the bench counts when "
         "choosing the fifteen. Low gives two cheap punts, high gives a squad you "
         "can rotate.\n"
@@ -1120,9 +1174,11 @@ with build_tab:
     b.metric(
         f"Projected over {horizon} GW",
         f"{result.projected:.0f} pts",
-        help="The starting eleven only, added up across the horizon, with the "
-        "captain counted twice. The four on the bench are not in this number, "
-        "since they only score if someone ahead of them does not play.",
+        help="The starting eleven added up across the horizon, plus the "
+        "captain's next gameweek once more. The armband is a weekly decision, "
+        "so it is worth one gameweek here rather than six. The four on the "
+        "bench are not counted at all, since they only score if someone ahead "
+        "of them does not play.",
     )
     c.metric(
         "Captain",
@@ -1132,11 +1188,20 @@ with build_tab:
     )
 
     formation_view(
-        result.xi, result.bench, result.captain.name, result.vice_captain.name, images=images
+        result.xi,
+        result.bench,
+        result.captain.name,
+        result.vice_captain.name,
+        images=images,
+        labels=span_labels,
     )
     st.caption(
-        "The number on each shirt is that player's projection for the **next "
-        "gameweek only**, which is why they do not add up to the total above."
+        f"Each card carries both projections. **{span_labels[0]}** is the next "
+        f"gameweek on its own, which is what a lineup or captain decision turns on. "
+        f"**{span_labels[1]}** is the whole horizon added up, which is what decides "
+        f"whether he is worth owning at all. The headline above is the eleven "
+        f"**{span_labels[1]}** figures added together, plus the captain's "
+        f"**{span_labels[0]}** once more for the armband, and no bench."
     )
     flag_legend()
 
@@ -1827,6 +1892,7 @@ with transfers_tab:
                 compact=True,
                 highlight={i: "out" for i in plan.transfers_out.index},
                 images=images,
+                labels=span_labels,
             )
         with after:
             st.caption(f"After · captain {plan.captain['name']}")
@@ -1838,6 +1904,7 @@ with transfers_tab:
                 compact=True,
                 highlight={i: "in" for i in plan.transfers_in.index},
                 images=images,
+                labels=span_labels,
             )
         flag_legend()
 
