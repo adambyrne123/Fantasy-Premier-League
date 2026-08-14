@@ -60,7 +60,9 @@ api.py  ──▶  data.py  ──▶  projections.py  ──▶  optimiser.py  
 | `chips.py` | What a chip is worth, and in which gameweek. | New MILP formulations, which go in `optimiser.py` |
 | `prices.py` | Who is close to a price rise or fall. | Anything the points model reads |
 | `live.py` | In-play scoring: live stats, provisional bonus, autosubs. | Anything forward looking, and any selection logic |
+| `roi.py` | Points already returned per million. | Projections, which look forward |
 | `squad.py` | Loading the user's 15, bank, selling prices. | Projections or optimisation |
+| `leagues.py` | Public manager profiles and classic league tables. | Anything that scores or ranks players |
 | `cli.py` | Argument parsing and printing. | Model logic of any kind |
 | `app.py` | Streamlit view: widgets, layout, caching. | Model logic of any kind |
 
@@ -160,6 +162,21 @@ expiring accomplishes nothing, because nothing re-enters `_get`. Without the
 stamp, Streamlit is told to skip hashing the `Season`, so a rebuilt one looks
 identical to the one it replaced and the old projections keep being served. New
 cached functions taking `_season` need the stamp as their last argument.
+**A push does not restart the deployed app, and that has broken it once.**
+Community Cloud pulls the new code and re-runs `app.py`, but modules already in
+`sys.modules` stay as they were. Adding a name to a library module and importing
+it from `app.py` in the same push is therefore enough to take the app down: the
+new `app.py` asks for something the old, still-loaded `optimiser` does not have,
+and every visitor gets an `ImportError` until someone reboots it by hand from
+Manage app.
+
+It is misleading while it lasts, because the traceback quotes the module's
+`__file__`, which is the checkout path and does hold the new code. The file on
+disk is fine. The module object in memory is not. Check out the merge commit and
+import it before going looking for a bad merge.
+
+Nothing in the repo prevents this. After a push that adds or renames anything in
+`fpl_manager`, load the app and reboot it if it errors.
 
 **Streamlit caching splits by type.** `Season` holds an HTTP session, so it uses
 `@st.cache_resource`. Frames use `@st.cache_data`. Passing `Season` into a
@@ -171,6 +188,14 @@ one.
 per club per fixture, so a club with two fixtures in a gameweek gets two rows
 and a club with none gets zero. Do not add special casing. If you find yourself
 writing `if is_double_gameweek`, the design has gone wrong.
+
+`Season.gameweek_shape` is the one exception, because naming them is the point
+of it rather than an accident of the arithmetic. It is also the only reader here
+that keeps finished fixtures: a club that has played the first leg of a double
+still has a double, and dropping played fixtures halfway through a gameweek
+would report every club that had already kicked off as blanking. It skips
+gameweeks with no fixtures at all, or the far end of the horizon reads as twenty
+clubs blanking at once.
 
 **The two live endpoints answer different questions and both are needed.**
 `event/{gw}/live/` sums a player's stats across his fixtures, which is the right
@@ -196,6 +221,22 @@ bench in the order the manager set it and takes the first legal replacement.
 Routing it through `optimiser.pick_xi` would field a better XI than FPL actually
 will, which is a wrong answer stated confidently, and would import the optimiser
 into a module that must stay a leaf.
+
+**None of the live code has met a real match yet.** It was written pre-season,
+when `event/{gw}/live/` returns zero elements and no fixture carries a stats
+array, so every test behind it runs on synthetic payloads shaped like the
+documented one. The empty case is handled and verified against the real API,
+but the bonus ranking and the substitution rule have only ever been exercised
+against a fake. Treat the first matchday of the season as the real test, and
+check a scored gameweek against the FPL site before trusting a number on it.
+
+**`total_points` changes meaning at the season rollover.** Before the first
+deadline the API still serves the previous season's totals, so in early August
+`total_points` is last season's return and a week later it is this season's,
+with no schema change to notice. `roi.points_source` decides which by reading
+the data rather than the calendar, because the reset does not line up neatly
+with `gameweeks_played`. Anything new that divides by or ranks on
+`total_points` has the same problem and should go through it.
 
 **Pre-season means no current data.** `gameweeks_played` is 0 until late August,
 so the shrinkage weight is 0 and projections rest entirely on last season. Any
@@ -301,9 +342,40 @@ Streamlit, decided. Interactivity was the priority, and re-solving is fast
 enough (well under a second for a full 15-man build) that sliders re-run the
 optimiser live rather than needing a submit button.
 
-Deployment target is Streamlit Community Cloud, which is free and public. Nothing
-in this repo is secret, and there are no credentials to leak, so a public app is
-fine. Mobile rendering is cramped but usable, which was the accepted trade.
+Deployed to Streamlit Community Cloud, which is free and public, and live at
+https://fantasy-premier-league-ab.streamlit.app/ tracking `main`. Nothing in this
+repo is secret, and there are no credentials to leak, so a public app is fine.
+Mobile rendering is cramped but usable, which was the accepted trade.
+
+**The deploy installs from `uv.lock`, not `requirements.txt`.** Both files are
+present and Community Cloud picks the lockfile, saying so in the build log:
+
+```
+WARN: More than one requirements file detected in the repository.
+Available options: uv-sync uv.lock, uv requirements.txt, poetry pyproject.toml.
+Used: uv-sync with uv.lock
+```
+
+So `requirements.txt` is currently dead weight on the deploy. Regenerating it
+changes nothing that runs in production, and anything that has to reach the
+deployed app belongs in `uv.lock`, which means `uv sync` and committing the
+result. Keep it exported anyway, since it is the fallback if the lockfile is
+ever dropped and it is what any other host would read:
+
+```bash
+uv export --no-dev --extra app --no-hashes --no-emit-project \
+    --format requirements-txt -o requirements.txt
+```
+
+One consequence of uv-sync winning: it installs the project itself,
+`fpl-manager==0.1.0` from the checkout, which is exactly what `--no-emit-project`
+keeps out of `requirements.txt`. That is the difference between the two paths,
+and it is why the file you regenerate does not describe the environment you get.
+
+Two things keep a cold boot survivable. `prior_season.parquet` is committed, so
+`load_prior` reads it rather than making roughly 700 `element-summary` requests
+before the first page renders. And `FPL_CACHE_DIR` wants a persisted path in the
+app's settings, or every boot re-fetches the rest.
 
 Rejected, with reasons, so they do not get re-proposed:
 
@@ -355,6 +427,12 @@ speculatively.
   fake is extended in the same commit. Set-piece and penalty duty
   (`penalties_order`, `direct_freekicks_order`,
   `corners_and_indirect_freekicks_order`) are not parsed at all.
+- Live scoring across a mini league. `live.py` scores your own squad and
+  `leagues.py` reads league tables, but nothing joins them to show what a whole
+  league is scoring in progress. The thing worth knowing when it is built is
+  that picks are immutable once a deadline passes, and only `event/{gw}/live/`
+  needs a short TTL, so a twenty manager league costs twenty long cached
+  requests fetched once per gameweek rather than twenty on every rerun.
 - Price change prediction is advisory only, in `prices.py`, and deliberately
   does not reach the optimiser. Feeding expected price movement into the MILP
   needs a points-per-0.1m exchange rate, and a wrong one quietly degrades squad
@@ -392,6 +470,8 @@ speculatively.
   container restart or a wake from sleep, so it makes reruns cheap within one
   container and nothing more. What keeps a cold boot fast is the committed
   `prior_season.parquet` and a fresh start being two requests.
+- Continuous integration. Nothing runs the suite on a pull request, so a green
+  run is whatever the last person happened to do locally.
 - Refreshing the committed `prior_season.parquet` between seasons. Nothing does
   it automatically, so in August it needs `--refresh` and a manual copy, or the
   projection quietly rests on a season that is two years old.

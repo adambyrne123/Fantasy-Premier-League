@@ -323,3 +323,95 @@ class Season:
         )
         agg.insert(0, "club", self.teams["short_name"])
         return agg.sort_values(["avg_difficulty", "fixtures"], ascending=[True, False])
+
+    def gameweek_shape(self, horizon: int = 12, start_gw: int | None = None) -> pd.DataFrame:
+        """Clubs that play twice in a gameweek, and clubs that do not play.
+
+        One row per club per affected gameweek, with `shape` reading "double"
+        or "blank". Gameweeks where everything is normal produce no rows at
+        all, so an empty frame means there is nothing coming.
+
+        Reads every fixture in the window rather than only the unfinished ones,
+        unlike everything else here. A club that has already played the first
+        leg of a double still has a double, and filtering to unfinished
+        fixtures halfway through a gameweek would report every club that had
+        already kicked off as blanking.
+
+        A gameweek with no fixtures published at all is skipped rather than
+        reported as twenty clubs blanking at once, which is what the far end of
+        the horizon looks like before the schedule is complete.
+        """
+        start_gw = start_gw or self.next_gameweek
+        window = self.fixtures[
+            self.fixtures["event"].notna()
+            & (self.fixtures["event"] >= start_gw)
+            & (self.fixtures["event"] < start_gw + horizon)
+        ]
+        if window.empty:
+            return pd.DataFrame(columns=["event", "club", "fixtures", "shape"])
+
+        playing = pd.concat(
+            [
+                window[["event", "team_h"]].rename(columns={"team_h": "team"}),
+                window[["event", "team_a"]].rename(columns={"team_a": "team"}),
+            ]
+        )
+        counts = playing.groupby(["event", "team"]).size().rename("fixtures")
+
+        rows = []
+        for event in sorted(counts.index.get_level_values("event").unique()):
+            in_week = counts.xs(event, level="event").reindex(self.teams.index).fillna(0)
+            for team, played in in_week.items():
+                shape = "double" if played >= 2 else "blank" if played == 0 else None
+                if shape:
+                    rows.append(
+                        {
+                            "event": int(event),
+                            "club": self.teams["short_name"].get(team),
+                            "fixtures": int(played),
+                            "shape": shape,
+                        }
+                    )
+
+        if not rows:
+            return pd.DataFrame(columns=["event", "club", "fixtures", "shape"])
+        return pd.DataFrame(rows).sort_values(["event", "shape", "club"]).reset_index(drop=True)
+
+    def fixture_swings(self, window: int = 3, start_gw: int | None = None) -> pd.DataFrame:
+        """How much each club's run changes between one block of gameweeks and the next.
+
+        `swing` is the mean difficulty of the next `window` gameweeks minus the
+        mean of the `window` after. Positive means it gets easier later, so the
+        club's players are worth waiting for. Negative means the good run is
+        happening now and is the signal to plan an exit.
+
+        Sorted easiest-to-come first. A club with no fixture at all in either
+        block has no comparison to make and is left out, which is why the game
+        counts come back alongside: a swing resting on one fixture is a much
+        weaker signal than one resting on three.
+        """
+        start_gw = start_gw or self.next_gameweek
+        tf = self.team_fixtures(window * 2, start_gw=start_gw)
+        if tf.empty:
+            return pd.DataFrame(
+                columns=["club", "now", "later", "swing", "now_games", "later_games"]
+            )
+
+        tf = tf.copy()
+        tf["block"] = (tf["event"] >= start_gw + window).map({False: "now", True: "later"})
+        means = tf.pivot_table(index="team", columns="block", values="difficulty", aggfunc="mean")
+        games = tf.pivot_table(index="team", columns="block", values="difficulty", aggfunc="size")
+
+        out = pd.DataFrame(index=means.index)
+        out.insert(0, "club", self.teams["short_name"])
+        for block in ("now", "later"):
+            out[block] = means[block] if block in means.columns else float("nan")
+            out[f"{block}_games"] = (
+                games[block].fillna(0).astype(int) if block in games.columns else 0
+            )
+
+        out["swing"] = out["now"] - out["later"]
+        out = out.dropna(subset=["swing"])
+        return out.sort_values("swing", ascending=False).reset_index(drop=True)[
+            ["club", "now", "later", "swing", "now_games", "later_games"]
+        ]

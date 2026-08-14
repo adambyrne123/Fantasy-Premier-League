@@ -205,6 +205,12 @@ The app polls once a minute, and only while a match is in progress. Load your
 squad with an entry id rather than a file if you want the real captain and
 bench order, since a squad file records neither.
 
+One caveat worth knowing. This was written before the season started, when the
+live endpoints return nothing at all, so every test behind it runs against
+synthetic data shaped like the real payload. The empty case is handled, but the
+bonus ranking and the substitution rule have never seen an actual match. Check
+the first gameweek against the FPL site before trusting it.
+
 ## What it does not do
 
 - Plan two chips together, or weigh a chip now against a better week later than

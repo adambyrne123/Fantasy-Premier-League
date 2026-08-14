@@ -54,6 +54,76 @@ def test_fixture_ticker_covers_every_club(season: Season):
     assert ticker["avg_difficulty"].between(1, 5).all()
 
 
+def test_gameweek_shape_only_reports_the_odd_ones(season: Season):
+    """A normal gameweek produces no rows, so an empty frame reads as nothing
+    coming rather than as a failure to look."""
+    shape = season.gameweek_shape(horizon=8)
+    assert set(shape.columns) == {"event", "club", "fixtures", "shape"}
+    assert set(shape["shape"]) <= {"double", "blank"}
+    assert (shape.loc[shape["shape"] == "double", "fixtures"] >= 2).all()
+    assert (shape.loc[shape["shape"] == "blank", "fixtures"] == 0).all()
+
+
+def test_a_double_is_found_and_the_rest_of_the_week_is_left_alone(season: Season):
+    """Twenty clubs and nineteen fixtures in a week means one club doubles and
+    one blanks, and the other eighteen are unremarkable."""
+    gw = season.next_gameweek
+    extra = {
+        "id": 9999,
+        "event": gw,
+        "team_h": 1,
+        "team_a": 2,
+        "team_h_difficulty": 3,
+        "team_a_difficulty": 3,
+        "finished": False,
+        "kickoff_time": pd.Timestamp("2026-08-22T14:00:00Z"),
+    }
+    season.fixtures = pd.concat([season.fixtures, pd.DataFrame([extra])], ignore_index=True)
+
+    week = season.gameweek_shape(horizon=1)
+    doubles = set(week.loc[week["shape"] == "double", "club"])
+    assert doubles == {season.teams["short_name"][1], season.teams["short_name"][2]}
+
+
+def test_a_played_fixture_still_counts_towards_the_shape(season: Season):
+    """Every other reader here drops finished fixtures. This one must not: half
+    way through a gameweek that would report each club that had already kicked
+    off as blanking, which is the opposite of the truth."""
+    gw = season.next_gameweek
+    played = season.fixtures["event"] == gw
+    if not played.any():
+        pytest.skip("no fixtures in the next gameweek to mark as played")
+    season.fixtures.loc[played, "finished"] = True
+
+    blanks = season.gameweek_shape(horizon=1)
+    assert blanks.empty, "clubs that have already played have not blanked"
+
+
+def test_an_unpublished_gameweek_is_not_twenty_blanks(season: Season):
+    """Past the end of the published schedule every club has no fixture. That
+    is missing data, not a blank gameweek for the whole league."""
+    shape = season.gameweek_shape(horizon=60)
+    per_event = shape[shape["shape"] == "blank"].groupby("event").size()
+    assert (per_event < len(season.teams)).all()
+
+
+def test_fixture_swings_compare_one_block_against_the_next(season: Season):
+    swings = season.fixture_swings(window=3)
+    assert not swings.empty
+    assert swings["swing"].is_monotonic_decreasing, "easiest to come should sort first"
+    reconstructed = swings["now"] - swings["later"]
+    assert np.allclose(reconstructed, swings["swing"])
+
+
+def test_a_positive_swing_means_it_gets_easier(season: Season):
+    """The sign is the whole signal, and getting it backwards would tell you to
+    sell exactly the players you should be buying."""
+    swings = season.fixture_swings(window=3)
+    best = swings.iloc[0]
+    assert best["swing"] > 0
+    assert best["now"] > best["later"], "a positive swing is a hard run now, an easier one after"
+
+
 def test_next_deadline_belongs_to_the_next_gameweek(season: Season):
     """The status bar puts the two side by side, so a deadline lifted from a
     different event than the gameweek shown next would be worse than none."""

@@ -92,6 +92,13 @@ class FakeApi:
                     elements.append(
                         {
                             "id": pid,
+                            # `code` is the photograph id and `team_code` the
+                            # kit id, both distinct from the ids beside them.
+                            # The front end builds image URLs off these, so the
+                            # fake has to keep them apart the way the real
+                            # payload does or a swapped pair would pass here.
+                            "code": 500_000 + pid,
+                            "team_code": 100 + team,
                             "first_name": f"First{pid}",
                             "second_name": f"Last{pid}",
                             "web_name": f"P{pid}",
@@ -236,6 +243,75 @@ class FakeApi:
 
     def fetched_at(self, key: str):
         return None
+
+    def entry(self, entry_id: int) -> dict:
+        """A manager's public profile, with the leagues they are in.
+
+        Entry 1 is in a private league and a system one, so a test can tell the
+        two apart. Entry 2 is in their first season and has no past to show.
+        """
+        return {
+            "id": entry_id,
+            "player_first_name": f"Manager{entry_id}",
+            "player_last_name": "Example",
+            "name": f"Team {entry_id}",
+            "summary_overall_points": 1000 + entry_id,
+            "summary_overall_rank": 500_000 - entry_id if self.played else None,
+            "summary_event_points": 50 + entry_id,
+            "years_active": list(range(3)),
+            "leagues": {
+                "classic": [
+                    {
+                        "id": 900 + entry_id,
+                        "name": f"Private {entry_id}",
+                        "league_type": "x",
+                        "entry_rank": 4,
+                    },
+                    {"id": 314, "name": "Overall", "league_type": "s", "entry_rank": 123456},
+                ]
+            },
+        }
+
+    def entry_history(self, entry_id: int) -> dict:
+        """Past seasons, deliberately out of order so a sort is exercised."""
+        if entry_id == 2:
+            return {"current": [], "past": [], "chips": []}
+        return {
+            "current": [],
+            "chips": [],
+            "past": [
+                {"season_name": "2024/25", "total_points": 2100, "rank": 400_000},
+                {"season_name": "2023/24", "total_points": 2000, "rank": 900_000},
+                {"season_name": "2025/26", "total_points": 2300, "rank": 120_000},
+            ],
+        }
+
+    def league_standings(self, league_id: int, page: int = 1) -> dict:
+        """A league table, empty before a gameweek has been scored.
+
+        That empty case is the real pre-season behaviour of this endpoint and
+        the reason the parser cannot assume any row key exists.
+        """
+        info = {"id": league_id, "name": f"League {league_id}"}
+        if not self.played:
+            return {"league": info, "standings": {"has_next": False, "page": page, "results": []}}
+
+        results = [
+            {
+                "id": i,
+                "entry": 1000 + i,
+                "entry_name": f"Team {i}",
+                "player_name": f"Manager {i}",
+                "rank": i,
+                # the first row is a new entry, which FPL marks with a last
+                # rank of zero rather than a null
+                "last_rank": 0 if i == 1 else i + 2,
+                "total": 500 - i * 10,
+                "event_total": 60 - i,
+            }
+            for i in range(1, 6)
+        ]
+        return {"league": info, "standings": {"has_next": False, "page": page, "results": results}}
 
     def element_summary(self, player_id: int) -> dict:
         """Past seasons for one player.

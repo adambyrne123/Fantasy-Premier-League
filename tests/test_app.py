@@ -8,6 +8,8 @@ somewhere down a tab the developer did not click on before shipping.
 
 from __future__ import annotations
 
+import json
+import re
 from pathlib import Path
 
 import pytest
@@ -27,6 +29,13 @@ def _app(monkeypatch, tmp_path, played: int):
     fake = FakeApi(played=played)
     monkeypatch.setattr(api.FplApi, "bootstrap", lambda self: fake.bootstrap())
     monkeypatch.setattr(api.FplApi, "fixtures", lambda self: fake.fixtures())
+    # the Leagues tab reads these three, and leaving them on the catch-all
+    # below would hand it an empty payload and quietly test nothing
+    monkeypatch.setattr(api.FplApi, "entry", lambda self, e: fake.entry(e))
+    monkeypatch.setattr(api.FplApi, "entry_history", lambda self, e: fake.entry_history(e))
+    monkeypatch.setattr(
+        api.FplApi, "league_standings", lambda self, lid, page=1: fake.league_standings(lid, page)
+    )
     monkeypatch.setattr(api.FplApi, "_get", lambda self, *a, **kw: {})
 
     from fpl_manager.data import Season
@@ -39,7 +48,12 @@ def _app(monkeypatch, tmp_path, played: int):
 
     st.cache_data.clear()
     st.cache_resource.clear()
-    return AppTest.from_file(str(APP), default_timeout=120)
+    # Every run here solves the full squad MILP, and there are enough of these
+    # now that a loaded machine can push one past a two minute budget. AppTest
+    # reports that as a bare RuntimeError, which reads like a broken app rather
+    # than a slow one, so the budget is generous on purpose. It costs nothing
+    # when the run is healthy.
+    return AppTest.from_file(str(APP), default_timeout=400)
 
 
 @pytest.fixture
@@ -63,8 +77,74 @@ def test_every_tab_renders(app):
     at = app.run()
     assert not at.exception
     labels = [tab.label for tab in at.tabs] if at.tabs else []
-    for expected in ["Squad", "Players", "Fixtures", "Transfers", "Chips", "Live"]:
+    for expected in [
+        "Squad",
+        "Players",
+        "ROI",
+        "Fixtures",
+        "Transfers",
+        "Chips",
+        "Leagues",
+        "Live",
+    ]:
         assert expected in labels
+
+
+def _states(at):
+    """Text of every empty-state card. They are markdown, not st.info."""
+    return [m.value for m in at.markdown if 'class="state"' in m.value]
+
+
+def _leagues_entry(at):
+    return next(n for n in at.number_input if n.key == "league_entry")
+
+
+def test_the_leagues_tab_asks_before_it_fetches(app):
+    """Nothing should be requested for a manager nobody has named."""
+    at = app.run()
+    assert not at.exception
+    assert any("Enter a manager id" in info.value for info in at.info)
+
+
+def test_a_manager_id_shows_their_record(midseason_app):
+    at = midseason_app.run()
+    _leagues_entry(at).set_value(1).run()
+    assert not at.exception
+    labels = [m.label for m in at.metric]
+    assert "Overall points" in labels
+    assert "Overall rank" in labels
+
+
+def test_an_unranked_manager_reads_as_unranked_not_as_first(app):
+    """Pre-season the API sends a null rank, and formatting that as a number
+    would put every manager top of the world."""
+    at = app.run()
+    _leagues_entry(at).set_value(1).run()
+    assert not at.exception
+    rank = next(m for m in at.metric if m.label == "Overall rank")
+    assert rank.value == "Not ranked yet"
+
+
+def test_an_empty_league_table_says_so(app):
+    """The real endpoint returns no rows until a gameweek is scored."""
+    at = app.run()
+    _leagues_entry(at).set_value(1).run()
+    assert not at.exception
+    assert any("has no table yet" in card for card in _states(at))
+
+
+def test_a_bad_manager_id_is_an_error_not_a_traceback(app, monkeypatch):
+    at = app.run()
+    from fpl_manager import leagues as leagues_module
+
+    def boom(*args, **kwargs):
+        raise RuntimeError("Could not read the manager for id 42. Check the id is right.")
+
+    monkeypatch.setattr(leagues_module, "load_manager", boom)
+    _leagues_entry(at).set_value(42).run()
+    assert not at.exception
+    assert any("Check the id is right" in e.value for e in at.error)
+    assert any("Squad cost" in m.label for m in at.metric), "other tabs should survive"
 
 
 def test_squad_summary_is_shown(app):
@@ -83,6 +163,109 @@ def _pool(at):
     return next(
         d.value for d in at.dataframe if any(str(c).startswith("GW") for c in d.value.columns)
     )
+
+
+def _pitch(at):
+    return next(m.value for m in at.markdown if 'class="pitch' in m.value)
+
+
+def test_every_card_in_the_squad_carries_a_face(app):
+    """Fifteen identical white rectangles tell you nothing about who is in the
+    side, which is the one thing a pitch view exists to say. The bench is part
+    of that: it renders in the same block and is where the players you least
+    recognise sit."""
+    at = app.run()
+    assert not at.exception
+    pitch = _pitch(at)
+    assert pitch.count('<span class="mug"') == 15, "eleven starters and four on the bench"
+    assert "photos/players/110x140/p500" in pitch, "built from the player's code, not his id"
+
+
+def test_the_kit_is_the_fallback_and_not_a_backdrop(app):
+    """Roughly half the cheapest players have no photograph and the CDN answers
+    403, and cheap players are exactly what the optimiser puts on a bench.
+
+    The kit has to be `object` fallback content, which renders only when the
+    photograph fails. Putting it behind the face instead looks right until you
+    notice every FPL photograph is a cut-out with a transparent background, so
+    the kit shows through around every player rather than only the missing ones.
+    """
+    at = app.run()
+    pitch = _pitch(at)
+    assert pitch.count("<object ") == 15, "one per card, starters and bench"
+    assert pitch.count("dist/img/shirts/standard/shirt_") == 15, "one kit per card"
+    for card in pitch.split('<span class="mug"')[1:]:
+        mug = card.split("</span>")[0]
+        assert "background-image" not in mug, "a kit behind the face bleeds through it"
+        assert mug.index("photos/players") < mug.index("shirts/standard"), (
+            "the photograph is the object, the kit is what it falls back to"
+        )
+
+
+def test_every_card_carries_its_club_crest(app):
+    """FPL's photographs go stale after a transfer, so a player can appear in
+    the kit of the club he has just left. The crest comes off the live team
+    code, so it stays right when the photograph does not."""
+    at = app.run()
+    pitch = _pitch(at)
+    assert pitch.count('class="crest"') == 15
+    assert "badges/70/t" in pitch
+
+
+def test_no_pitch_image_relies_on_a_script_handler(app):
+    """Streamlit strips every on* attribute from the HTML it renders, so an
+    onerror fallback here is removed before it can run and fails silently.
+    That is exactly how this shipped broken once."""
+    at = app.run()
+    assert "onerror" not in _pitch(at)
+
+
+def test_the_keeper_wears_a_different_kit_from_the_outfielders(app):
+    """Keepers have their own kit image, the `_1` variant. Getting this wrong
+    puts an outfield shirt on the one player guaranteed to be on the pitch."""
+    at = app.run()
+    pitch = _pitch(at)
+    assert "_1-66.png" in pitch, "the keeper should have the keeper kit"
+    assert re.search(r"shirt_\d+-66\.png", pitch), "outfielders should not"
+
+
+def test_the_drill_down_shows_the_player_s_face(midseason_app):
+    at = _select_row(midseason_app.run())
+    assert not at.exception
+    head = next(m.value for m in at.get("dialog")[0].markdown if 'class="pd-head"' in m.value)
+    assert "photos/players" in head
+    assert "shirts/standard" in head, "the kit has to back the face here too"
+
+
+def test_the_pool_carries_a_club_badge(app):
+    at = app.run()
+    assert not at.exception
+    pool = _pool(at)
+    assert "badge" in pool.columns
+    assert pool["badge"].str.contains("badges/70/t").all()
+
+
+def test_club_tables_carry_badges_too(app):
+    """The fixture ticker and the swing tables are club-keyed, so the badge
+    reads faster than the three letter short name does."""
+    at = app.run()
+    assert not at.exception
+    badged = [d.value for d in at.dataframe if "badge" in d.value.columns]
+    assert len(badged) >= 3, "the pool, the ticker and at least one swing table"
+    for frame in badged:
+        assert frame["badge"].dropna().str.contains("badges/70/t").all()
+
+
+def test_the_roi_tables_are_badged_once_there_are_points_to_rank(midseason_app):
+    """Both ROI tables only fill in once a gameweek has been scored, and the
+    projected-against-returned one needs a club column to map a badge from,
+    which it did not originally select."""
+    at = midseason_app.run()
+    assert not at.exception
+    badged = [d.value for d in at.dataframe if "badge" in d.value.columns]
+    projected = [f for f in badged if "projected_roi" in f.columns]
+    assert projected, "the projected against returned table should carry badges"
+    assert projected[0]["badge"].str.contains("badges/70/t").all()
 
 
 def test_the_status_bar_carries_the_deadline_and_the_data_age(midseason_app):
@@ -140,7 +323,7 @@ def test_filtering_to_nothing_leaves_the_other_tabs_alone(app):
     at = app.run()
     at.text_input[0].set_value("no such player anywhere").run()
     assert not at.exception
-    assert any("Nothing matches" in info.value for info in at.info)
+    assert any("No players match" in card for card in _states(at))
     assert any("Squad cost" in m.label for m in at.metric), "the Squad tab should still render"
 
 
@@ -190,6 +373,92 @@ def test_clearing_the_selection_allows_the_drill_down_to_reopen(midseason_app):
     assert at.session_state["inspected"] is None
 
 
+def _chart_specs(at):
+    """Every Vega-Lite spec on the page, parsed.
+
+    `.proto.spec` rather than `.spec`, since the element's own accessor reads
+    session state and a chart with no key has none.
+    """
+    specs = [json.loads(c.proto.spec) for c in at.get("vega_lite_chart")]
+    assert specs, "no charts found, so an assertion about them proves nothing"
+    return specs
+
+
+def _has_scale_binding(spec) -> bool:
+    """Whether a spec binds a selection to the scales, which is what claims
+    the wheel. `.interactive()` puts it on the top level of a layered chart."""
+    if isinstance(spec, dict):
+        if any(p.get("bind") == "scales" for p in spec.get("params", []) if isinstance(p, dict)):
+            return True
+        return any(_has_scale_binding(v) for v in spec.values())
+    if isinstance(spec, list):
+        return any(_has_scale_binding(v) for v in spec)
+    return False
+
+
+def test_charts_do_not_claim_the_wheel_until_asked(app):
+    """A chart left `.interactive()` zooms when you scroll the page past it, so
+    you scroll down and arrive having quietly rescaled it."""
+    at = app.run()
+    assert not at.exception
+    assert not any(_has_scale_binding(spec) for spec in _chart_specs(at))
+
+
+def test_turning_zoom_on_gives_the_chart_back_its_wheel(app):
+    at = app.run()
+    next(t for t in at.toggle if t.key == "pool_zoom").set_value(True).run()
+    assert not at.exception
+    assert any(_has_scale_binding(spec) for spec in _chart_specs(at))
+
+
+def test_the_radar_says_nothing_is_coming_rather_than_showing_a_blank_table(app):
+    """The synthetic season has every club playing exactly once a week, which
+    is also what a real fixture list looks like until postponements start."""
+    at = app.run()
+    assert not at.exception
+    assert any("Nothing irregular coming" in card for card in _states(at))
+
+
+def test_the_radar_lists_clubs_once_a_double_exists(monkeypatch, tmp_path):
+    """The empty case is the one the synthetic season reaches on its own, so
+    the populated table needs its rows supplying."""
+    import pandas as pd
+
+    from fpl_manager.data import Season
+
+    rows = pd.DataFrame(
+        [
+            {"event": 24, "club": "C01", "fixtures": 2, "shape": "double"},
+            {"event": 24, "club": "C02", "fixtures": 2, "shape": "double"},
+            {"event": 24, "club": "C03", "fixtures": 0, "shape": "blank"},
+        ]
+    )
+    monkeypatch.setattr(Season, "gameweek_shape", lambda self, horizon=12: rows)
+
+    at = _app(monkeypatch, tmp_path, played=12).run()
+    assert not at.exception
+    table = next(
+        d.value for d in at.dataframe if {"double", "blank"} <= set(map(str, d.value.columns))
+    )
+    assert list(table["event"]) == [24]
+    assert table.loc[0, "double"] == "C01, C02"
+    assert table.loc[0, "blank"] == "C03"
+
+
+def test_swings_split_into_easing_and_worsening(app):
+    at = app.run()
+    assert not at.exception
+    captions = [c.value for c in at.caption]
+    assert any("Hard now, easier later" in c for c in captions)
+    assert any("Easy now, harder later" in c for c in captions)
+
+
+def test_changing_the_swing_window_reruns_cleanly(app):
+    at = app.run()
+    next(s for s in at.slider if s.key == "swing_window").set_value(5).run()
+    assert not at.exception
+
+
 def test_changing_horizon_reruns_cleanly(app):
     at = app.run()
     at.sidebar.slider[0].set_value(10).run()
@@ -222,17 +491,30 @@ def test_choosing_an_entry_id_reruns_cleanly(app):
     assert not at.exception
 
 
+def test_roi_says_nothing_before_any_points_are_scored(app):
+    at = app.run()
+    assert not at.exception
+    assert any("every return is zero" in info.value for info in at.info)
+
+
+def test_roi_ranks_players_once_points_exist(midseason_app):
+    at = midseason_app.run()
+    assert not at.exception
+    assert any("Best return" in m.label for m in at.metric)
+    assert not any("every return is zero" in info.value for info in at.info)
+
+
 def test_price_pressure_says_nothing_before_the_season(app):
     at = app.run()
     assert not at.exception
-    assert any("nothing to read" in info.value for info in at.info)
+    assert any("No transfer activity yet" in card for card in _states(at))
 
 
 def test_price_pressure_renders_once_transfers_exist(midseason_app):
     """The populated branch is unreachable pre-season, so it needs its own run."""
     at = midseason_app.run()
     assert not at.exception
-    assert not any("nothing to read" in info.value for info in at.info)
+    assert not any("No transfer activity yet" in card for card in _states(at))
     assert any("Closest to rising" in caption.value for caption in at.caption)
 
 
