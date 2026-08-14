@@ -168,19 +168,47 @@ def test_every_card_in_the_squad_carries_a_face(app):
     at = app.run()
     assert not at.exception
     pitch = _pitch(at)
-    assert pitch.count('<img class="mug"') == 15, "eleven starters and four on the bench"
+    assert pitch.count('<span class="mug"') == 15, "eleven starters and four on the bench"
     assert "photos/players/110x140/p500" in pitch, "built from the player's code, not his id"
 
 
-def test_a_missing_face_falls_back_to_the_club_kit(app):
+def test_the_kit_is_the_fallback_and_not_a_backdrop(app):
     """Roughly half the cheapest players have no photograph and the CDN answers
     403, and cheap players are exactly what the optimiser puts on a bench.
-    Without this the bench renders as holes."""
+
+    The kit has to be `object` fallback content, which renders only when the
+    photograph fails. Putting it behind the face instead looks right until you
+    notice every FPL photograph is a cut-out with a transparent background, so
+    the kit shows through around every player rather than only the missing ones.
+    """
     at = app.run()
     pitch = _pitch(at)
-    assert "onerror=" in pitch
-    assert "this.onerror=null" in pitch, "a failing kit must not loop"
-    assert "dist/img/shirts/standard/shirt_" in pitch
+    assert pitch.count("<object ") == 15, "one per card, starters and bench"
+    assert pitch.count("dist/img/shirts/standard/shirt_") == 15, "one kit per card"
+    for card in pitch.split('<span class="mug"')[1:]:
+        mug = card.split("</span>")[0]
+        assert "background-image" not in mug, "a kit behind the face bleeds through it"
+        assert mug.index("photos/players") < mug.index("shirts/standard"), (
+            "the photograph is the object, the kit is what it falls back to"
+        )
+
+
+def test_every_card_carries_its_club_crest(app):
+    """FPL's photographs go stale after a transfer, so a player can appear in
+    the kit of the club he has just left. The crest comes off the live team
+    code, so it stays right when the photograph does not."""
+    at = app.run()
+    pitch = _pitch(at)
+    assert pitch.count('class="crest"') == 15
+    assert "badges/70/t" in pitch
+
+
+def test_no_pitch_image_relies_on_a_script_handler(app):
+    """Streamlit strips every on* attribute from the HTML it renders, so an
+    onerror fallback here is removed before it can run and fails silently.
+    That is exactly how this shipped broken once."""
+    at = app.run()
+    assert "onerror" not in _pitch(at)
 
 
 def test_the_keeper_wears_a_different_kit_from_the_outfielders(app):
@@ -197,7 +225,7 @@ def test_the_drill_down_shows_the_player_s_face(midseason_app):
     assert not at.exception
     head = next(m.value for m in at.get("dialog")[0].markdown if 'class="pd-head"' in m.value)
     assert "photos/players" in head
-    assert "onerror=" in head
+    assert "shirts/standard" in head, "the kit has to back the face here too"
 
 
 def test_the_pool_carries_a_club_badge(app):
@@ -206,6 +234,29 @@ def test_the_pool_carries_a_club_badge(app):
     pool = _pool(at)
     assert "badge" in pool.columns
     assert pool["badge"].str.contains("badges/70/t").all()
+
+
+def test_club_tables_carry_badges_too(app):
+    """The fixture ticker and the swing tables are club-keyed, so the badge
+    reads faster than the three letter short name does."""
+    at = app.run()
+    assert not at.exception
+    badged = [d.value for d in at.dataframe if "badge" in d.value.columns]
+    assert len(badged) >= 3, "the pool, the ticker and at least one swing table"
+    for frame in badged:
+        assert frame["badge"].dropna().str.contains("badges/70/t").all()
+
+
+def test_the_roi_tables_are_badged_once_there_are_points_to_rank(midseason_app):
+    """Both ROI tables only fill in once a gameweek has been scored, and the
+    projected-against-returned one needs a club column to map a badge from,
+    which it did not originally select."""
+    at = midseason_app.run()
+    assert not at.exception
+    badged = [d.value for d in at.dataframe if "badge" in d.value.columns]
+    projected = [f for f in badged if "projected_roi" in f.columns]
+    assert projected, "the projected against returned table should carry badges"
+    assert projected[0]["badge"].str.contains("badges/70/t").all()
 
 
 def test_the_status_bar_carries_the_deadline_and_the_data_age(midseason_app):
