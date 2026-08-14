@@ -44,6 +44,51 @@ from fpl_manager.squad import (
 
 st.set_page_config(page_title="FPL Manager", page_icon="⚽", layout="wide")
 
+# What every number on screen means, in one place. A column appears in several
+# views and a couple of them appear as metrics too, so defining each once is
+# what stops the same figure being explained two different ways.
+#
+# Two of these are worth the words they take. `xpts_next` and `xpts_total` are
+# both "projected points" and are not the same number, and they sit next to
+# each other constantly.
+GLOSSARY = {
+    "xpts_next": "Projected points in the next gameweek alone. A club with two "
+    "fixtures that week counts both, a club with none scores zero.",
+    "xpts_total": "Projected points added up across every gameweek in the "
+    "horizon, which is the slider in the sidebar. Not comparable with the next "
+    "gameweek figure beside it.",
+    "value": "Projected points over the horizon divided by today's price. What "
+    "you get per million spent, which is what decides who can be afforded "
+    "elsewhere in the squad.",
+    "differential": "Projection percentile minus ownership percentile. Positive "
+    "means the model rates him higher than the crowd does.",
+    "ownership": "Share of all FPL managers who own him, straight from the API.",
+    "points_per_90": "The scoring rate the projection is built from. Last "
+    "season blended with this one, plus a rate rebuilt from expected goals, "
+    "assists and clean sheets once enough of the season has been played.",
+    "minutes_share": "Expected share of a full match, so 0.85 means he is "
+    "worth about 76 minutes. Built from how often he starts rather than from "
+    "his minutes total, which would cancel against the rate beside it.",
+    "start_rate": "How often he started last season, shrunk towards what his "
+    "price implies. Price is the only input here that is not last season's "
+    "minutes, which is what lets his rate and his role move separately.",
+    "prior_p90": "Last season's points per 90, before this season is blended in.",
+    "component_p90": "Points per 90 rebuilt from expected goals, expected "
+    "assists and the club's clean sheet chance, rather than read back off what "
+    "he actually scored. Empty until he has 270 minutes this season.",
+    "form": "FPL's own figure: average points over the last 30 days.",
+    "points_per_game": "FPL's own figure: average points per appearance.",
+    "total_points": "Points actually scored so far, straight from the API.",
+    "expected_goals": "Expected goals accumulated so far, straight from the API.",
+    "expected_assists": "Expected assists accumulated so far, straight from the API.",
+    "chance_of_playing": "FPL's published chance he features in the next "
+    "gameweek. Blank means nothing has been flagged.",
+    "price": "Today's price. What you would pay to buy him now, which is not "
+    "what you would get for selling one you already own.",
+    "roi": "Points already scored this season per million of today's price. "
+    "Backward looking, unlike everything on the Players tab.",
+}
+
 CACHE_TTL = 6 * 3600
 # shorter than the sixty seconds api.live holds on disk, or the memory cache
 # outlives the disk cache behind it and every poll serves stale data twice over
@@ -249,6 +294,16 @@ PITCH_CSS = """
 </style>
 """
 st.markdown(PITCH_CSS, unsafe_allow_html=True)
+
+
+def how_to_read(body: str) -> None:
+    """A collapsed note explaining what a page's numbers mean.
+
+    Collapsed because this is read once and then never again, and an open block
+    of prose on every tab would push the actual numbers below the fold.
+    """
+    with st.expander("How to read this", icon=":material/help:"):
+        st.markdown(body)
 
 
 def fdr_css(value: float) -> str:
@@ -527,38 +582,62 @@ def pool_column_config(horizon: int, gw_cols: list[str], max_xpts: float) -> dic
     the same whichever view you found it in. The player name is pinned because
     the fixture run makes the table wider than a phone.
     """
+
+    def g(key):
+        """The tooltip for a column, or nothing if it needs no explaining."""
+        return {"help": GLOSSARY[key]} if key in GLOSSARY else {}
+
     config = {
         "badge": st.column_config.ImageColumn("", width="small", pinned=True),
         "name": st.column_config.TextColumn("Player", pinned=True),
         "position": st.column_config.TextColumn("Pos", width="small"),
         "club": st.column_config.TextColumn("Club", width="small"),
-        "price": st.column_config.NumberColumn("Price", format="%.1f", width="small"),
-        "xpts_next": st.column_config.NumberColumn("xPts next", format="%.1f"),
+        "price": st.column_config.NumberColumn("Price", format="%.1f", width="small", **g("price")),
+        "xpts_next": st.column_config.NumberColumn("xPts next", format="%.1f", **g("xpts_next")),
         "xpts_total": st.column_config.ProgressColumn(
-            f"xPts {horizon} GW", format="%.1f", min_value=0.0, max_value=max_xpts
+            f"xPts {horizon} GW",
+            format="%.1f",
+            min_value=0.0,
+            max_value=max_xpts,
+            **g("xpts_total"),
         ),
-        "value": st.column_config.NumberColumn("Pts per m", format="%.2f"),
+        "value": st.column_config.NumberColumn("Pts per m", format="%.2f", **g("value")),
         "differential": st.column_config.NumberColumn(
-            "Differential",
-            format="%+.2f",
-            help="Projection percentile minus ownership percentile. Positive means "
-            "the model rates him higher than the crowd does.",
+            "Differential", format="%+.2f", **g("differential")
         ),
-        "ownership": st.column_config.NumberColumn("Owned %", format="%.1f"),
-        "points_per_90": st.column_config.NumberColumn("Pts per 90", format="%.2f"),
-        "minutes_share": st.column_config.NumberColumn("Mins share", format="%.2f"),
-        "start_rate": st.column_config.NumberColumn("Start rate", format="%.2f"),
-        "prior_p90": st.column_config.NumberColumn("Last season p90", format="%.2f"),
-        "form": st.column_config.NumberColumn("Form", format="%.1f"),
-        "points_per_game": st.column_config.NumberColumn("PPG", format="%.1f"),
-        "total_points": st.column_config.NumberColumn("Total", format="%d"),
-        "expected_goals": st.column_config.NumberColumn("xG", format="%.2f"),
-        "expected_assists": st.column_config.NumberColumn("xA", format="%.2f"),
-        "chance_of_playing": st.column_config.NumberColumn("Chance %", format="%.0f"),
+        "ownership": st.column_config.NumberColumn("Owned %", format="%.1f", **g("ownership")),
+        "points_per_90": st.column_config.NumberColumn(
+            "Pts per 90", format="%.2f", **g("points_per_90")
+        ),
+        "minutes_share": st.column_config.NumberColumn(
+            "Mins share", format="%.2f", **g("minutes_share")
+        ),
+        "start_rate": st.column_config.NumberColumn("Start rate", format="%.2f", **g("start_rate")),
+        "prior_p90": st.column_config.NumberColumn(
+            "Last season p90", format="%.2f", **g("prior_p90")
+        ),
+        "form": st.column_config.NumberColumn("Form", format="%.1f", **g("form")),
+        "points_per_game": st.column_config.NumberColumn(
+            "PPG", format="%.1f", **g("points_per_game")
+        ),
+        "total_points": st.column_config.NumberColumn("Total", format="%d", **g("total_points")),
+        "expected_goals": st.column_config.NumberColumn("xG", format="%.2f", **g("expected_goals")),
+        "expected_assists": st.column_config.NumberColumn(
+            "xA", format="%.2f", **g("expected_assists")
+        ),
+        "chance_of_playing": st.column_config.NumberColumn(
+            "Chance %", format="%.0f", **g("chance_of_playing")
+        ),
         "fitness": st.column_config.TextColumn("Fitness", width="medium"),
     }
     for col in gw_cols:
-        config[col] = st.column_config.TextColumn(col, width="small")
+        config[col] = st.column_config.TextColumn(
+            col,
+            width="small",
+            help="Opponent that gameweek. Upper case at home, lower case away, "
+            "coloured green for an easy fixture and red for a hard one. Two "
+            "opponents means a double gameweek, a dash means a blank.",
+        )
     return config
 
 
@@ -634,9 +713,15 @@ def player_detail(
         {"out": st.error, "doubt": st.warning, "note": st.info}[severity](note)
 
     a, b, c = st.columns(3)
-    a.metric("Points per 90", f"{row['points_per_90']:.2f}")
-    b.metric("Expected minutes", f"{row['minutes_share']:.0%} of 90")
-    c.metric(f"Projected, {horizon} GW", f"{row['xpts_total']:.1f} pts")
+    a.metric("Points per 90", f"{row['points_per_90']:.2f}", help=GLOSSARY["points_per_90"])
+    b.metric(
+        "Expected minutes", f"{row['minutes_share']:.0%} of 90", help=GLOSSARY["minutes_share"]
+    )
+    c.metric(
+        f"Projected, {horizon} GW",
+        f"{row['xpts_total']:.1f} pts",
+        help=GLOSSARY["xpts_total"],
+    )
 
     current = row["current_p90"]
     st.caption(
@@ -991,6 +1076,23 @@ status_bar(season, len(projections))
 
 with build_tab:
     st.subheader("Build a squad")
+    how_to_read(
+        "The best fifteen the model can buy under the budget, the three per club "
+        "cap and the position quotas. It is a solved answer, not a sorted list: "
+        "picking the best points per million one at a time is reliably a few "
+        "points worse, because what binds is having enough cheap players to "
+        "afford the expensive ones.\n\n"
+        "- **Projected over the horizon** counts the starting eleven with the "
+        "captain doubled. The bench is not in it.\n"
+        "- **The number on each shirt** is the next gameweek alone, so the "
+        "shirts and the headline are different units.\n"
+        "- **Bench weight** in the sidebar decides how much the bench counts when "
+        "choosing the fifteen. Low gives two cheap punts, high gives a squad you "
+        "can rotate.\n"
+        "- **Coloured dots** flag injuries and doubts. Hover one to read it.\n\n"
+        "Rotation, press conferences and minutes management are not in the API, "
+        "so treat this as a shortlist to argue with."
+    )
     left, right = st.columns(2)
     locked = left.multiselect("Must include", options=sorted(lookup), key="locks")
     banned = right.multiselect("Rule out", options=sorted(lookup), key="bans")
@@ -1008,12 +1110,33 @@ with build_tab:
         st.stop()
 
     a, b, c = st.columns(3)
-    a.metric("Squad cost", f"{result.cost:.1f}m", f"{budget - result.cost:+.1f}m in bank")
-    b.metric(f"Projected over {horizon} GW", f"{result.projected:.0f} pts")
-    c.metric("Captain", result.captain["name"])
+    a.metric(
+        "Squad cost",
+        f"{result.cost:.1f}m",
+        f"{budget - result.cost:+.1f}m in bank",
+        help="What the fifteen cost at today's prices, against the budget set "
+        "in the sidebar. A fresh squad starts with 100.0m.",
+    )
+    b.metric(
+        f"Projected over {horizon} GW",
+        f"{result.projected:.0f} pts",
+        help="The starting eleven only, added up across the horizon, with the "
+        "captain counted twice. The four on the bench are not in this number, "
+        "since they only score if someone ahead of them does not play.",
+    )
+    c.metric(
+        "Captain",
+        result.captain["name"],
+        help="Whoever the solver expects most from over the horizon. His "
+        "points double, so this is a bigger decision than any single transfer.",
+    )
 
     formation_view(
         result.xi, result.bench, result.captain.name, result.vice_captain.name, images=images
+    )
+    st.caption(
+        "The number on each shirt is that player's projection for the **next "
+        "gameweek only**, which is why they do not add up to the total above."
     )
     flag_legend()
 
@@ -1028,6 +1151,19 @@ with build_tab:
 
 with players_tab:
     st.subheader("Player pool")
+    how_to_read(
+        "Every player the model has a projection for. Hover any column header "
+        "for what that number is.\n\n"
+        "The projection is three things multiplied together, and the **Model "
+        "terms** view above the table splits them out:\n\n"
+        "`points per 90` times `expected minutes` times `fixture difficulty`\n\n"
+        "That separation is the point. A high projection because someone scores "
+        "freely is a different bet from a high projection because he plays every "
+        "minute against weak opposition, and a single total cannot tell you "
+        "which. Select any row to see the working behind it.\n\n"
+        "**xPts next** and **xPts over the horizon** are both projected points "
+        "and are not comparable with each other."
+    )
 
     # the raw API stats are joined on rather than modelled, so the Form and
     # attack view is a check on the projection instead of a restatement of it
@@ -1212,6 +1348,16 @@ with players_tab:
 
 with roi_tab:
     st.subheader("Return on investment")
+    how_to_read(
+        "Points already **scored** per million of the price today. Everything on "
+        "the Players tab looks forward; this looks back.\n\n"
+        "Useful for spotting who has actually earned their place rather than who "
+        "the model likes, and the two disagreeing is worth a look either way. A "
+        "player well ahead of his projection has been lucky, in form, or is "
+        "being underrated, and the table cannot tell you which.\n\n"
+        "Priced at the cost today, not what he cost when he scored them, so anyone "
+        "who has risen sharply looks worse here than he was."
+    )
     points_from = points_source(season)
     roi = load_roi(season, projections, stamp)
 
@@ -1257,9 +1403,26 @@ with roi_tab:
         else:
             top = roi_view.iloc[0]
             k1, k2, k3 = st.columns(3)
-            k1.metric("Best return", top["name"], f"{top['roi']:.1f} pts per m", delta_color="off")
-            k2.metric("Players ranked", len(roi_view))
-            k3.metric("Median return", f"{roi_view['roi'].median():.1f} pts per m")
+            k1.metric(
+                "Best return",
+                top["name"],
+                f"{top['roi']:.1f} pts per m",
+                delta_color="off",
+                help=GLOSSARY["roi"],
+            )
+            k2.metric(
+                "Players ranked",
+                len(roi_view),
+                help="How many players clear the minutes filter below. Anyone who has "
+                "barely played is left out, since a few points off one substitute "
+                "appearance divides into a flattering rate.",
+            )
+            k3.metric(
+                "Median return",
+                f"{roi_view['roi'].median():.1f} pts per m",
+                help="The midpoint of those players, which is what makes a given "
+                "return good or bad rather than merely large.",
+            )
 
             chart = roi_view.head(200).reset_index()
             present = [p for p in POSITIONS_IN_ORDER if p in set(chart["position"])]
@@ -1362,6 +1525,18 @@ with roi_tab:
 
 with fixtures_tab:
     st.subheader(f"Fixture ticker, next {horizon} gameweeks")
+    how_to_read(
+        "Who each club plays, coloured by how hard it is. Green is easy, red is "
+        "hard, and the middle band is deliberately the dimmest thing here so it "
+        "does not draw the eye towards the fixtures that matter least.\n\n"
+        "Upper case is at home, lower case away. Two opponents in a cell is a "
+        "double gameweek, a dash is a blank.\n\n"
+        "Difficulty blends the one to five rating FPL publishes with the attack "
+        "and defence ratings of the two clubs, which move during the season and "
+        "can tell apart two fixtures the rating calls identical.\n\n"
+        "**Swings** below compare the next few gameweeks against the ones after, "
+        "so a positive swing means it gets easier and is a reason to buy early."
+    )
     st.caption(
         "Each cell is the opponent and where the game is played, coloured by FPL's own "
         "difficulty rating. Green is kind, red is not. Clubs are sorted easiest run first. "
@@ -1477,6 +1652,18 @@ with fixtures_tab:
 
 with transfers_tab:
     st.subheader("Transfer planner")
+    how_to_read(
+        "What to do with the squad you already own. Every gain here is **net of "
+        "the four point hit** for going beyond your free transfers, so a positive "
+        "number already pays for itself.\n\n"
+        "The multi week planner solves all the weeks as one problem rather than "
+        "one week at a time, which is what lets it hold a transfer this week to "
+        "afford someone next week. Solving each week alone can never do that.\n\n"
+        "**Selling prices matter and are not public.** FPL gives you back what "
+        "you paid plus half of any rise, so a player who has gone up 0.4 sells "
+        "for 0.2 more than you paid. Load a squad.json with your purchase prices "
+        "or the planner will think you have more money than you do."
+    )
     squad = my_squad
 
     if squad is None:
@@ -1530,6 +1717,9 @@ with transfers_tab:
                 f"{gain:+.1f} pts",
                 f"{plan.hits * 4} point hit" if plan.hits else "No hit",
                 delta_color="off",
+                help="What the move is worth after the cost of making it. Already net "
+                "of any four point hit, so anything positive is worth doing on the "
+                "model's numbers alone.",
             )
             with moves:
                 st.caption("Moves")
@@ -1572,9 +1762,25 @@ with transfers_tab:
                 st.stop()
 
             m1, m2, m3 = st.columns(3)
-            m1.metric(f"Projected over {plan_weeks} GW", f"{route.projected:.0f} pts")
-            m2.metric("Transfers", route.transfers)
-            m3.metric("Hits", f"{route.hits * 4} pts", delta_color="off")
+            m1.metric(
+                f"Projected over {plan_weeks} GW",
+                f"{route.projected:.0f} pts",
+                help="What the whole route scores, the starting eleven each week with "
+                "the captain doubled, already net of any hits.",
+            )
+            m2.metric(
+                "Transfers",
+                route.transfers,
+                help="Moves across the whole route, not per week. The weeks are solved "
+                "together, so it can sit still now to afford someone later.",
+            )
+            m3.metric(
+                "Hits",
+                f"{route.hits * 4} pts",
+                delta_color="off",
+                help="Points given up for going beyond your free transfers, four each. "
+                "Already subtracted from the projection beside it.",
+            )
 
             for week in route.weeks:
                 with st.container(border=True):
@@ -1637,6 +1843,18 @@ with transfers_tab:
 
 with chips_tab:
     st.subheader("Chip timing")
+    how_to_read(
+        "What each chip is worth in each gameweek, measured against what this "
+        "squad scores that week anyway with the lineup and captain already picked "
+        "as well as they can be. So Bench Boost is worth your bench, not your "
+        "whole squad.\n\n"
+        "**Wildcard is not comparable with the other three.** You keep the squad, "
+        "so it is measured over every remaining gameweek rather than one, and its "
+        "gain falls the longer you leave it.\n\n"
+        "The horizon bounds the answer. If the best week is beyond it the tool "
+        "cannot see it, so widen the slider before trusting advice to play one "
+        "now. Nothing here knows which chips you have already used."
+    )
     st.caption(
         "Gain is what the chip adds on top of what your squad scores anyway, "
         "with the lineup and captain already picked optimally for that gameweek."
@@ -1658,6 +1876,9 @@ with chips_tab:
                     f"+{row['gain']:.1f} pts",
                     f"GW{int(row['event'])} · {row['detail']}",
                     delta_color="off",
+                    help="What the chip adds on top of what this squad scores in that "
+                    "gameweek anyway, with the lineup and captain already picked as "
+                    "well as they can be without it.",
                 )
 
             st.caption(
@@ -1690,6 +1911,16 @@ with chips_tab:
 
 with leagues_tab:
     st.subheader("Managers and mini leagues")
+    how_to_read(
+        "Anyone's public record, and the classic leagues they are in. The entry "
+        "id is the number in the URL when you look at a points page.\n\n"
+        "Leagues you joined are sorted above the ones FPL put you in by club and "
+        "country, since those are rarely the ones you care about.\n\n"
+        "Everything here is read only and public. Nothing on this page needs a "
+        "login, and the tool never asks for one.\n\n"
+        "**This is a record, not a projection.** Nothing on this page feeds the "
+        "model, and no league table shows what anyone is scoring in progress."
+    )
     st.caption(
         "Public data for any manager id, which is the number in the URL of their points page "
         "on the FPL site. Ranks and league tables stay empty until the first gameweek has "
@@ -1720,12 +1951,23 @@ with leagues_tab:
     else:
         st.markdown(f"#### {escape(manager.name)} · {escape(manager.team_name)}")
         m1, m2, m3 = st.columns(3)
-        m1.metric("Overall points", f"{manager.overall_points:,}")
+        m1.metric(
+            "Overall points",
+            f"{manager.overall_points:,}",
+            help="Points scored across the whole season so far, as FPL reports them.",
+        )
         m2.metric(
             "Overall rank",
             f"{manager.overall_rank:,}" if manager.overall_rank else "Not ranked yet",
+            help="Position among every FPL manager. Nobody has a rank until a "
+            "gameweek has been scored, which is what the pre-season reading means.",
         )
-        m3.metric("Seasons played", manager.seasons_played)
+        m3.metric(
+            "Seasons played",
+            manager.seasons_played,
+            help="How many previous seasons this manager has a record for. FPL "
+            "publishes only the seasons they actually played.",
+        )
 
         st.divider()
         st.caption("Previous seasons")
@@ -1803,6 +2045,19 @@ with leagues_tab:
 
 with live_tab:
     st.subheader("Live scoring")
+    how_to_read(
+        "Your squad as the matches are played. Refreshes itself once a minute "
+        "while a game is in progress and sits still otherwise.\n\n"
+        "**Bonus is provisional until a match ends.** It is worked out from the "
+        "bonus points system the same way FPL does, three, two and one to the top "
+        "scorers in each match with ties sharing, and it can still move. Once "
+        "real bonus is awarded that match switches to the real figure.\n\n"
+        "**Automatic substitutions only resolve once the matches are over.** "
+        "Somebody on no minutes at half past three has not blanked, he "
+        "has not kicked off.\n\n"
+        "Load your squad by entry id rather than a file if you want the real "
+        "captain and bench order, since a squad file records neither."
+    )
     live_gw = season.current_gameweek
 
     if live_gw < 1:
@@ -1853,9 +2108,27 @@ with live_tab:
 
             score = score_squad(state, season, my_squad)
             cols = st.columns(3)
-            cols[0].metric("Points", score.total)
-            cols[1].metric("Playing", f"{score.playing} of {len(score.lineup.starters)}")
-            cols[2].metric("Provisional bonus", score.provisional_bonus, delta_color="off")
+            cols[0].metric(
+                "Points",
+                score.total,
+                help="Your eleven with the captain doubled, including bonus that has "
+                "not been awarded yet. Substitutions are applied only once a player's "
+                "matches are over.",
+            )
+            cols[1].metric(
+                "Playing",
+                f"{score.playing} of {len(score.lineup.starters)}",
+                help="How many of your eleven have been on the pitch. The rest either "
+                "have not kicked off or did not make the matchday squad.",
+            )
+            cols[2].metric(
+                "Provisional bonus",
+                score.provisional_bonus,
+                delta_color="off",
+                help="Bonus worked out from the bonus points system the same way FPL "
+                "does, for matches that have not finished. It is already counted in "
+                "the total and can still move.",
+            )
 
             if not score.lineup.settled:
                 st.caption(
