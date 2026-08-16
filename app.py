@@ -20,7 +20,13 @@ import streamlit as st
 from fpl_manager.api import FplApi
 from fpl_manager.chips import best_per_chip
 from fpl_manager.chips import evaluate as evaluate_chips
-from fpl_manager.data import MAX_PER_CLUB, Season
+from fpl_manager.data import (
+    FORMATIONS,
+    MAX_PER_CLUB,
+    Season,
+    format_formation,
+    parse_formation,
+)
 from fpl_manager.leagues import leagues_of, load_manager, past_seasons, standings
 from fpl_manager.live import LiveGameweek, load_live, player_view, score_squad
 from fpl_manager.optimiser import (
@@ -95,6 +101,9 @@ CACHE_TTL = 6 * 3600
 LIVE_MEMORY_TTL = 30
 LIVE_POLL = "60s"
 POSITIONS_IN_ORDER = ("GKP", "DEF", "MID", "FWD")
+# the formation selector's "let the solver decide" option, named once so the
+# widget and the branch reading it cannot drift apart
+BEST_SHAPE = "Best"
 
 # One table answering several questions, rather than one wide table answering
 # none of them well. Model terms has no equivalent on the stats sites and is
@@ -888,6 +897,7 @@ def formation_view(
     highlight: dict | None = None,
     images: pd.DataFrame | None = None,
     labels: tuple[str, str] = ("Next", "Span"),
+    cost: float | None = None,
 ) -> None:
     """Lay the XI out on a pitch, in formation, the way the FPL site does.
 
@@ -895,6 +905,11 @@ def formation_view(
     work out the shape, which is the one thing the layout should tell you at a
     glance. `highlight` rings individual players, which is how the transfer
     view shows what is leaving and what is arriving.
+
+    `cost` is what pinning this shape gave up against the shape the solver would
+    have chosen. It goes in the caption rather than a metric because an override
+    you have forgotten you set is the thing worth being told about, and the
+    caption is already where the eye goes to read the shape.
 
     `images` is passed in rather than read from a global because this has three
     call sites and a global that one of them forgot would fail silently, as a
@@ -918,10 +933,16 @@ def formation_view(
         )
         lines.append(f'<div class="pitch-line">{shirts}</div>')
 
-    shape = "-".join(str(int((xi["position"] == pos).sum())) for pos in POSITIONS_IN_ORDER[1:])
+    shape = format_formation(int((xi["position"] == pos).sum()) for pos in POSITIONS_IN_ORDER[1:])
+    # a shape pinned to what the solver wanted anyway has cost nothing, and
+    # saying "0.0 pts behind" reads as a warning where there is nothing to warn
+    # about
+    behind = (
+        f" · {-cost:.1f} pts behind the best shape" if cost is not None and cost < -0.05 else ""
+    )
     size = " compact" if compact else ""
     markup = (
-        f'<div class="pitch{size}"><div class="pitch-cap">Formation {shape}</div>'
+        f'<div class="pitch{size}"><div class="pitch-cap">Formation {shape}{behind}</div>'
         f"{''.join(lines)}</div>"
     )
 
@@ -1048,6 +1069,14 @@ with st.sidebar.expander("Squad building", expanded=False):
         "bench, high for a squad you can rotate.",
     )
     budget = st.number_input("Budget (m)", 80.0, 120.0, 100.0, 0.1)
+    shape_choice = st.selectbox(
+        "Formation",
+        [BEST_SHAPE] + [format_formation(f) for f in FORMATIONS],
+        help="The solver picks the shape it likes best unless you name one here. "
+        "Pinning a shape changes which fifteen it buys, not just who starts, and "
+        "the pitch says what the choice costs.",
+    )
+formation = parse_formation(None if shape_choice == BEST_SHAPE else shape_choice)
 
 season = load_season(st.session_state.refresh_token)
 stamp = season.data_stamp
@@ -1143,6 +1172,9 @@ with build_tab:
         "- **Bench weight** in the sidebar decides how much the bench counts when "
         "choosing the fifteen. Low gives two cheap punts, high gives a squad you "
         "can rotate.\n"
+        "- **Formation** in the sidebar is free by default, so the shape on the "
+        "pitch is one the solver chose rather than one it was given. Pin a shape "
+        "there and the caption says what pinning it cost.\n"
         "- **Coloured dots** flag injuries and doubts. Hover one to read it.\n\n"
         "Rotation, press conferences and minutes management are not in the API, "
         "so treat this as a shortlist to argue with."
@@ -1158,9 +1190,25 @@ with build_tab:
             bench_weight=bench_weight,
             include=[lookup[n] for n in locked],
             exclude=[lookup[n] for n in banned],
+            formation=formation,
+        )
+        # what the pinned shape gave up. Solving free as well doubles the work
+        # for this tab, which is under half a second, and is the only way to
+        # know whether the override is costing anything
+        shape_cost = (
+            result.projected
+            - build_squad(
+                projections,
+                budget_tenths=round(budget * 10),
+                bench_weight=bench_weight,
+                include=[lookup[n] for n in locked],
+                exclude=[lookup[n] for n in banned],
+            ).projected
+            if formation
+            else None
         )
     except RuntimeError as exc:
-        st.error(f"{exc}. Try relaxing the locks or raising the budget.")
+        st.error(f"{exc}. Try relaxing the locks, raising the budget or freeing the formation.")
         st.stop()
 
     a, b, c = st.columns(3)
@@ -1194,6 +1242,7 @@ with build_tab:
         result.vice_captain.name,
         images=images,
         labels=span_labels,
+        cost=shape_cost,
     )
     st.caption(
         f"Each card carries both projections. **{span_labels[0]}** is the next "
@@ -1748,16 +1797,27 @@ with transfers_tab:
         free = t2.number_input("Free transfers", 0, 5, squad.free_transfers)
         max_moves = t3.number_input("Max transfers to consider", 1, 5, 2)
 
+        plan_args = dict(
+            current_ids=squad.player_ids,
+            selling_prices=squad.selling_prices,
+            bank_tenths=round(bank * 10),
+            free_transfers=int(free),
+            max_transfers=int(max_moves),
+            bench_weight=bench_weight,
+        )
+        # squad.frame drops ids the projections no longer know about, which a
+        # plain .loc would raise on once a player leaves the game mid-season
+        current = squad.frame(projections)
         try:
-            plan = suggest_transfers(
-                projections,
-                current_ids=squad.player_ids,
-                selling_prices=squad.selling_prices,
-                bank_tenths=round(bank * 10),
-                free_transfers=int(free),
-                max_transfers=int(max_moves),
-                bench_weight=bench_weight,
-            )
+            plan = suggest_transfers(projections, formation=formation, **plan_args)
+            current_xi, current_bench, current_captain = pick_xi(current, formation=formation)
+            # both pitches are solved twice under a pinned shape, so the two
+            # captions are measuring the same thing from the same baseline
+            after_cost = now_cost = None
+            if formation:
+                after_cost = plan.projected - suggest_transfers(projections, **plan_args).projected
+                free_xi = pick_xi(current)[0]
+                now_cost = current_xi["xpts_total"].sum() - free_xi["xpts_total"].sum()
         except RuntimeError as exc:
             # an illegal squad has no legal plan to reach, and anyone can upload
             # a hand-edited file, so this must not be a traceback
@@ -1767,10 +1827,6 @@ with transfers_tab:
             )
             st.stop()
 
-        # squad.frame drops ids the projections no longer know about, which a
-        # plain .loc would raise on once a player leaves the game mid-season
-        current = squad.frame(projections)
-        current_xi, current_bench, current_captain = pick_xi(current)
         gain = plan.xi["xpts_total"].sum() - current_xi["xpts_total"].sum() - 4 * plan.hits
 
         if plan.transfers_in.empty:
@@ -1821,6 +1877,7 @@ with transfers_tab:
                         weeks=int(plan_weeks),
                         max_transfers_per_week=int(per_week),
                         bench_weight=bench_weight,
+                        formation=formation,
                     )
             except (RuntimeError, ValueError) as exc:
                 st.error(f"Could not plan those gameweeks: {exc}")
@@ -1893,6 +1950,7 @@ with transfers_tab:
                 highlight={i: "out" for i in plan.transfers_out.index},
                 images=images,
                 labels=span_labels,
+                cost=now_cost,
             )
         with after:
             st.caption(f"After · captain {plan.captain['name']}")
@@ -1905,6 +1963,7 @@ with transfers_tab:
                 highlight={i: "in" for i in plan.transfers_in.index},
                 images=images,
                 labels=span_labels,
+                cost=after_cost,
             )
         flag_legend()
 

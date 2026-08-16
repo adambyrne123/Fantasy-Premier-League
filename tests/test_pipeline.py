@@ -9,7 +9,18 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from fpl_manager.data import MAX_PER_CLUB, SQUAD_LIMITS, XI_MIN, Season
+from fpl_manager.data import (
+    FORMATIONS,
+    MAX_PER_CLUB,
+    OUTFIELD,
+    SQUAD_LIMITS,
+    XI_MAX,
+    XI_MIN,
+    Season,
+    format_formation,
+    is_legal_xi,
+    parse_formation,
+)
 from fpl_manager.optimiser import (
     build_squad,
     pick_xi,
@@ -518,6 +529,10 @@ def test_starting_eleven_is_a_legal_formation(squad):
     assert counts.get("GKP", 0) == 1
     for pos, minimum in XI_MIN.items():
         assert counts.get(pos, 0) >= minimum
+    # the maximums went unasserted for a long time, which left a formation
+    # constraint applied to the wrong variable free to pass
+    for pos, maximum in XI_MAX.items():
+        assert counts.get(pos, 0) <= maximum
 
 
 def test_captain_starts_and_vice_differs(squad):
@@ -814,6 +829,95 @@ def test_lineup_meets_formation_minimums(projections: pd.DataFrame, squad):
     assert counts.get("GKP", 0) == 1
     for pos, minimum in XI_MIN.items():
         assert counts.get(pos, 0) >= minimum
+
+
+# ----------------------------------------------------------------------
+# formation: free by default, pinned on request
+# ----------------------------------------------------------------------
+def _shape(xi: pd.DataFrame) -> tuple[int, int, int]:
+    return tuple(int((xi["position"] == pos).sum()) for pos in OUTFIELD)
+
+
+def test_every_generated_formation_is_one_fpl_allows():
+    assert len(FORMATIONS) == 8
+    for shape in FORMATIONS:
+        positions = ["GKP"] + [
+            pos for pos, n in zip(OUTFIELD, shape, strict=True) for _ in range(n)
+        ]
+        assert is_legal_xi(positions)
+
+
+def test_illegal_shapes_are_refused():
+    for bad in ["2-5-3", "4-4-3", "3-4", "nonsense"]:
+        with pytest.raises(ValueError):
+            parse_formation(bad)
+
+
+def test_no_formation_asked_for_means_no_formation_imposed():
+    assert parse_formation(None) is None
+
+
+@pytest.mark.parametrize("shape", FORMATIONS, ids=format_formation)
+def test_a_pinned_shape_is_the_shape_that_gets_built(projections: pd.DataFrame, shape):
+    result = build_squad(projections, formation=parse_formation(shape))
+    assert _shape(result.xi) == shape
+
+
+@pytest.mark.parametrize("shape", FORMATIONS, ids=format_formation)
+def test_a_pinned_shape_is_the_shape_that_gets_fielded(projections: pd.DataFrame, squad, shape):
+    owned = [int(i) for i in squad.squad.index]
+    xi, bench, captain = pick_xi(projections.loc[owned], formation=parse_formation(shape))
+    assert _shape(xi) == shape
+    assert len(bench) == 4
+    assert captain.name in xi.index
+
+
+def test_pinning_a_shape_can_only_cost_points(projections: pd.DataFrame):
+    """The free solve searches every shape, so no pinned one can beat it.
+
+    This is the assertion that catches a formation constraint written onto the
+    squad variable rather than the starting one. That would still produce the
+    shape asked for, and would quietly buy a better squad than the rules allow.
+    """
+    best = build_squad(projections).projected
+    for shape in FORMATIONS:
+        assert build_squad(projections, formation=parse_formation(shape)).projected <= best + 1e-6
+
+
+def test_a_free_solve_is_unchanged_by_the_formation_argument(projections: pd.DataFrame, squad):
+    """`formation=None` has to reproduce the old output exactly."""
+    assert build_squad(projections, formation=None).projected == build_squad(projections).projected
+    owned = [int(i) for i in squad.squad.index]
+    xi, _, _ = pick_xi(projections.loc[owned], formation=None)
+    assert list(xi.index) == list(pick_xi(projections.loc[owned])[0].index)
+
+
+def test_an_unfieldable_shape_is_an_error_not_a_traceback(projections: pd.DataFrame, squad):
+    """A squad short of players has no legal eleven, pinned or otherwise.
+
+    Without the status check this surfaced as a `StopIteration` out of the
+    captain lookup, which reads like a bug in the caller rather than a squad
+    that cannot field the shape asked for.
+    """
+    owned = [int(i) for i in squad.squad.index]
+    short = projections.loc[owned]
+    short = short[short["position"] != "FWD"]
+    with pytest.raises(RuntimeError, match="No legal eleven"):
+        pick_xi(short, formation=parse_formation("3-4-3"))
+
+
+def test_a_pinned_shape_holds_for_every_week_of_a_plan(horizon, squad):
+    """A formation is a choice about how you play, so it binds every week."""
+    week_projections, by_gameweek = horizon
+    plan = plan_transfers(
+        week_projections,
+        by_gameweek,
+        current_ids=[int(i) for i in squad.squad.index],
+        weeks=2,
+        formation=parse_formation("4-4-2"),
+    )
+    for week in plan.weeks:
+        assert _shape(week.xi) == (4, 4, 2)
 
 
 # ----------------------------------------------------------------------

@@ -19,7 +19,15 @@ from pathlib import Path
 import pandas as pd
 import pulp
 
-from .data import BUDGET_TENTHS, MAX_PER_CLUB, SQUAD_LIMITS, XI_MAX, XI_MIN
+from .data import (
+    BUDGET_TENTHS,
+    MAX_PER_CLUB,
+    OUTFIELD,
+    SQUAD_LIMITS,
+    XI_MAX,
+    XI_MIN,
+    format_formation,
+)
 
 TRANSFER_COST = 4
 MAX_FREE_TRANSFERS = 5
@@ -143,6 +151,19 @@ class SquadResult:
         return self.cost_tenths / 10
 
 
+def _xi_bounds(formation: dict[str, int] | None, pos: str) -> tuple[int, int]:
+    """How many of a position the XI must field.
+
+    A formation pins the count, no formation leaves the legal range open. Both
+    XI selection paths read this rather than writing the constraint out, since a
+    shape honoured by one and ignored by the other would put two different
+    formations on the same screen.
+    """
+    if formation is None:
+        return XI_MIN[pos], XI_MAX[pos]
+    return formation[pos], formation[pos]
+
+
 def _base_problem(
     pool: pd.DataFrame,
     points_col: str,
@@ -150,6 +171,7 @@ def _base_problem(
     captain_col: str | None,
     prob: pulp.LpProblem | None = None,
     suffix: str = "",
+    formation: dict[str, int] | None = None,
 ):
     """Shared variables and constraints for any 15-man squad selection.
 
@@ -182,8 +204,9 @@ def _base_problem(
 
     for pos in SQUAD_LIMITS:
         members = pool.index[pool["position"] == pos]
-        prob += pulp.lpSum(y[i] for i in members) >= XI_MIN[pos]
-        prob += pulp.lpSum(y[i] for i in members) <= XI_MAX[pos]
+        low, high = _xi_bounds(formation, pos)
+        prob += pulp.lpSum(y[i] for i in members) >= low
+        prob += pulp.lpSum(y[i] for i in members) <= high
 
     points = pool[points_col].to_dict()
     cap_points = pool[captain_col].to_dict() if captain_col else points
@@ -232,12 +255,17 @@ def build_squad(
     min_minutes_share: float = 0.05,
     include: list[int] | None = None,
     exclude: list[int] | None = None,
+    formation: dict[str, int] | None = None,
 ) -> SquadResult:
     """Pick the best legal 15 from scratch under the budget.
 
     `bench_weight` is the fraction of a bench player's projection that counts
     towards the objective. Push it towards 0 for an aggressive build with two
     playing-time punts on the bench, towards 0.3 for a squad you can rotate.
+
+    `formation` pins the shape of the XI. It changes which fifteen get bought,
+    not just who starts, because a squad built to play three at the back spends
+    differently from one built to play five.
     """
     pool = projections[projections["minutes_share"] >= min_minutes_share].copy()
     if exclude:
@@ -246,7 +274,9 @@ def build_squad(
         forced = projections.loc[[i for i in include if i in projections.index]]
         pool = pd.concat([pool, forced[~forced.index.isin(pool.index)]])
 
-    prob, x, y, c, objective = _base_problem(pool, points_col, bench_weight, captain_col)
+    prob, x, y, c, objective = _base_problem(
+        pool, points_col, bench_weight, captain_col, formation=formation
+    )
     prob += objective
     prob += pulp.lpSum(pool.loc[i, "now_cost"] * x[i] for i in pool.index) <= budget_tenths
 
@@ -281,6 +311,7 @@ def suggest_transfers(
     points_col: str = "xpts_total",
     captain_col: str = "xpts_next",
     min_minutes_share: float = 0.05,
+    formation: dict[str, int] | None = None,
 ) -> SquadResult:
     """Find the transfer plan with the best projection net of point hits.
 
@@ -297,7 +328,9 @@ def suggest_transfers(
     pool = pd.concat([pool, held[~held.index.isin(pool.index)]])
     owned = [i for i in current_ids if i in pool.index]
 
-    prob, x, y, c, objective = _base_problem(pool, points_col, bench_weight, captain_col)
+    prob, x, y, c, objective = _base_problem(
+        pool, points_col, bench_weight, captain_col, formation=formation
+    )
 
     transfers = 15 - pulp.lpSum(x[i] for i in owned)
     hits = prob.add_variable("hits", lowBound=0, cat="Integer")
@@ -431,6 +464,7 @@ def plan_transfers(
     bench_weight: float = 0.12,
     pool_size: int = POOL_SIZE,
     min_minutes_share: float = 0.05,
+    formation: dict[str, int] | None = None,
 ) -> MultiWeekPlan:
     """Plan transfers across several gameweeks as one problem.
 
@@ -469,8 +503,10 @@ def plan_transfers(
         frame = gameweek_frame(pool, by_gameweek, event)
         frames[event] = frame
 
+        # every week gets the same shape, since a formation is a choice about
+        # how you want to play rather than one about a single gameweek
         prob, x, y, c, week_objective = _base_problem(
-            frame, "xpts_gw", bench_weight, "xpts_gw", prob=prob, suffix=tag
+            frame, "xpts_gw", bench_weight, "xpts_gw", prob=prob, suffix=tag, formation=formation
         )
         picks[event], starts[event], captains[event] = x, y, c
 
@@ -598,9 +634,16 @@ def _assemble_weeks(
 
 
 def pick_xi(
-    squad_projections: pd.DataFrame, points_col: str = "xpts_next"
+    squad_projections: pd.DataFrame,
+    points_col: str = "xpts_next",
+    formation: dict[str, int] | None = None,
 ) -> tuple[pd.DataFrame, pd.DataFrame, pd.Series]:
-    """Choose the best legal XI, bench order and captain from a fixed 15."""
+    """Choose the best legal XI, bench order and captain from a fixed 15.
+
+    Pass a `formation` to overrule the shape the projections would choose. Every
+    legal shape is reachable from a legal 15, so this only fails on a squad that
+    is short of players, which happens when the projection has dropped someone.
+    """
     pool = squad_projections
     prob = pulp.LpProblem("fpl_xi", pulp.LpMaximize)
     ids = list(pool.index)
@@ -613,12 +656,19 @@ def pick_xi(
         prob += c[i] <= y[i]
     for pos in SQUAD_LIMITS:
         members = pool.index[pool["position"] == pos]
-        prob += pulp.lpSum(y[i] for i in members) >= XI_MIN[pos]
-        prob += pulp.lpSum(y[i] for i in members) <= XI_MAX[pos]
+        low, high = _xi_bounds(formation, pos)
+        prob += pulp.lpSum(y[i] for i in members) >= low
+        prob += pulp.lpSum(y[i] for i in members) <= high
 
     pts = pool[points_col].to_dict()
     prob += pulp.lpSum(pts[i] * y[i] + pts[i] * c[i] for i in ids)
-    prob.solve(solver())
+    status = prob.solve(solver())
+    if pulp.LpStatus[status] != "Optimal":
+        shape = format_formation(formation[p] for p in OUTFIELD) if formation else ""
+        raise RuntimeError(
+            f"No legal eleven in this squad{' playing ' + shape if shape else ''} "
+            f"(solver status: {pulp.LpStatus[status]})"
+        )
 
     starting = [i for i in ids if y[i].value() > 0.5]
     captain_id = next(i for i in ids if c[i].value() > 0.5)

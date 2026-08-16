@@ -72,6 +72,17 @@ uv run fpl-manager prices                          # who is close to moving
 uv run fpl-manager live --entry 1234567            # what you are scoring now
 ```
 
+The shape of the eleven is the solver's choice unless you make it yours.
+`--formation` pins it, and goes before the subcommand with the other global
+flags:
+
+```bash
+uv run fpl-manager --formation 3-4-3 build
+```
+
+Pinning changes which fifteen get bought, not just who starts, and the output
+says how many points the shape gave up against the one it would have picked.
+
 Once the season is running you can pull your squad straight from the API with
 `--entry YOUR_ENTRY_ID` instead of `--squad`. Your entry id is the number in the
 URL when you view your points page. Note that the public endpoint does not

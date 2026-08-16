@@ -37,6 +37,55 @@ def is_legal_xi(positions: Iterable[str]) -> bool:
     return all(XI_MIN[pos] <= counts.get(pos, 0) <= XI_MAX[pos] for pos in XI_MIN)
 
 
+OUTFIELD = ("DEF", "MID", "FWD")
+
+
+def _legal_formations() -> tuple[tuple[int, int, int], ...]:
+    """Every outfield split FPL would accept, generated rather than listed.
+
+    Typing the eight shapes out would be shorter and would go stale the moment
+    a limit moved. Running the candidates through `is_legal_xi` means there is
+    one definition of legal in this module instead of two.
+    """
+    return tuple(
+        (d, m, f)
+        for d in range(XI_MIN["DEF"], XI_MAX["DEF"] + 1)
+        for m in range(XI_MIN["MID"], XI_MAX["MID"] + 1)
+        for f in range(XI_MIN["FWD"], XI_MAX["FWD"] + 1)
+        if is_legal_xi(["GKP"] + ["DEF"] * d + ["MID"] * m + ["FWD"] * f)
+    )
+
+
+FORMATIONS = _legal_formations()
+
+
+def format_formation(shape: Iterable[int]) -> str:
+    """A shape as the notation everyone writes it in, `3-4-3`."""
+    return "-".join(str(n) for n in shape)
+
+
+def parse_formation(spec: str | Iterable[int] | None) -> dict[str, int] | None:
+    """A formation as counts per position, ready to constrain a solve.
+
+    Takes either the notation a person types, `3-4-3`, or the tuple form the
+    constants use. `None` passes straight through, so a caller offering "let the
+    solver decide" does not need a branch of its own.
+    """
+    if spec is None:
+        return None
+    parts = spec.split("-") if isinstance(spec, str) else list(spec)
+    try:
+        shape = tuple(int(p) for p in parts)
+    except (TypeError, ValueError):
+        raise ValueError(f"Not a formation: {spec!r}. Write it as 3-4-3.") from None
+    if shape not in FORMATIONS:
+        raise ValueError(
+            f"{format_formation(shape)} is not a legal formation. "
+            f"Pick one of {', '.join(format_formation(f) for f in FORMATIONS)}."
+        )
+    return {"GKP": 1} | dict(zip(OUTFIELD, shape, strict=True))
+
+
 class Season:
     """Everything loaded for the current season, in frame form."""
 
