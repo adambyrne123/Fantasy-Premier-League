@@ -1,0 +1,71 @@
+name: CI
+
+# Push is filtered to main because this repo works through feature branches and
+# merge PRs. Unfiltered, the branch push and the pull request synchronise are
+# separate events and every PR commit would run the suite twice.
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+# Three pushes to a branch in a minute otherwise run three full suites, and the
+# suite is not instant.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    # The suite takes about six minutes on a developer machine, most of it the
+    # Streamlit tests solving a full squad MILP each. Thirty leaves room for a
+    # shared runner being slower without waiting on the GitHub default of six
+    # hours, which is the wrong failure mode for a solve that hangs rather than
+    # one that fails.
+    timeout-minutes: 30
+    env:
+      # No test should reach a cache at all. Pointing it at the runner's temp
+      # directory means an accidental write lands somewhere disposable rather
+      # than in $HOME, where it would be invisible and would seed the next step.
+      FPL_CACHE_DIR: ${{ runner.temp }}/fpl-cache
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v6
+        with:
+          # Linux is the whole point of this workflow, and the version should
+          # track what Community Cloud runs rather than what the developer has.
+          python-version: "3.12"
+          # keyed on uv.lock, so a stale cache cannot drift from the lockfile
+          enable-cache: true
+
+      # --extra app installs Streamlit, without which tests/test_app.py skips
+      # itself and the suite passes by not running. --locked fails if uv.lock
+      # has drifted from pyproject.toml, which matters because the deploy
+      # installs from the lockfile and not from pyproject.toml. The dev group
+      # is PEP 735 and uv installs it by default, so ruff and pytest need no
+      # flag of their own.
+      - name: Install
+        run: uv sync --locked --extra app
+
+      # The Streamlit tests importorskip, so a missing extra would be silent.
+      # Fail here instead, where the step name says what went wrong.
+      - name: Check the app extra landed
+        run: uv run python -c "import streamlit.testing.v1"
+
+      # Ruff comes from the lockfile rather than from an action that resolves
+      # its own version, so this is the command in CLAUDE.md byte for byte and
+      # a newer CI ruff cannot fail on rules the developer's has never seen.
+      - name: Lint
+        run: uv run ruff check .
+
+      - name: Format
+        run: uv run ruff format --check .
+
+      # -rs prints the skip report. A skip exits zero, and noticing that a
+      # particular test has stopped skipping is most of why this runs on Linux.
+      - name: Test
+        run: uv run pytest -rs

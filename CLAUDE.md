@@ -261,6 +261,22 @@ enough of this season to mean anything. That is the intended progression rather
 than a happy accident, and anything new reading these fields needs the same
 guard or it will read a year-old number as though it were current.
 
+The list above is not exhaustive and reading it as though it were is the trap.
+Every counting stat rolls over the same way: `saves`, `yellow_cards`,
+`red_cards`, `defensive_contribution`, `tackles`, `recoveries` and
+`clearances_blocks_interceptions` are all last season's until the first
+deadline. Checked live on 2026-08-16, five days out from GW1: players were
+carrying three thousand minutes and last season's expected goals. So the 270
+minute gate is wide open pre-season and is **not** what protects the model in
+August. The blend weight being 0 is. All of these are read inside
+`component_rate` and nowhere else, which is what keeps them behind that weight.
+Reading one in `build_rates` beside the observed rate would put it in front of
+the weight, where nothing is standing between it and the projection.
+
+`tests/conftest.py` zeroes these fields pre-season, which is kinder than the real
+payload, so a test that wants to prove the guard has to write the stale values in
+itself rather than trusting the fixture.
+
 **Pre-season means no current data.** `gameweeks_played` is 0 until late August,
 so the shrinkage weight is 0 and projections rest entirely on last season. Any
 new model term needs a defined pre-season behaviour.
@@ -290,7 +306,10 @@ Three terms, deliberately separable so any one can be replaced without touching
 the others. Tuning constants sit at the top of `projections.py`:
 `SHRINKAGE_GAMES`, `DIFFICULTY_ALPHA`, `HOME_BONUS`, `START_RATE_TRUST`,
 `SUB_SHARE`, `STARTER_DURATION`, `STRENGTH_WEIGHT`, `STRENGTH_ALPHA`,
-`PENALTY_XG_P90`, `FREEKICK_XG_P90`, `COMPONENT_MINUTES`.
+`PENALTY_XG_P90`, `FREEKICK_XG_P90`, `COMPONENT_MINUTES`, `SAVE_REMAINDER`.
+
+`SAVE_REMAINDER` is derived rather than fitted, so it is the odd one in that
+list. See the saves paragraph below for where 1.0 comes from before changing it.
 
 **`points_per_90` is part rate observed and part rate rebuilt.**
 `component_rate` reconstructs what FPL actually pays a player for, rather than
@@ -299,11 +318,62 @@ reading back what he happened to score:
 ```
 appearance + xG90 * goal points for his position + xA90 * 3
            + P(clean sheet) * clean sheet points for his position
+           + max(0, saves90 - SAVE_REMAINDER) / 3      (keepers)
+           - E[floor(goals conceded / 2)]              (keepers and defenders)
+           + P(defensive contribution) * 2             (outfielders)
+           - yellows90 - 3 * reds90
 ```
 
 Clean sheet probability is the Poisson zero, `exp(-xGC per 90)`, on the club's
 rate rather than the player's. That is what stops a defender and a forward
 collapsing into the same scalar, which is what the old single rate did.
+
+**The clean sheet and the conceded charge come from one Poisson and one rate,
+and that is the point.** `_conceded_points` is `lambda / 2 - (1 - exp(-2 lambda))
+/ 4`, which is `E[floor(C / 2)]` exactly, on the same club rate the clean sheet
+reads. Nothing is double counted: the clean sheet pays at nought conceded,
+neither term fires at one, and only the charge fires at two or more. Modelling
+the upside off one distribution and the downside off another is how the two come
+to disagree about the same defence, so keep them together.
+
+**Saves are paid in whole threes and the remainder is lost.** Dividing the rate
+by three pays for saves nobody was paid for, worth about a third of a point per
+90 to a busy keeper. `SAVE_REMAINDER` subtracts what the remainder averages,
+which is 1.0, the mean of nought, one and two. Against a Poisson that lands
+within 0.003 of exact for anyone making two or more saves a match and errs low
+below that, which is the right direction to err.
+
+**The defensive contribution term is a threshold estimated from a mean, and it
+is the one real approximation here.** FPL pays 2 points for reaching
+`DEFCON_THRESHOLD` actions in a match, and the API gives a season count, so
+`_poisson_at_least` turns the per 90 rate into a chance of clearing the bar.
+Three ways that is wrong, all worth knowing before trusting it: real action
+counts are overdispersed against a Poisson, so it understates for anyone well
+below his bar; it is per 90 where the rule is per match, so scaling by
+`expected_minutes_share` afterwards overstates a part-player, because the bar
+does not come down when his minutes do; and it assumes his rate is steady across
+fixtures. A negative binomial would be better in principle and there is nothing
+here to fit its dispersion against, so it would be one more constant set by eye.
+
+Do not fix the per-match problem by threading `minutes_share` into
+`component_rate`. It would couple two of the three terms the model exists to keep
+separable.
+
+**The threshold lives in `data.py` and the points values live in
+`projections.py`, and the split is deliberate.** `DEFCON_THRESHOLD` is a rule
+about what counts, which is what `data.py` holds. `DEFCON_POINTS`, `SAVE_POINTS`
+and `CONCEDED_POINTS` are the scoring table `component_rate` reproduces, which
+already lives beside `GOAL_POINTS`. FPL publishes its own copy of the threshold
+as `element_types[].defensive_contribution_start` and serves it empty, so
+reading it would add a branch that never runs in favour of a fallback that
+always does.
+
+**`defensive_contribution` is a count of actions, not points already scored**,
+and it is exactly the sum of the actions its position counts: tackles plus
+clearances, blocks and interceptions, plus recoveries for everyone except
+defenders. Verified against the live payload. `component_rate` rebuilds it from
+those parts when the column is absent, which is what a payload from before
+2025/26 looks like.
 
 **The club's conceding rate comes off the keepers, and it has to.**
 `expected_goals_conceded` is charged to a player only while he is on the pitch,
@@ -390,9 +460,25 @@ every test runs once pre-season and once mid-season.
 
 No test touches the network and it must stay that way. New tests use `FakeApi`.
 A `network` marker exists for live checks if they ever become necessary, and is
-deselected by default.
+deselected by `addopts` in `pyproject.toml`, so marking a test is enough to keep
+it out of a normal run and out of CI. `pytest -m network` is the way back in.
 
 If you add a constraint to the optimiser, add the test that proves it holds.
+
+**`ruff` and `pytest` run on Linux on every push to `main` and every pull
+request**, from `.github/workflows/ci.yml`. It installs with
+`uv sync --locked --extra app`, and all three parts of that matter: `--extra app`
+because `tests/test_app.py` calls `importorskip` and would otherwise let the
+suite pass by not running, and `--locked` because Community Cloud installs from
+`uv.lock` rather than from `pyproject.toml`, so drift between the two is worth
+failing on.
+
+Linux is the point rather than a default. `test_the_bundled_solver_is_preferred_over_a_hand_found_one`
+skips on Windows on ARM, where PuLP bundles no binary, so on the machine this was
+written on it has never reached its assertion. It now fails rather than skips on
+Linux, because a test that is allowed to skip on the one platform it exists to
+cover is the same as not having it, and that is the test that would have caught
+the regression which took the deploy down.
 
 ## Delivery
 
@@ -469,7 +555,7 @@ The backlog lives in `ROADMAP.md`, including the things that were considered and
 turned down, and why. Keep it there rather than here: this file is read in full
 every session and is long enough already.
 
-Three of those items will mislead you mid-task if you do not know them, so they
+Two of those items will mislead you mid-task if you do not know them, so they
 are repeated here:
 
 - **None of the live code has met a real match.** It was written pre-season, when
@@ -477,8 +563,5 @@ are repeated here:
   payloads. The empty case is verified against the real API. The bonus ranking
   and the substitution rule are not. Treat the first scored gameweek as the real
   test.
-- **Nothing runs the suite on a pull request.** A green run is whatever the last
-  person happened to do locally. A CBC solver regression reached production this
-  way, and the test that catches it skips on Windows on ARM.
 - **`prior_season.parquet` needs a manual refresh between seasons**, or in August
   the projection quietly rests on a season two years old.

@@ -25,7 +25,7 @@ import numpy as np
 import pandas as pd
 
 from .api import default_cache_dir
-from .data import Season
+from .data import DEFCON_THRESHOLD, Season
 
 PRIOR_CACHE = default_cache_dir() / "prior_season.parquet"
 
@@ -56,13 +56,39 @@ STARTER_DURATION = 0.85  # share of 90 a starter lasts, absent anything better
 
 PRIOR_COLUMNS = ["prior_season", "prior_points", "prior_minutes", "prior_starts", "prior_end_cost"]
 
-# FPL's scoring, as far as the component rate reproduces it. Saves, cards and
-# defensive contributions are left out: they are small, and two of the three
-# are penalties for things the model has no way to anticipate.
+# FPL's scoring, as the component rate reproduces it. Every category is here,
+# including the three that cost points, because what a defender stands to lose
+# separates him from a forward as much as his clean sheet does. Two of them are
+# thresholds within a match rather than rates, so they are estimated rather than
+# counted, and `_conceded_points` and `_poisson_at_least` say how.
 GOAL_POINTS = {"GKP": 6, "DEF": 6, "MID": 5, "FWD": 4}
 CLEAN_SHEET_POINTS = {"GKP": 4, "DEF": 4, "MID": 1, "FWD": 0}
 ASSIST_POINTS = 3
 APPEARANCE_POINTS = 2
+
+# One point per three saves, and only a keeper makes them. Position dicts rather
+# than a scalar and a test on position, because that is how the two tables above
+# already say "this position only" and it keeps the assembly one expression.
+SAVE_POINTS = {"GKP": 1, "DEF": 0, "MID": 0, "FWD": 0}
+SAVES_PER_POINT = 3
+# Saves are paid in whole threes within a match and the leftovers are lost
+# rather than carried, so a rate divided by three overstates by whatever the
+# remainder averages. Across a season that is one, the mean of nought, one and
+# two. Derived rather than fitted: against a Poisson it is within 0.003 of the
+# exact figure for anyone making two or more saves a match, and errs low below.
+SAVE_REMAINDER = 1.0
+
+# Minus one per two conceded, and only the two positions that are charged it.
+CONCEDED_POINTS = {"GKP": -1, "DEF": -1, "MID": 0, "FWD": 0}
+CONCEDED_PER_POINT = 2
+
+# Two points for reaching the defensive contribution threshold in a match, which
+# `DEFCON_THRESHOLD` in `data.py` holds because it is a rule about what counts
+# rather than part of the scoring table here.
+DEFCON_POINTS = {"GKP": 0, "DEF": 2, "MID": 2, "FWD": 2}
+
+YELLOW_CARD_POINTS = -1
+RED_CARD_POINTS = -3
 
 # A first choice penalty taker is worth roughly a goal every eight or nine
 # matches over someone otherwise identical, and a first choice direct free kick
@@ -248,6 +274,59 @@ def team_defence_rate(players: pd.DataFrame) -> pd.Series:
     return rate.replace([np.inf, -np.inf], np.nan).dropna()
 
 
+def _per_90(
+    players: pd.DataFrame, column: str, ninetieths: pd.Series, played_enough: pd.Series
+) -> pd.Series:
+    """A counting stat as a rate, zero wherever it cannot be one.
+
+    `DataFrame.get` on a column that is not there gives NaN rather than raising,
+    so the arithmetic still produces a series of the right shape and the term
+    that reads it drops out instead of taking the rest of the rate down with it.
+    That is what lets a payload from before a category existed lose one term
+    rather than the whole component.
+    """
+    counted = pd.to_numeric(players.get(column), errors="coerce")
+    return (counted / ninetieths).where(played_enough).fillna(0.0)
+
+
+def _conceded_points(xgc: pd.Series) -> pd.Series:
+    """Expected goals conceded per 90 turned into how many are actually charged.
+
+    FPL takes a point per two conceded and the odd one is free, so the charge is
+    `floor(C / 2)` rather than `C / 2`. Under the same Poisson the clean sheet
+    already assumes, that has a closed form:
+
+        E[floor(C / 2)] = lambda / 2 - (1 - exp(-2 lambda)) / 4
+
+    because `E[C mod 2]` is the chance of an odd count, `(1 - exp(-2 lambda))/2`.
+    Exact given the Poisson, so the only assumption here is the one made once
+    for the clean sheet and not made again.
+
+    Nothing is double counted against that clean sheet. It pays at nought
+    conceded, neither term fires at one, and only this one fires at two or more.
+    """
+    return xgc / CONCEDED_PER_POINT - (1 - np.exp(-CONCEDED_PER_POINT * xgc)) / 4
+
+
+def _poisson_at_least(rate: pd.Series, threshold: pd.Series) -> pd.Series:
+    """Chance of at least `threshold` events in one match, given a per 90 rate.
+
+    Twelve terms at most, which is why this walks the head of the distribution
+    rather than pulling in a special function and a dependency for it. Every
+    player carries his own threshold, so each term is subtracted only from the
+    rows it is actually below.
+    """
+    rate = rate.clip(lower=0.0).fillna(0.0)
+    threshold = threshold.fillna(0.0)
+    cdf = pd.Series(0.0, index=rate.index)
+    term = np.exp(-rate)
+    highest = int(threshold.max()) if len(threshold) else 0
+    for k in range(highest):
+        cdf = cdf + term.where(k < threshold, 0.0)
+        term = term * rate / (k + 1)
+    return (1 - cdf).clip(0.0, 1.0)
+
+
 def component_rate(players: pd.DataFrame, defence: pd.Series | None = None) -> pd.Series:
     """Points per 90 rebuilt from what a player is expected to do, not what he scored.
 
@@ -257,11 +336,30 @@ def component_rate(players: pd.DataFrame, defence: pd.Series | None = None) -> p
 
         appearance + expected goals * goal points + expected assists * 3
                    + P(clean sheet) * clean sheet points
+                   + saves paid in threes
+                   - goals conceded charged in twos
+                   + P(defensive contribution) * 2
+                   - cards
 
     Clean sheet probability is the Poisson zero, `exp(-xGC per 90)`, on the
     club's rate rather than the player's. The opponent adjustment deliberately
     does not appear here. It belongs in the fixture term, where the strength
     ratings already handle it, and applying it twice would double count.
+
+    The two threshold terms are estimates rather than counts, and it is worth
+    being clear about which way they are wrong. Real defensive action counts are
+    overdispersed against a Poisson, because how much defending a player does
+    depends on how the match is going, so `_poisson_at_least` understates for
+    anyone well below his bar. Both threshold terms are also per 90 where the
+    rule is per match, so scaling them by `expected_minutes_share` afterwards is
+    linear where the truth is not: the bar does not come down when the minutes
+    do, and a part-player is overstated. Neither is fixed here. Threading the
+    minutes term into this one would couple two of the three terms the whole
+    model exists to keep separable.
+
+    Cards are the one linear term, and they only see the points. A red also
+    costs the following match through suspension, which nothing here looks
+    forward to, though `available` already drops anyone currently serving one.
 
     Comes back as NaN for anyone the inputs cannot describe, so the caller can
     fall back rather than being handed a confident zero.
@@ -293,17 +391,54 @@ def component_rate(players: pd.DataFrame, defence: pd.Series | None = None) -> p
 
     if defence is None or defence.empty:
         clean_sheet = pd.Series(np.nan, index=index, dtype="float64")
+        conceded = pd.Series(np.nan, index=index, dtype="float64")
     else:
         xgc = players["team"].map(defence).astype("float64")
         clean_sheet = np.exp(-xgc) * cs_points
+        # the same Poisson and the same rate as the line above, which is what
+        # stops the upside and the downside of one defence disagreeing
+        conceded = _conceded_points(xgc) * position.map(CONCEDED_POINTS).astype("float64")
+
+    # Whole threes within a match, so the remainder is lost rather than banked.
+    # Dividing the rate by three straight would pay for saves nobody was paid
+    # for, which for a busy keeper is worth about a third of a point per 90.
+    saves90 = _per_90(players, "saves", ninetieths, played_enough)
+    save_points = ((saves90 - SAVE_REMAINDER).clip(lower=0.0) / SAVES_PER_POINT) * position.map(
+        SAVE_POINTS
+    ).astype("float64")
+
+    defcon90 = _per_90(players, "defensive_contribution", ninetieths, played_enough)
+    if not defcon90.any():
+        # a payload from before the category existed, where the sum has to be
+        # rebuilt from its parts and recoveries count for everyone but defenders
+        parts = _per_90(players, "tackles", ninetieths, played_enough) + _per_90(
+            players, "clearances_blocks_interceptions", ninetieths, played_enough
+        )
+        recoveries = _per_90(players, "recoveries", ninetieths, played_enough)
+        defcon90 = parts + recoveries.where(position != "DEF", 0.0)
+
+    threshold = position.map(DEFCON_THRESHOLD).astype("float64")
+    defcon = _poisson_at_least(defcon90, threshold) * position.map(DEFCON_POINTS).astype("float64")
+    # a keeper has no threshold and is not eligible, so he scores none of this
+    defcon = defcon.where(position != "GKP", 0.0)
+
+    cards = _per_90(players, "yellow_cards", ninetieths, played_enough) * YELLOW_CARD_POINTS
+    cards = cards + _per_90(players, "red_cards", ninetieths, played_enough) * RED_CARD_POINTS
 
     rate = APPEARANCE_POINTS + xg90 * goal_points + xa90 * ASSIST_POINTS
-    rate = rate + clean_sheet.fillna(0.0)
+    rate = rate + clean_sheet.fillna(0.0) + conceded.fillna(0.0)
+    # every penalty is filled rather than left NaN, so a club with no conceding
+    # rate is charged nothing instead of taking the whole player out
+    rate = rate + save_points.fillna(0.0) + defcon.fillna(0.0) + cards.fillna(0.0)
 
     # Set piece duty adjusts a rate, it does not make one. Someone who has not
     # played has no expected goals and no minutes to divide by, and calling the
     # appearance points alone a scoring rate would be inventing a number rather
     # than measuring one. Pre-season that is everybody.
+    #
+    # Every term above sits on this side of the gate on purpose. It is what
+    # makes all of them inherit `COMPONENT_MINUTES` for nothing, so do not move
+    # one below it.
     return rate.where(played_enough).astype("float64")
 
 

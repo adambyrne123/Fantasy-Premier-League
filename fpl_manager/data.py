@@ -23,6 +23,18 @@ MAX_PER_CLUB = 3
 SQUAD_SIZE = sum(SQUAD_LIMITS.values())
 XI_SIZE = 11
 
+# What a defensive contribution takes in one match. Defenders count clearances,
+# blocks, interceptions and tackles, everyone else counts recoveries too, which
+# is why the bar is higher for them. Keepers are absent rather than set high,
+# because they are not eligible at all and a number here would read like a bar
+# somebody could clear.
+#
+# `element_types[].defensive_contribution_start` in the bootstrap is FPL's own
+# copy of this and comes back empty, so reading it would add a branch that never
+# runs in favour of a fallback that always does. If it is ever populated, assert
+# it against this rather than letting it silently override.
+DEFCON_THRESHOLD = {"DEF": 10, "MID": 12, "FWD": 12}
+
 
 def is_legal_xi(positions: Iterable[str]) -> bool:
     """Whether eleven positions make a formation FPL would accept.
@@ -161,6 +173,20 @@ class Season:
             "penalties_order",
             "direct_freekicks_order",
             "corners_and_indirect_freekicks_order",
+            # the rest of what FPL pays for, rebuilt in `component_rate`. The
+            # API also serves `saves_per_90` and `defensive_contribution_per_90`
+            # and they are deliberately not taken: the component rate divides by
+            # its own `minutes / 90`, and a second definition of per 90 arriving
+            # from elsewhere is how two numbers on one screen come to disagree.
+            "saves",
+            "yellow_cards",
+            "red_cards",
+            "defensive_contribution",
+            # the parts the line above is the sum of, kept as the fallback for a
+            # payload from before the category existed
+            "tackles",
+            "recoveries",
+            "clearances_blocks_interceptions",
             # what price moves are worked out from, see prices.py
             "transfers_in_event",
             "transfers_out_event",

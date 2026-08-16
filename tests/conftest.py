@@ -93,6 +93,15 @@ class FakeApi:
                     # model has something to separate a forward from a keeper
                     xg90 = {1: 0.0, 2: 0.04, 3: 0.16, 4: 0.38}[etype] * self.rng.uniform(0.4, 1.8)
                     xa90 = {1: 0.0, 2: 0.05, 3: 0.15, 4: 0.11}[etype] * self.rng.uniform(0.4, 1.8)
+                    # Defensive work per 90, spread wide enough on purpose that
+                    # generated players land on both sides of their threshold.
+                    # If every defender sat above 10 the tests could not tell a
+                    # working estimator from a constant.
+                    defcon90 = {1: 0.0, 2: 9.0, 3: 6.0, 4: 2.0}[etype] * self.rng.uniform(0.4, 1.8)
+                    saves90 = 3.0 * self.rng.uniform(0.4, 1.8) if etype == 1 else 0.0
+                    # defenders and holding midfielders get booked more than
+                    # forwards do, which is part of what separates the positions
+                    yellow90 = {1: 0.02, 2: 0.12, 3: 0.11, 4: 0.06}[etype]
                     elements.append(
                         {
                             "id": pid,
@@ -142,6 +151,35 @@ class FakeApi:
                             "expected_goals_conceded": f"{minutes / 90 * 1.35:.2f}"
                             if self.played
                             else "0.0",
+                            # The rest of what FPL pays for. Zero pre-season
+                            # like their neighbours above, and split so that
+                            # `defensive_contribution` is exactly the sum its
+                            # position counts, the way the real payload is:
+                            # recoveries are in it for everyone but defenders.
+                            "saves": round(minutes / 90 * saves90) if self.played else 0,
+                            "yellow_cards": round(minutes / 90 * yellow90) if self.played else 0,
+                            "red_cards": 1 if self.played and pid % 47 == 0 else 0,
+                            "defensive_contribution": round(minutes / 90 * defcon90)
+                            if self.played
+                            else 0,
+                            "tackles": round(minutes / 90 * defcon90 * 0.25) if self.played else 0,
+                            "clearances_blocks_interceptions": (
+                                round(minutes / 90 * defcon90)
+                                - round(minutes / 90 * defcon90 * 0.25)
+                                if etype == 2
+                                else round(minutes / 90 * defcon90 * 0.3)
+                            )
+                            if self.played
+                            else 0,
+                            "recoveries": (
+                                0
+                                if etype == 2
+                                else round(minutes / 90 * defcon90)
+                                - round(minutes / 90 * defcon90 * 0.25)
+                                - round(minutes / 90 * defcon90 * 0.3)
+                            )
+                            if self.played
+                            else 0,
                             # one taker per club per duty, the way the real
                             # payload is, and absent for everyone else
                             **(

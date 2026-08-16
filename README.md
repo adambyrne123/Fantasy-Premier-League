@@ -1,5 +1,7 @@
 # fpl-manager
 
+[![CI](https://github.com/adambyrne123/Fantasy-Premier-League/actions/workflows/ci.yml/badge.svg)](https://github.com/adambyrne123/Fantasy-Premier-League/actions/workflows/ci.yml)
+
 A command line tool for building an FPL squad and keeping it maintained through
 the season. It pulls from the public Fantasy Premier League API, projects points
 per player per gameweek, and solves for the best legal squad under the budget,
@@ -135,7 +137,7 @@ a promoted club's 5.5m midfielder gets a promoted-club-shaped number regardless
 of what they actually did in the Championship.
 
 By the same weight it also blends in a rate rebuilt from what a player is
-expected to do rather than what he happened to score: expected goals and assists
+expected to do rather than what he happened to score. Expected goals and assists
 priced at what FPL pays for them in his position, plus a clean sheet chance from
 how much his club concedes, taken as `exp(-xGC per 90)`. That is what stops a
 defender and a forward collapsing into the same number, which a single scalar
@@ -143,11 +145,30 @@ rate cannot avoid. Penalty and free kick duty are added on top, because a player
 who has just been given the job has a claim on chances his past numbers cannot
 show yet.
 
-It contributes nothing in August, and deliberately. FPL publishes the expected
-goals fields as zero until the season is under way, and a player needs 270
-minutes this season before his own rates are used at all, so the term arrives
-around the fourth gameweek rather than pretending to know something in the
-first.
+The rest of the scoring is there too, including the parts that cost points:
+
+- **Saves**, a point per three, and only for keepers. They are paid in whole
+  threes within a match and the leftovers are lost, so the rate is docked what
+  the remainder averages rather than simply divided by three.
+- **Goals conceded**, minus one per two, for keepers and defenders. It comes off
+  the same club rate as the clean sheet above, so the upside and the downside of
+  one defence cannot disagree. A defender at a leaky club now carries a net
+  negative defensive term, which the old rate had no way to say.
+- **Defensive contributions**, two points for enough tackles, clearances, blocks,
+  interceptions and recoveries in a match. Be aware this one is an estimate: FPL
+  pays for clearing a bar within a match and the API gives a season average, so
+  the chance of clearing it is modelled rather than counted, and it understates
+  for anyone who falls well short of his bar.
+- **Cards**, minus one and minus three. Small, but systematically larger for
+  defenders and holding midfielders, which is more position separation.
+
+The whole rebuilt rate contributes nothing in August, and deliberately. A player
+needs 270 minutes this season before his own rates are used at all, and until a
+gameweek has been played the blend weight is zero, so the term arrives around the
+fourth gameweek rather than pretending to know something in the first. That
+matters more than it sounds: before the first deadline the API is still serving
+last season's minutes and counts, so the weight is the only thing standing
+between the projection and a year-old number.
 
 **expected_minutes_share** is how often a player starts multiplied by how long
 he lasts when he does, rather than his share of the minutes available. The
@@ -264,3 +285,9 @@ uv run pytest
 Runs the whole pipeline against synthetic payloads shaped like the real API, at
 both zero and twelve gameweeks played, and checks every FPL rule the optimiser
 is meant to respect. No network access required.
+
+The same suite, plus `ruff check` and `ruff format --check`, runs on Linux on
+every push to `main` and every pull request. Linux is the point rather than a
+convenience: PuLP ships no CBC binary for Windows on ARM, so the test that
+guards how the solver is chosen cannot run on the machine this was written on,
+and a regression in exactly that area once took the deployed app down.
