@@ -70,8 +70,8 @@ GLOSSARY = {
     "means the model rates him higher than the crowd does.",
     "ownership": "Share of all FPL managers who own him, straight from the API.",
     "points_per_90": "The scoring rate the projection is built from. Last "
-    "season blended with this one, plus a rate rebuilt from expected goals, "
-    "assists and clean sheets once enough of the season has been played.",
+    "season blended with this one, plus a rate rebuilt from what FPL pays a "
+    "player in his position, once enough of the season has been played.",
     "minutes_share": "Expected share of a full match, so 0.85 means he is "
     "worth about 76 minutes. Built from how often he starts rather than from "
     "his minutes total, which would cancel against the rate beside it.",
@@ -79,9 +79,11 @@ GLOSSARY = {
     "price implies. Price is the only input here that is not last season's "
     "minutes, which is what lets his rate and his role move separately.",
     "prior_p90": "Last season's points per 90, before this season is blended in.",
-    "component_p90": "Points per 90 rebuilt from expected goals, expected "
-    "assists and the club's clean sheet chance, rather than read back off what "
-    "he actually scored. Empty until he has 270 minutes this season.",
+    "component_p90": "Points per 90 rebuilt from what FPL pays for rather than "
+    "read back off what he scored: expected goals and assists, the club's clean "
+    "sheet chance and the goals it concedes, saves, defensive contributions and "
+    "cards. The last two are chances of clearing a bar in a match, estimated "
+    "from an average. Empty until he has 270 minutes this season.",
     "form": "FPL's own figure: average points over the last 30 days.",
     "points_per_game": "FPL's own figure: average points per appearance.",
     "total_points": "Points actually scored so far, straight from the API.",

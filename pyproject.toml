@@ -45,7 +45,13 @@ quote-style = "double"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-addopts = "-q --strict-markers"
+# The deselection is here rather than in a conftest hook so the marker's
+# description is true of the command everyone actually runs. Nothing carries
+# the marker today, which is why now is the cheap time to make it real: without
+# it the first live check anyone adds would start hitting the FPL API from a CI
+# runner on every pull request. A later -m on the command line overrides this,
+# so `pytest -m network` remains the way in.
+addopts = "-q --strict-markers -m 'not network'"
 markers = [
     "network: hits the live FPL API, deselected by default",
 ]

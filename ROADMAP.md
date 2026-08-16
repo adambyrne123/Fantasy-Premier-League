@@ -57,21 +57,30 @@ Poisson, attached to a captaincy view and nothing else. Phase 5 put the xG
 plumbing in, so this is now unblocked. Do not thread it through the objective;
 see the rejected list.
 
-**The rest of position-specific scoring.** `component_rate` covers goals, assists
-and clean sheets, which is most of where the positions differ. Still missing:
-
-- **Saves.** A shot-stopper at a bad club reads the same as a spectator at a good
-  one.
-- **The goals-conceded penalty**, one point per two conceded, which is the other
-  half of a defender's downside and currently absent while the clean sheet upside
-  is modelled.
-- **Cards**, and the **defensive contribution** points added in 2025/26. The
-  latter has no mention anywhere in the repo.
-
-`saves`, `yellow_cards` and `red_cards` are parsed in `live.py` as realised
-stats, but not in `data.py`, so the model cannot see them.
+**Position-specific scoring is complete, with two loose ends.**
+`component_rate` now covers every category FPL pays for.
 `corners_and_indirect_freekicks_order` is parsed and deliberately unused, since a
-corner taker's assists are already in his expected assists.
+corner taker's assists are already in his expected assists. What is left:
+
+- **Read `element_types[].defensive_contribution_start` once FPL populates it.**
+  It is FPL's own copy of `DEFCON_THRESHOLD` and currently comes back empty, so
+  the threshold is hardcoded. Assert the payload against the constant rather
+  than letting it silently override, and confirm the units against a scored
+  season while you are there.
+- **The defensive contribution term is a threshold estimated from a mean.**
+  `_poisson_at_least` assumes defensive actions are Poisson, and real counts are
+  overdispersed, so it understates for anyone below his bar. A negative binomial
+  would be better and there is nothing to fit its dispersion against. Revisit
+  once there is a season of per-match counts to fit one on.
+
+**`FakeApi` is kinder pre-season than the real payload.** It zeroes `minutes`,
+`expected_goals` and the counting stats when `played=0`, and the API does not:
+before the first deadline it serves last season's figures. So a test asserting a
+pre-season guard passes because the fixture handed it zeros rather than because
+the guard works, unless it writes the stale values in itself.
+`test_the_new_scoring_terms_are_inert_before_the_first_deadline` does. A
+`stale_preseason` flag on the fixture would fix it at the source, and it
+reparametrises a fixture every test depends on, so it is its own piece of work.
 
 **Set piece constants are guesses.** `PENALTY_XG_P90` and `FREEKICK_XG_P90` are
 set by eye against how many spot kicks a season produces, not fitted. Only
@@ -141,21 +150,14 @@ gameweek rather than twenty on every rerun.
 
 ### Infrastructure and upkeep
 
-**Continuous integration.** Nothing runs the suite on a pull request, so a green
-run is whatever the last person happened to do locally. This is not
-hypothetical. A CBC solver regression reached production and took the deployed
-app down, and the test that catches it skips on Windows on ARM because there is
-no bundled binary to prefer. A single GitHub Actions workflow running `ruff` and
-`pytest` on Linux would have caught it before the merge, and is the highest value
-item in this section by some distance.
-
 **PuLP deprecation warnings are back, deliberately.** Reordering
 `optimiser.solver()` to silence them is what broke the deploy. `PULP_CBC_CMD` is
 not a deprecated alias for a pathed `COIN_CMD`: it resolves the bundled binary
 for the running platform and chmods it executable on anything that is not
 Windows. If the 4.0 migration is attempted again, `PULP_CBC_CMD` has to stay
 first, and it has to be tested on Linux. The warning is cosmetic and the pin is
-still below 4.0.
+still below 4.0. What blocked a second attempt was having nowhere to test it,
+and CI is now that Linux run.
 
 **Refreshing `prior_season.parquet` between seasons.** Nothing does it
 automatically, so in August it needs `--refresh` and a manual copy or the

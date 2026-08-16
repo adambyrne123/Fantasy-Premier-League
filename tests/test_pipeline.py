@@ -5,6 +5,8 @@ If you add a constraint to `optimiser.py`, add the test that proves it holds.
 
 from __future__ import annotations
 
+import math
+
 import numpy as np
 import pandas as pd
 import pytest
@@ -327,7 +329,11 @@ def test_a_neutral_strength_pulls_the_fixture_towards_average(season: Season):
     one and is wrong."""
     from fpl_manager.projections import HOME_BONUS, fixture_multiplier
 
-    fixtures = season.team_fixtures(horizon=4).head(1).copy()
+    # a fixture the difficulty rating has an opinion about, since softening a
+    # rating that already said "unremarkable" is not a thing that can be
+    # observed and picking whichever fixture came first left this to luck
+    fixtures = season.team_fixtures(horizon=4)
+    fixtures = fixtures[fixtures["difficulty"] != 3].head(1).copy()
     difficulty, is_home = fixtures["difficulty"], fixtures["is_home"]
     home_adjust = HOME_BONUS if bool(is_home.iloc[0]) else -HOME_BONUS
 
@@ -378,7 +384,12 @@ def test_a_penalty_taker_outprojects_an_identical_team_mate(season: Season):
 
 def test_a_mean_defence_beats_a_leaky_one_for_a_defender(season: Season):
     """The clean sheet half of the rate is the whole reason a defender and a
-    forward cannot share one scalar."""
+    forward cannot share one scalar.
+
+    Passes for two reasons now rather than one: the tight club's defender
+    collects the clean sheet more often and is charged for conceded goals less
+    often. `test_a_leaky_defence_costs_more_than_the_clean_sheet_alone` is the
+    one that pins the second of those down."""
     from fpl_manager.projections import component_rate
 
     players = season.players.copy()
@@ -420,6 +431,387 @@ def test_a_forward_outscores_a_defender_on_the_same_expected_goals(season: Seaso
     # no clean sheet term, so the only difference left is what a goal is worth
     rate = component_rate(players, None)
     assert rate[d] > rate[f], "six points a goal beats four"
+
+
+def _poisson_pmf(lam: float, k: int) -> float:
+    """The Poisson probability of exactly k, written out rather than imported,
+    so the tests below check the estimators against arithmetic rather than
+    against the same library the estimators could have used."""
+    return math.exp(-lam) * lam**k / math.factorial(k)
+
+
+# The API serves these as whole counts and the frame holds them as integers, so
+# a test writing a per 90 figure back into one has to widen it first. Real code
+# only ever reads them.
+COUNTING_STATS = [
+    "saves",
+    "yellow_cards",
+    "red_cards",
+    "defensive_contribution",
+    "tackles",
+    "recoveries",
+    "clearances_blocks_interceptions",
+]
+
+
+def _editable(season: Season) -> pd.DataFrame:
+    players = season.players.copy()
+    for column in COUNTING_STATS:
+        if column in players.columns:
+            players[column] = players[column].astype("float64")
+    return players
+
+
+def test_the_new_scoring_terms_are_inert_before_the_first_deadline(season: Season):
+    """The one that matters, because August is when this can silently go wrong.
+
+    Before the first deadline the API is still serving last season's counts.
+    Checked live while this was written: with no gameweek finished, players were
+    carrying three thousand minutes and last year's expected goals. So the 270
+    minute gate is wide open pre-season and is not what protects the model. What
+    protects it is the blend weight being zero until a gameweek is played.
+
+    The fixture zeroes these fields pre-season, which is kinder than the real
+    payload, so this writes the stale values in itself. Trusting the fake here
+    would prove nothing.
+    """
+    from fpl_manager.projections import build_rates, load_prior
+
+    if season.gameweeks_played:
+        pytest.skip("this is the pre-season half of the fixture")
+
+    prior = load_prior(season)
+    before = build_rates(season, prior)["points_per_90"]
+
+    # last season's figures, the way the API actually serves them in August
+    stale = season.players
+    stale["minutes"] = 3000
+    stale["saves"] = 90
+    stale["defensive_contribution"] = 400
+    stale["yellow_cards"] = 9
+    stale["red_cards"] = 2
+    stale["expected_goals_conceded"] = 45.0
+
+    after = build_rates(season, prior)["points_per_90"]
+    pd.testing.assert_series_equal(before, after)
+
+
+def test_a_shot_stopper_outrates_a_spectator(season: Season):
+    """A keeper at a club under siege makes saves a keeper at a good one never
+    gets the chance to, and before this the two read identically."""
+    from fpl_manager.projections import component_rate
+
+    players = _editable(season)
+    keepers = players[(players["position"] == "GKP") & (players["minutes"] >= 900)]
+    if len(keepers) < 2:
+        pytest.skip("needs two keepers with minutes")
+
+    busy, idle = keepers.index[0], keepers.index[1]
+    for column in ("minutes", "expected_goals", "expected_assists", "team"):
+        players.loc[idle, column] = players.loc[busy, column]
+    players.loc[busy, "saves"] = players.loc[busy, "minutes"] / 90 * 4
+    players.loc[idle, "saves"] = 0
+
+    rate = component_rate(players, None)
+    assert rate[busy] > rate[idle]
+
+
+def test_saves_are_a_keepers_points_and_nobody_elses(season: Season):
+    """Only a keeper is paid for them, so the same figure on an outfielder has
+    to leave his rate alone rather than quietly paying him for it."""
+    from fpl_manager.projections import component_rate
+
+    players = _editable(season)
+    defenders = players[(players["position"] == "DEF") & (players["minutes"] >= 900)]
+    if defenders.empty:
+        pytest.skip("needs a defender with minutes")
+
+    d = defenders.index[0]
+    before = component_rate(players, None)[d]
+    players.loc[d, "saves"] = players.loc[d, "minutes"] / 90 * 6
+    after = component_rate(players, None)[d]
+
+    assert after == pytest.approx(before)
+
+
+def test_saves_are_paid_in_whole_threes(season: Season):
+    """FPL pays `floor(saves / 3)` within a match and the leftovers are lost, so
+    a rate divided by three pays for saves nobody was paid for. Worth about a
+    third of a point per 90 for a busy keeper, which is not a rounding detail.
+
+    Pinned against the exact Poisson figure so that simplifying this back to
+    `saves90 / 3` fails here and says what was lost."""
+    from fpl_manager.projections import component_rate
+
+    players = _editable(season)
+    keepers = players[(players["position"] == "GKP") & (players["minutes"] >= 900)]
+    if keepers.empty:
+        pytest.skip("needs a keeper with minutes")
+
+    k = keepers.index[0]
+    minutes = players.loc[k, "minutes"]
+    players.loc[k, "saves"] = 0
+    baseline = component_rate(players, None)[k]
+    players.loc[k, "saves"] = minutes / 90 * 3.0
+    paid = component_rate(players, None)[k] - baseline
+
+    exact = sum(math.floor(s / 3) * _poisson_pmf(3.0, s) for s in range(40))
+    assert paid == pytest.approx(exact, abs=0.01)
+    assert paid < 3.0 / 3, "dividing the rate by three would overpay"
+
+
+def test_the_conceded_charge_is_nothing_at_a_clean_sheet():
+    """The clean sheet term pays at nought conceded and this one charges from
+    two, so they are disjoint halves of one distribution rather than the same
+    goals counted twice."""
+    from fpl_manager.projections import _conceded_points
+
+    assert _conceded_points(pd.Series([0.0])).iloc[0] == pytest.approx(0.0)
+
+
+@pytest.mark.parametrize("lam", [0.8, 1.35, 2.0, 3.5])
+def test_the_conceded_charge_matches_the_distribution_it_claims(lam: float):
+    """`E[floor(C / 2)]` in closed form, checked against summing the Poisson
+    term by term. Exact rather than approximate, so the only assumption in the
+    penalty is the Poisson the clean sheet already makes."""
+    from fpl_manager.projections import _conceded_points
+
+    brute = sum(math.floor(c / 2) * _poisson_pmf(lam, c) for c in range(40))
+    assert _conceded_points(pd.Series([lam])).iloc[0] == pytest.approx(brute, abs=1e-9)
+
+
+def test_a_leaky_defence_costs_more_than_the_clean_sheet_alone(season: Season):
+    """Before this, a defender at a bad club only missed out on the upside. Now
+    he is charged for the downside too, so the gap has to be strictly wider than
+    the clean sheet difference on its own."""
+    from fpl_manager.projections import CLEAN_SHEET_POINTS, component_rate
+
+    players = season.players.copy()
+    defenders = players[(players["position"] == "DEF") & (players["minutes"] >= 900)]
+    defenders = defenders.groupby("team").head(1)
+    if len(defenders) < 2:
+        pytest.skip("needs two defenders at different clubs")
+
+    tight, leaky = defenders.index[0], defenders.index[1]
+    for column in ("minutes", "expected_goals", "expected_assists", "saves"):
+        players.loc[leaky, column] = players.loc[tight, column]
+    players.loc[leaky, "defensive_contribution"] = players.loc[tight, "defensive_contribution"]
+    players.loc[leaky, "yellow_cards"] = players.loc[tight, "yellow_cards"]
+    players.loc[leaky, "red_cards"] = players.loc[tight, "red_cards"]
+
+    defence = pd.Series(
+        {int(players.loc[tight, "team"]): 1.0, int(players.loc[leaky, "team"]): 3.5}
+    )
+    rate = component_rate(players, defence)
+    clean_sheet_only = CLEAN_SHEET_POINTS["DEF"] * (math.exp(-1.0) - math.exp(-3.5))
+
+    assert rate[tight] - rate[leaky] > clean_sheet_only
+
+
+def test_a_midfielder_is_not_charged_for_goals_conceded(season: Season):
+    """The strongest of these, because it pins two things at once. A midfielder
+    gets the clean sheet point and none of the penalty, so his gap between the
+    same two clubs has to be exactly the clean sheet difference. If the penalty
+    leaked into his position, or if it had been folded into the clean sheet term
+    rather than sitting beside it, this moves."""
+    from fpl_manager.projections import CLEAN_SHEET_POINTS, component_rate
+
+    players = season.players.copy()
+    mids = players[(players["position"] == "MID") & (players["minutes"] >= 900)]
+    mids = mids.groupby("team").head(1)
+    if len(mids) < 2:
+        pytest.skip("needs two midfielders at different clubs")
+
+    tight, leaky = mids.index[0], mids.index[1]
+    for column in ("minutes", "expected_goals", "expected_assists", "defensive_contribution"):
+        players.loc[leaky, column] = players.loc[tight, column]
+    players.loc[leaky, "yellow_cards"] = players.loc[tight, "yellow_cards"]
+    players.loc[leaky, "red_cards"] = players.loc[tight, "red_cards"]
+    players.loc[[tight, leaky], "penalties_order"] = np.nan
+    players.loc[[tight, leaky], "direct_freekicks_order"] = np.nan
+
+    defence = pd.Series(
+        {int(players.loc[tight, "team"]): 1.0, int(players.loc[leaky, "team"]): 3.5}
+    )
+    rate = component_rate(players, defence)
+    clean_sheet_only = CLEAN_SHEET_POINTS["MID"] * (math.exp(-1.0) - math.exp(-3.5))
+
+    assert rate[tight] - rate[leaky] == pytest.approx(clean_sheet_only, abs=1e-9)
+
+
+@pytest.mark.parametrize(("rate", "threshold"), [(6.0, 10), (8.0, 10), (10.0, 12), (12.0, 12)])
+def test_the_defensive_contribution_tail_matches_the_distribution(rate: float, threshold: int):
+    """Walking the head of the Poisson is only worth doing if it lands on the
+    same number a sum over the terms does."""
+    from fpl_manager.projections import _poisson_at_least
+
+    brute = sum(_poisson_pmf(rate, k) for k in range(threshold, 60))
+    got = _poisson_at_least(pd.Series([rate]), pd.Series([float(threshold)])).iloc[0]
+    assert got == pytest.approx(brute, abs=1e-9)
+
+
+def test_each_row_gets_its_own_defensive_contribution_threshold():
+    """Every player carries his own bar, so the terms below it have to be taken
+    off per row rather than off the frame as a whole."""
+    from fpl_manager.projections import _poisson_at_least
+
+    got = _poisson_at_least(pd.Series([8.0, 8.0]), pd.Series([10.0, 12.0]))
+    assert got.iloc[0] > got.iloc[1], "the same work clears a lower bar more often"
+    assert got.iloc[1] == pytest.approx(sum(_poisson_pmf(8.0, k) for k in range(12, 60)), abs=1e-9)
+
+
+def test_the_defensive_contribution_tail_is_a_probability():
+    """It multiplies a points value, so anything outside nought to one is points
+    invented or points lost rather than a chance of clearing a bar."""
+    from fpl_manager.projections import _poisson_at_least
+
+    rates = pd.Series([0.0, 1.0, 5.0, 9.0, 14.0, 40.0])
+    tail = _poisson_at_least(rates, pd.Series([10.0] * len(rates)))
+    assert ((tail >= 0) & (tail <= 1)).all()
+    assert tail.is_monotonic_increasing, "more work clears the bar more often"
+    assert _poisson_at_least(rates, pd.Series([0.0] * len(rates))).eq(1.0).all()
+
+    lower = _poisson_at_least(rates, pd.Series([10.0] * len(rates)))
+    higher = _poisson_at_least(rates, pd.Series([12.0] * len(rates)))
+    assert (lower >= higher).all(), "a higher bar is cleared no more often"
+
+
+def test_a_defender_clears_the_bar_more_easily_than_a_midfielder(season: Season):
+    """Ten for a defender and twelve for everyone else, so identical defensive
+    work is not worth the same to both."""
+    from fpl_manager.projections import component_rate
+
+    players = _editable(season)
+    playing = players[players["minutes"] >= 900]
+    defender = playing[playing["position"] == "DEF"].index[:1]
+    mid = playing[playing["position"] == "MID"].index[:1]
+    if not len(defender) or not len(mid):
+        pytest.skip("needs one of each with minutes")
+
+    d, m = defender[0], mid[0]
+    # identical in everything, including the attacking return, so the only
+    # thing left between them is where their threshold sits
+    for column in ("minutes", "expected_goals", "expected_assists"):
+        players.loc[m, column] = players.loc[d, column]
+    players.loc[[d, m], "penalties_order"] = np.nan
+    players.loc[[d, m], "direct_freekicks_order"] = np.nan
+    players.loc[[d, m], "yellow_cards"] = 0
+    players.loc[[d, m], "red_cards"] = 0
+    work = players.loc[d, "minutes"] / 90 * 10.0
+    players.loc[[d, m], "defensive_contribution"] = work
+
+    # no clean sheet and no conceded charge, so a goal being worth six to one
+    # and five to the other is the only other difference, and it favours the
+    # defender in the same direction rather than against it
+    rate = component_rate(players, None)
+    assert rate[d] > rate[m]
+
+
+def test_a_keeper_gets_no_defensive_contribution(season: Season):
+    """He is not eligible for the category, so the work has to be worth nothing
+    to him rather than merely hard to reach."""
+    from fpl_manager.projections import component_rate
+
+    players = _editable(season)
+    keepers = players[(players["position"] == "GKP") & (players["minutes"] >= 900)]
+    if keepers.empty:
+        pytest.skip("needs a keeper with minutes")
+
+    k = keepers.index[0]
+    before = component_rate(players, None)[k]
+    players.loc[k, "defensive_contribution"] = players.loc[k, "minutes"] / 90 * 20
+    after = component_rate(players, None)[k]
+
+    assert after == pytest.approx(before)
+
+
+def test_a_red_card_costs_three_times_a_yellow(season: Season):
+    """Cards are the one linear term here, so the ratio between them is just the
+    scoring table and is worth pinning as such."""
+    from fpl_manager.projections import component_rate
+
+    players = _editable(season)
+    mids = players[(players["position"] == "MID") & (players["minutes"] >= 900)]
+    if mids.empty:
+        pytest.skip("needs a midfielder with minutes")
+
+    m = mids.index[0]
+    per_season = players.loc[m, "minutes"] / 90
+    players.loc[m, ["yellow_cards", "red_cards"]] = 0
+    clean = component_rate(players, None)[m]
+
+    players.loc[m, "yellow_cards"] = per_season
+    yellow = component_rate(players, None)[m] - clean
+    players.loc[m, ["yellow_cards", "red_cards"]] = [0, per_season]
+    red = component_rate(players, None)[m] - clean
+
+    assert yellow < 0 and red < 0, "a card costs points"
+    assert red == pytest.approx(3 * yellow)
+
+
+def test_no_penalty_turns_a_rate_negative(season: Season):
+    """Charges are subtracted from a rate, never used to make one. A player the
+    inputs cannot describe has to stay NaN so the caller falls back, rather than
+    arriving as a confident negative number nobody asked for."""
+    from fpl_manager.projections import component_rate, team_defence_rate
+
+    players = season.players.copy()
+    rate = component_rate(players, team_defence_rate(players))
+    described = rate.dropna()
+    assert (described >= 0).all(), "no player is worth less than nothing per 90"
+
+    # nothing played, everything charged
+    idle = players[players["minutes"] == 0].index[:1]
+    if len(idle):
+        players.loc[idle, ["yellow_cards", "red_cards", "defensive_contribution"]] = [9, 3, 400]
+        again = component_rate(players, team_defence_rate(players))
+        assert again[idle[0]] != again[idle[0]], "no minutes still means no rate"
+
+
+def test_a_missing_category_loses_one_term_not_the_rate(season: Season):
+    """The API is undocumented and a payload from before 2025/26 has no
+    defensive contribution in it at all. Losing that term is right, losing every
+    player's rate over it is not."""
+    from fpl_manager.projections import component_rate
+
+    players = season.players.copy()
+    if not players["minutes"].ge(900).any():
+        pytest.skip("needs somebody with minutes")
+
+    full = component_rate(players, None)
+    without = component_rate(
+        players.drop(
+            columns=[
+                "defensive_contribution",
+                "tackles",
+                "recoveries",
+                "clearances_blocks_interceptions",
+            ]
+        ),
+        None,
+    )
+
+    described = full.dropna().index
+    assert len(described), "the fixture should describe somebody"
+    assert without[described].notna().all(), "one missing column is not a missing rate"
+    assert (without[described] <= full[described] + 1e-9).all()
+
+
+def test_the_defensive_contribution_falls_back_to_its_parts(season: Season):
+    """`defensive_contribution` is the sum of the actions its position counts,
+    verified against the live payload, so rebuilding it from those parts has to
+    reproduce it. Recoveries are in the sum for everyone but defenders."""
+    from fpl_manager.projections import component_rate
+
+    players = season.players.copy()
+    if not players["minutes"].ge(900).any():
+        pytest.skip("needs somebody with minutes")
+
+    full = component_rate(players, None)
+    rebuilt = component_rate(players.drop(columns=["defensive_contribution"]), None)
+
+    described = full.dropna().index
+    pd.testing.assert_series_equal(full[described], rebuilt[described], atol=1e-9)
 
 
 def test_team_defence_is_read_off_the_keepers(season: Season):
@@ -560,7 +952,13 @@ def test_the_bundled_solver_is_preferred_over_a_hand_found_one():
     executable, which a `COIN_CMD` pointed at a path found by globbing does
     not. On Linux, where the wheel ships the binary without the execute bit,
     skipping it means every solve dies in `posix_spawn`.
+
+    The skip below is why CI runs on Linux. On Windows on ARM this test has
+    never once reached its assertion, so a skip there is the fallback doing its
+    job and a skip on Linux is this test quietly covering nothing.
     """
+    import sys
+
     import pulp
 
     from fpl_manager.optimiser import solver
@@ -568,6 +966,8 @@ def test_the_bundled_solver_is_preferred_over_a_hand_found_one():
     solver.cache_clear()
     try:
         if not pulp.PULP_CBC_CMD(msg=False).available():
+            if sys.platform.startswith("linux"):
+                pytest.fail("PuLP ships a Linux binary, so this must never skip in CI")
             pytest.skip("no bundled binary on this platform, which is the fallback's job")
         assert isinstance(solver(), pulp.PULP_CBC_CMD)
     finally:
