@@ -228,19 +228,21 @@ the first gameweek against the FPL site before trusting it.
 
 ## What it does not do
 
-- Plan two chips together, or weigh a chip now against a better week later than
-  the horizon reaches. Wildcard is priced over the rest of the horizon rather
-  than for one week, since you keep the squad, but the horizon still bounds it.
-- Plan transfers further than four gameweeks ahead. `plan` holds every week in
-  one problem, so it can bank a transfer or take a loss now to reach a player
-  later, but five weeks takes five or six seconds against under one for three.
-  It also chooses from a trimmed pool rather than the whole game.
-- Predict price changes. `prices` reads net transfers, which the API gives as a
-  running total rather than a rate, so somebody who took five days to gather
-  his looks identical to somebody who did it this morning. It is a watchlist.
 - Anything a press conference tells you. Rotation risk, a manager hinting at
   resting someone, a returning player easing back in: none of that is in the
   API. Treat the output as a ranked shortlist to argue with, not an answer.
+- Predict price changes. `prices` reads net transfers, which the API gives as a
+  running total rather than a rate, so somebody who took five days to gather
+  his looks identical to somebody who did it this morning. It is a watchlist.
+- Tell you which chip to play with any confidence. All four are priced, but each
+  is priced on its own, the horizon bounds the answer, and nothing knows which
+  ones you have already used.
+- Score a live gameweek that anybody has checked. The live view was written
+  before the season started, when the endpoints return nothing, so its bonus and
+  substitution logic has only ever run against synthetic data. Check it against
+  the FPL site the first time you use it in anger.
+
+`ROADMAP.md` has the rest, including what was considered and turned down.
 
 ## Tests
 

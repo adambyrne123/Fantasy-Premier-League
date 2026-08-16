@@ -423,6 +423,11 @@ Two things keep a cold boot survivable. `prior_season.parquet` is committed, so
 before the first page renders. And `FPL_CACHE_DIR` wants a persisted path in the
 app's settings, or every boot re-fetches the rest.
 
+Be honest about what that second one buys. The Community Cloud filesystem does
+not survive a container restart or a wake from sleep, so it makes reruns cheap
+within one container and nothing more. What actually keeps a cold boot fast is
+the committed parquet and a fresh start being two requests.
+
 Rejected, with reasons, so they do not get re-proposed:
 
 - **Tableau or any BI tool.** Ruled out by the user.
@@ -448,71 +453,20 @@ speculatively.
 
 ## Not built yet
 
-- Chips are advisory only, in `chips.py`. All four are priced per gameweek
-  across the horizon. Wildcard is the odd one, measured over every remaining
-  gameweek rather than one, since you keep the squad, so its gain falls the
-  later you play it and is not directly comparable with the other three. What
-  is missing is planning two chips together, any sense of a chip being worth
-  saving for a gameweek beyond the horizon, and the assistant manager chip.
-  Nothing reads which chips you have already used, either.
-- Variance. Everything is a point estimate, which matters most for captaincy
-  and Triple Captain, both of which are decisions about a ceiling rather than a
-  mean. A haul probability per player would be the smallest useful version and
-  wants the xG plumbing below first. Do not reach for a mean-variance or
-  chance-constrained MILP on a model this rough.
-- The rest of position-specific scoring. `component_rate` covers goals, assists
-  and clean sheets, which is most of where the positions differ. Saves are not
-  modelled, so a shot-stopper at a bad club reads the same as a spectator at a
-  good one, and `saves` is not parsed. Nor are cards, or the defensive
-  contribution points added in 2025/26. `corners_and_indirect_freekicks_order`
-  is parsed and unused, since a corner taker's assists are already in his xA.
-  `PENALTY_XG_P90` and `FREEKICK_XG_P90` are set by eye against how many spot
-  kicks a season produces, not fitted, so they are a starting point to tune.
-- Live scoring across a mini league. `live.py` scores your own squad and
-  `leagues.py` reads league tables, but nothing joins them to show what a whole
-  league is scoring in progress. The thing worth knowing when it is built is
-  that picks are immutable once a deadline passes, and only `event/{gw}/live/`
-  needs a short TTL, so a twenty manager league costs twenty long cached
-  requests fetched once per gameweek rather than twenty on every rerun.
-- Price change prediction is advisory only, in `prices.py`, and deliberately
-  does not reach the optimiser. Feeding expected price movement into the MILP
-  needs a points-per-0.1m exchange rate, and a wrong one quietly degrades squad
-  selection, which is a bad trade for a signal this rough. What is missing is
-  any sense of rate: the API gives a running total since the gameweek opened,
-  not a time series, so a player who took five days to gather his net transfers
-  looks identical to one who did it this morning. Fixing that means storing a
-  daily snapshot, which nothing does yet.
-- Multi-gameweek planning beyond four weeks. `plan_transfers` links the weeks
-  into one MILP, so it can roll a free transfer or take a loss now to reach a
-  player later, but five weeks takes five or six seconds against under a second
-  for three, and the app caps at `MAX_PLAN_WEEKS`. It also chooses from a
-  trimmed pool rather than the whole game. `ENABLER_SHARE` reserves part of
-  each position's places for the best points per million so the cheap enablers
-  survive the trim, but it is still a shortlist. Prices are held constant
-  across the horizon, which is the assumption most worth removing once
-  `prices.py` has a rate rather than a running total.
-- Deployment itself. The prerequisites are done: `prior_season.parquet` is
-  committed so a cold boot reads it instead of making 700 requests, and
-  `requirements.txt` is exported from `uv.lock`, since Community Cloud cannot
-  read uv lockfiles. Regenerate it whenever dependencies change, or the deploy
-  quietly drifts from what you test against:
+The backlog lives in `ROADMAP.md`, including the things that were considered and
+turned down, and why. Keep it there rather than here: this file is read in full
+every session and is long enough already.
 
-  ```bash
-  uv export --no-dev --extra app --no-hashes --no-emit-project \
-      --format requirements-txt -o requirements.txt
-  ```
+Three of those items will mislead you mid-task if you do not know them, so they
+are repeated here:
 
-  `--no-emit-project` matters. Community Cloud runs `streamlit run app.py` from
-  the checkout, so `fpl_manager` is already importable and emitting it would put
-  an unresolvable local file path in the file. What is left is outside the code,
-  being a git repo, a GitHub remote and the Community Cloud app itself. Set
-  `FPL_CACHE_DIR` to a writable path there or every rerun re-fetches. Be honest
-  about what that buys: the Community Cloud filesystem does not survive a
-  container restart or a wake from sleep, so it makes reruns cheap within one
-  container and nothing more. What keeps a cold boot fast is the committed
-  `prior_season.parquet` and a fresh start being two requests.
-- Continuous integration. Nothing runs the suite on a pull request, so a green
-  run is whatever the last person happened to do locally.
-- Refreshing the committed `prior_season.parquet` between seasons. Nothing does
-  it automatically, so in August it needs `--refresh` and a manual copy, or the
-  projection quietly rests on a season that is two years old.
+- **None of the live code has met a real match.** It was written pre-season, when
+  the live endpoints return nothing, so every test behind it runs on synthetic
+  payloads. The empty case is verified against the real API. The bonus ranking
+  and the substitution rule are not. Treat the first scored gameweek as the real
+  test.
+- **Nothing runs the suite on a pull request.** A green run is whatever the last
+  person happened to do locally. A CBC solver regression reached production this
+  way, and the test that catches it skips on Windows on ARM.
+- **`prior_season.parquet` needs a manual refresh between seasons**, or in August
+  the projection quietly rests on a season two years old.
