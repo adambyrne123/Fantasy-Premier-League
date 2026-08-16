@@ -5,6 +5,7 @@ python -m fpl_manager ticker --horizon 8
 python -m fpl_manager players --position MID --top 25
 python -m fpl_manager transfers --squad squad.json --free 1 --max 2
 python -m fpl_manager xi --squad squad.json
+python -m fpl_manager --formation 3-4-3 build
 python -m fpl_manager live --entry 1234567
 python -m fpl_manager find haaland
 """
@@ -18,7 +19,7 @@ import pandas as pd
 
 from . import chips, live
 from .api import FplApi
-from .data import Season
+from .data import FORMATIONS, OUTFIELD, Season, format_formation, parse_formation
 from .optimiser import MAX_PLAN_WEEKS, build_squad, pick_xi, plan_transfers, suggest_transfers
 from .prices import is_dormant, movers, price_pressure
 from .projections import BUNDLED_PRIOR, PRIOR_CACHE, load_prior, project
@@ -46,10 +47,23 @@ LIVE_COLS = ["name", "position", "club", "minutes", "points", "provisional_bonus
 PRICE_COLS = ["name", "position", "club", "price", "owners", "net_transfers", "pressure"]
 
 
-def _print_squad(result, label: str) -> None:
+def _shape(xi: pd.DataFrame, cost: float | None = None) -> str:
+    """The formation, and what pinning it cost if it was pinned.
+
+    Only worth saying when there is something to say, so a shape the solver
+    would have chosen anyway reads as a plain formation rather than as a
+    warning about nothing.
+    """
+    shape = format_formation(int((xi["position"] == pos).sum()) for pos in OUTFIELD)
+    if cost is None or cost > -0.05:
+        return shape
+    return f"{shape}, {-cost:.1f} pts behind the best shape"
+
+
+def _print_squad(result, label: str, cost: float | None = None) -> None:
     print(f"\n{label}")
     print(f"Cost {result.cost:.1f}m, projected {result.projected:.1f} pts")
-    print("\nStarting XI")
+    print(f"\nStarting XI ({_shape(result.xi, cost)})")
     print(_fmt(result.xi, SQUAD_COLS))
     print("\nBench, in order")
     print(_fmt(result.bench, SQUAD_COLS))
@@ -57,14 +71,18 @@ def _print_squad(result, label: str) -> None:
 
 
 def cmd_build(args, season, projections, by_gw):
-    result = build_squad(
-        projections,
+    formation = parse_formation(args.formation)
+    build = dict(
         budget_tenths=round(args.budget * 10),
         bench_weight=args.bench_weight,
         include=args.include,
         exclude=args.exclude,
     )
-    _print_squad(result, f"Squad for GW{season.next_gameweek} onwards")
+    result = build_squad(projections, formation=formation, **build)
+    # solved a second time only to price the override, so a run that did not
+    # ask for a shape pays nothing for the answer
+    cost = result.projected - build_squad(projections, **build).projected if formation else None
+    _print_squad(result, f"Squad for GW{season.next_gameweek} onwards", cost)
     if args.save:
         write_squad_file(
             args.save,
@@ -119,14 +137,18 @@ def cmd_transfers(args, season, projections, by_gw):
     free = args.free if args.free is not None else squad.free_transfers
     bank = round(args.bank * 10) if args.bank is not None else squad.bank_tenths
 
-    result = suggest_transfers(
-        projections,
+    formation = parse_formation(args.formation)
+    moves = dict(
         current_ids=squad.player_ids,
         selling_prices=squad.selling_prices,
         bank_tenths=bank,
         free_transfers=free,
         max_transfers=args.max,
         bench_weight=args.bench_weight,
+    )
+    result = suggest_transfers(projections, formation=formation, **moves)
+    cost = (
+        result.projected - suggest_transfers(projections, **moves).projected if formation else None
     )
     if result.transfers_in.empty:
         print("\nNo transfer improves the projection by more than it costs. Roll it.")
@@ -137,14 +159,16 @@ def cmd_transfers(args, season, projections, by_gw):
         print(_fmt(result.transfers_in, SQUAD_COLS))
         if result.hits:
             print(f"\nThis takes a hit of {result.hits * 4} points.")
-    _print_squad(result, "Resulting squad")
+    _print_squad(result, "Resulting squad", cost)
 
 
 def cmd_xi(args, season, projections, by_gw):
     squad = load_squad(season, args.squad, args.entry)
     frame = squad.frame(projections)
-    xi, bench, captain = pick_xi(frame)
-    print(f"\nGW{season.next_gameweek} lineup")
+    formation = parse_formation(args.formation)
+    xi, bench, captain = pick_xi(frame, formation=formation)
+    cost = xi["xpts_next"].sum() - pick_xi(frame)[0]["xpts_next"].sum() if formation else None
+    print(f"\nGW{season.next_gameweek} lineup ({_shape(xi, cost)})")
     print(_fmt(xi, SQUAD_COLS))
     print("\nBench, in order")
     print(_fmt(bench, SQUAD_COLS))
@@ -194,6 +218,7 @@ def cmd_plan(args, season, projections, by_gw):
         weeks=weeks,
         max_transfers_per_week=args.max,
         bench_weight=args.bench_weight,
+        formation=parse_formation(args.formation),
     )
 
     print(f"\nPlan over {len(plan.weeks)} gameweeks, projected {plan.projected:.1f} pts")
@@ -298,6 +323,11 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument("--refresh", action="store_true", help="ignore the cache")
     parser.add_argument("--bench-weight", type=float, default=0.12)
+    parser.add_argument(
+        "--formation",
+        choices=[format_formation(f) for f in FORMATIONS],
+        help="pin the shape of the XI instead of letting the solver choose it",
+    )
 
     sub = parser.add_subparsers(dest="command", required=True)
 

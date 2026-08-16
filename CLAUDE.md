@@ -31,7 +31,8 @@ uv run fpl-manager live --entry 1234567    # what your squad is scoring now
 ```
 
 Global flags live on the parent parser, not the subcommands. `--horizon`,
-`--no-prior`, `--refresh` and `--bench-weight` all go before the subcommand name.
+`--no-prior`, `--refresh`, `--bench-weight` and `--formation` all go before the
+subcommand name.
 
 Run `ruff check` and `pytest` before considering any change finished. Both are
 fast, so there is no reason to skip either.
@@ -96,6 +97,17 @@ them true, and `tests/test_pipeline.py` asserts each one.
 
 Constants live at the top of `data.py`: `SQUAD_LIMITS`, `XI_MIN`, `XI_MAX`,
 `BUDGET_TENTHS`, `MAX_PER_CLUB`. Import them, do not re-declare.
+
+**The formation is an outcome, not a constraint.** The XI rules above are a
+range, so the solver picks whatever shape scores most and the pitch caption
+counts it back off the chosen XI. On real data that is 5-4-1 nearly every time,
+which reads like a pin and is not one. Pass `formation` to `build_squad`,
+`suggest_transfers`, `plan_transfers` or `pick_xi` to overrule it, built with
+`parse_formation` from `FORMATIONS`, which is generated from `XI_MIN`/`XI_MAX`
+rather than listed. `formation=None` reproduces the free solve exactly and
+there is a test asserting it. `chips.py` is deliberately left free: a chip is
+priced against your normal week and both sides of that comparison have to
+choose their lineup the same way.
 
 ## Conventions
 

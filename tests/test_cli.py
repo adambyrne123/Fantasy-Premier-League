@@ -90,6 +90,36 @@ def test_a_subcommand_that_needs_a_squad_runs(wired, squad_file, capsys, argv):
     assert capsys.readouterr().out.strip()
 
 
+def test_a_pinned_formation_reaches_the_lineup(wired, squad_file, capsys):
+    """The flag is on the parent parser, so it goes before the subcommand."""
+    assert cli.main(["--horizon", "3", "--formation", "3-4-3", "xi", "--squad", squad_file]) == 0
+    assert "lineup (3-4-3" in capsys.readouterr().out
+
+
+def test_an_illegal_formation_is_refused_at_the_parser(wired, squad_file):
+    with pytest.raises(SystemExit):
+        cli.main(["--horizon", "3", "--formation", "2-5-3", "xi", "--squad", squad_file])
+
+
+def test_a_build_says_what_pinning_the_shape_cost(wired, capsys):
+    """A free build names its shape and owes nothing. Pinning a different one
+    does, and which shape that is depends on the season, so it is read off the
+    free run rather than guessed at."""
+    from fpl_manager.data import FORMATIONS, format_formation
+
+    assert cli.main(["--horizon", "3", "build"]) == 0
+    free = capsys.readouterr().out
+    assert "Starting XI (" in free
+    assert "behind the best shape" not in free
+
+    shapes = [format_formation(f) for f in FORMATIONS]
+    other = next(f for f in shapes if f"Starting XI ({f})" not in free)
+    assert cli.main(["--horizon", "3", "--formation", other, "build"]) == 0
+    out = capsys.readouterr().out
+    assert f"Starting XI ({other}," in out
+    assert "behind the best shape" in out
+
+
 def test_live_scores_the_gameweek_under_way(wired, squad_file, capsys):
     cli.main(["--horizon", "3", "live", "--squad", squad_file])
     out = capsys.readouterr().out

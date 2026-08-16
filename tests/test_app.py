@@ -550,6 +550,51 @@ def test_lowering_budget_is_handled(app):
     assert not at.exception
 
 
+def _formation_picker(at):
+    return next(s for s in at.sidebar.selectbox if s.label == "Formation")
+
+
+def test_the_pitch_reads_back_the_shape_the_solver_chose(app):
+    """Free by default, so the caption is a report rather than an instruction."""
+    at = app.run()
+    assert not at.exception
+    assert _formation_picker(at).value == "Best"
+    assert re.search(r"Formation \d-\d-\d<", _pitch(at))
+    assert "behind the best shape" not in _pitch(at)
+
+
+def test_pinning_a_formation_changes_the_pitch_and_says_what_it_cost(app):
+    """The override has to reach the solve, not just the caption.
+
+    Counting the shirt rows is what proves it did. A caption written from the
+    selector rather than from the XI would pass on the string alone.
+    """
+    at = app.run()
+    _formation_picker(at).set_value("3-4-3").run()
+    assert not at.exception
+
+    pitch = _pitch(at)
+    assert "Formation 3-4-3" in pitch
+    assert "pts behind the best shape" in pitch, "a shape it would not have chosen costs points"
+    # the pitch holds the XI in rows plus the bench in one more
+    rows = pitch.split('<div class="pitch-line">')[1:]
+    assert [row.count('<div class="shirt') for row in rows] == [1, 3, 4, 3, 4]
+
+
+def test_a_pinned_formation_reaches_the_transfer_pitches(app_with_squad):
+    """Now and After come from two different solves, so they are the likeliest
+    pair to disagree about the shape."""
+    at = _load_the_squad(app_with_squad.run())
+    _formation_picker(at).set_value("4-4-2").run()
+    assert not at.exception
+
+    compact = [m.value for m in at.markdown if 'class="pitch compact"' in m.value]
+    if not compact:
+        pytest.skip("no transfer worth making, so neither pitch is drawn")
+    assert len(compact) == 2
+    assert all("Formation 4-4-2" in p for p in compact)
+
+
 def test_player_pool_chart_is_built(app):
     """The scatter is the whole point of the Players tab.
 
