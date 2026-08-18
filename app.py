@@ -63,6 +63,9 @@ GLOSSARY = {
     "xpts_total": "Projected points added up across every gameweek in the "
     "horizon, which is the slider in the sidebar. Not comparable with the next "
     "gameweek figure beside it.",
+    "ep_next": "Fantasy Premier League's own projection for the next gameweek, "
+    "read straight off their API. It is here to disagree with ours, and it is "
+    "deliberately not an input to it.",
     "value": "Projected points over the horizon divided by today's price. What "
     "you get per million spent, which is what decides who can be afforded "
     "elsewhere in the squad.",
@@ -126,7 +129,14 @@ STAT_VIEWS = {
 }
 # read straight off the API rather than through the model, so they are the
 # check on it rather than a restatement of it
-EXTRA_STATS = ["form", "points_per_game", "total_points", "expected_goals", "expected_assists"]
+EXTRA_STATS = [
+    "form",
+    "points_per_game",
+    "total_points",
+    "expected_goals",
+    "expected_assists",
+    "ep_next",
+]
 # FPL sets its deadlines in UK time and shows them that way, so converting to
 # the server's timezone would disagree with the site people are playing on.
 UK = ZoneInfo("Europe/London")
@@ -134,6 +144,32 @@ UK = ZoneInfo("Europe/London")
 # point of difficulty the swing is inside the noise of FPL's own 1 to 5 rating.
 SWING_THRESHOLD = 0.6
 POSITION_COLOURS = {"GKP": "#FFB020", "DEF": "#00C2FF", "MID": "#00E87B", "FWD": "#FF4D6D"}
+# One colour per player being compared, held steady across every chart in that
+# section so the same person stays the same colour. The position palette's own
+# values, since a second set of greens and blues would invite reading position
+# into a chart that is not about position.
+COMPARE_COLOURS = ("#00E87B", "#00C2FF", "#FFB020", "#FF4D6D")
+# At most four rows, so the comparison can carry the whole projection at once
+# rather than making you switch views to see the rest of it. The stat views
+# above exist because the pool is hundreds of rows long, which this is not.
+COMPARE_COLUMNS = [
+    "price",
+    "xpts_next",
+    "ep_next",
+    "xpts_total",
+    "value",
+    "differential",
+    "ownership",
+    "fitness",
+]
+# The three terms the projection multiplies together, each on its own axis. A
+# shared axis would need normalising, and a normalised bar cannot tell you
+# whether 0.6 of a match is a lot.
+TERM_CHARTS = (
+    ("points_per_90", "Scoring rate", "Points per 90"),
+    ("minutes_share", "Expected minutes", "Share of a match"),
+    ("difficulty", "Fixture difficulty", "Average FDR, lower is easier"),
+)
 
 # Player photographs and club kits, served by the same CDNs the FPL site uses.
 # Nothing here fetches them: these are strings handed to the browser, so the
@@ -623,6 +659,7 @@ def pool_column_config(horizon: int, gw_cols: list[str], max_xpts: float) -> dic
         "club": st.column_config.TextColumn("Club", width="small"),
         "price": st.column_config.NumberColumn("Price", format="%.1f", width="small", **g("price")),
         "xpts_next": st.column_config.NumberColumn("xPts next", format="%.1f", **g("xpts_next")),
+        "ep_next": st.column_config.NumberColumn("FPL xPts", format="%.1f", **g("ep_next")),
         "xpts_total": st.column_config.ProgressColumn(
             f"xPts {horizon} GW",
             format="%.1f",
@@ -670,19 +707,18 @@ def pool_column_config(horizon: int, gw_cols: list[str], max_xpts: float) -> dic
     return config
 
 
-def pool_table(
+def pool_frame(
     view: pd.DataFrame,
     labels: pd.DataFrame,
     difficulty: pd.DataFrame,
     columns: list[str],
-    horizon: int,
-    key: str,
     images: pd.DataFrame | None = None,
-) -> int | None:
-    """The pool, with each player's fixture run beside his numbers.
+) -> tuple[pd.DataFrame, pd.DataFrame, list[str]]:
+    """A set of players with their fixture runs attached, and the run's colours.
 
-    Reading a projection without the run that produced it means holding two
-    tabs in your head at once. Returns the id of the selected player, or None.
+    Split out of `pool_table` because the comparison further down the tab wants
+    the same table over a different set of rows. A run coloured one way in one
+    place and another way twenty lines below is worse than either.
     """
     gw_cols = [f"GW{int(c)}" for c in labels.columns]
     table = view[["name", "position", "club", *columns]]
@@ -704,6 +740,24 @@ def pool_table(
         colours[gw_cols] = pd.DataFrame(
             [[fdr_css(v) for v in row] for row in fdr], index=table.index, columns=gw_cols
         )
+    return table, colours, gw_cols
+
+
+def pool_table(
+    view: pd.DataFrame,
+    labels: pd.DataFrame,
+    difficulty: pd.DataFrame,
+    columns: list[str],
+    horizon: int,
+    key: str,
+    images: pd.DataFrame | None = None,
+) -> int | None:
+    """The pool, with each player's fixture run beside his numbers.
+
+    Reading a projection without the run that produced it means holding two
+    tabs in your head at once. Returns the id of the selected player, or None.
+    """
+    table, colours, gw_cols = pool_frame(view, labels, difficulty, columns, images)
 
     selection = st.dataframe(
         table.style.apply(lambda _: colours, axis=None),
@@ -999,6 +1053,33 @@ def player_weeks(by_gameweek: pd.DataFrame, player_id: int) -> pd.DataFrame:
     return weeks
 
 
+def compare_weeks(
+    by_gameweek: pd.DataFrame, names: dict[int, str], events: list[int]
+) -> pd.DataFrame:
+    """Several players' runs on one frame, aligned gameweek by gameweek.
+
+    `player_weeks` drops a gameweek its player's club does not play in, which is
+    right for one run on its own and wrong beside another: the bars stop lining
+    up under each other and a blank reads as a week nobody asked about. Filling
+    the gap with a zero says what a blank actually scores.
+    """
+    frames = []
+    for pid, name in names.items():
+        weeks = player_weeks(by_gameweek, pid)
+        run = pd.DataFrame({"event": events})
+        run = (
+            run.merge(weeks[["event", "xpts", "fixture"]], on="event", how="left")
+            if not weeks.empty
+            else run.assign(xpts=pd.NA, fixture=pd.NA)
+        )
+        run["xpts"] = run["xpts"].fillna(0.0).astype(float)
+        run["fixture"] = run["fixture"].fillna("—")
+        run["label"] = "GW" + run["event"].astype(str)
+        run["name"] = name
+        frames.append(run)
+    return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+
+
 def zoomable(chart: alt.Chart, key: str) -> alt.Chart:
     """Hand the chart the mouse wheel only once it has been asked for.
 
@@ -1028,6 +1109,111 @@ def position_scale(frame: pd.DataFrame) -> alt.Scale:
     """
     present = [p for p in POSITIONS_IN_ORDER if p in set(frame["position"])]
     return alt.Scale(domain=present, range=[POSITION_COLOURS[p] for p in present])
+
+
+def compare_scale(names: list[str]) -> alt.Scale:
+    """A colour per compared player, the same one in every chart below."""
+    return alt.Scale(domain=names, range=list(COMPARE_COLOURS[: len(names)]))
+
+
+def compare_panel(
+    pool: pd.DataFrame,
+    ids: list[int],
+    by_gameweek: pd.DataFrame,
+    labels: pd.DataFrame,
+    difficulty: pd.DataFrame,
+    horizon: int,
+    images: pd.DataFrame | None = None,
+) -> None:
+    """Two to four players read against each other rather than one at a time.
+
+    A ranked list answers "who is best" and the question people actually have is
+    "which of these three", which the list can only answer by being read in
+    several passes. The totals come first because that is what is being argued
+    about, the runs second because that is usually what separates them, and the
+    three terms last because that is what says whether two similar totals are
+    the same bet.
+    """
+    picked = pool.loc[ids]
+    picked = picked.assign(
+        fitness=[availability(row)[1] or "No news" for _, row in picked.iterrows()]
+    )
+    names = [str(n) for n in picked["name"]]
+    scale = compare_scale(names)
+
+    table, colours, gw_cols = pool_frame(picked, labels, difficulty, COMPARE_COLUMNS, images)
+    st.dataframe(
+        table.style.apply(lambda _: colours, axis=None),
+        hide_index=True,
+        width="stretch",
+        column_config=pool_column_config(
+            horizon, gw_cols, float(max(picked["xpts_total"].max(), 1))
+        ),
+    )
+    st.caption(
+        "**FPL xPts** is Fantasy Premier League's own projection for the next gameweek. "
+        "It is theirs, not ours, and it is not an input to ours, so the players where the "
+        "two disagree are the ones worth a second look."
+    )
+
+    events = [int(c) for c in labels.columns]
+    weeks = compare_weeks(by_gameweek, dict(zip(ids, names, strict=True)), events)
+    if weeks.empty:
+        empty_state(
+            "No fixtures to compare",
+            "None of these clubs has a fixture inside the horizon, so there is no run to put "
+            "side by side. Widen the horizon in the sidebar.",
+        )
+    else:
+        st.altair_chart(
+            alt.Chart(weeks)
+            .mark_bar(cornerRadiusEnd=3)
+            .encode(
+                x=alt.X("label:N", title=None, sort=[f"GW{e}" for e in events]),
+                xOffset=alt.XOffset("name:N", sort=names),
+                y=alt.Y("xpts:Q", title="Projected points"),
+                color=alt.Color("name:N", title="Player", scale=scale),
+                tooltip=[
+                    alt.Tooltip("name:N", title="Player"),
+                    alt.Tooltip("label:N", title="Gameweek"),
+                    alt.Tooltip("fixture:N", title="Fixture"),
+                    alt.Tooltip("xpts:Q", title="xPts", format=".2f"),
+                ],
+            )
+            .properties(height=260)
+        )
+        st.caption(
+            "Upper case is at home, lower case away, and a double gameweek shows both. A bar "
+            "at zero is a blank rather than a week left out."
+        )
+
+    terms = picked[["name", "points_per_90", "minutes_share"]].assign(
+        difficulty=difficulty.reindex(picked["team"]).set_axis(picked.index).mean(axis=1)
+    )
+    for column, (field, heading, axis) in zip(st.columns(3), TERM_CHARTS, strict=True):
+        with column:
+            st.caption(heading)
+            st.altair_chart(
+                alt.Chart(terms)
+                .mark_bar(cornerRadiusEnd=3)
+                .encode(
+                    y=alt.Y("name:N", title=None, sort=names),
+                    x=alt.X(f"{field}:Q", title=axis),
+                    color=alt.Color("name:N", scale=scale, legend=None),
+                    tooltip=[
+                        alt.Tooltip("name:N", title="Player"),
+                        alt.Tooltip(f"{field}:Q", title=heading, format=".2f"),
+                    ],
+                )
+                .properties(height=150)
+            )
+    st.caption(
+        "The three terms the projection multiplies together, each on its own axis because a "
+        "normalised bar cannot say whether 0.6 of a match is a lot. Difficulty is FPL's own 1 "
+        "to 5 rating averaged over the run, which is what the fixture term is built from "
+        "rather than the term itself, and it is the one panel here where a shorter bar is "
+        "the better one."
+    )
 
 
 def name_lookup(projections: pd.DataFrame) -> dict[str, int]:
@@ -1325,6 +1511,10 @@ with players_tab:
         view = view[hay.str.contains(search.strip().lower(), regex=False)]
     view = view.sort_values(sort_by, ascending=False)
 
+    # above the empty guard because the comparison at the foot of the tab reads
+    # the same runs, and it works off the whole pool rather than this view
+    labels, difficulty = fixture_runs(season, horizon, stamp)
+
     # an empty filter result is an ordinary thing to do, not an error, so it
     # must not reach st.stop() and take the other four tabs down with it
     if view.empty:
@@ -1350,7 +1540,6 @@ with players_tab:
             f"Showing {len(shown)} of {len(view)} players, ranked by "
             f"{sort_by.replace('_', ' ')}. Click a row for the working behind the projection."
         )
-        labels, difficulty = fixture_runs(season, horizon, stamp)
         chosen = pool_table(shown, labels, difficulty, columns, horizon, key="pool", images=images)
 
         # only open on a change, or closing the dialog would reopen it at once
@@ -1413,6 +1602,35 @@ with players_tab:
                 )
                 .properties(height=430)
             )
+
+    st.divider()
+    st.subheader("Head to head")
+    st.caption(
+        "Three players who all look plausible is the ordinary transfer question, and a ranked "
+        "list can only answer it by being read several times over. Pick up to four to put "
+        "their numbers, their runs and the terms behind them beside each other. This list is "
+        "the whole pool, so the filters above do not narrow it."
+    )
+    compared = st.multiselect(
+        "Compare players",
+        sorted(lookup),
+        max_selections=4,
+        key="compare",
+        label_visibility="collapsed",
+        placeholder="Search for a player",
+    )
+    if not compared:
+        st.caption("Nobody picked yet.")
+    else:
+        compare_panel(
+            pool,
+            [lookup[n] for n in compared],
+            by_gameweek,
+            labels,
+            difficulty,
+            horizon,
+            images=images,
+        )
 
     st.divider()
     st.subheader("Price pressure")

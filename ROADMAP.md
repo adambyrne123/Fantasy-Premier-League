@@ -87,11 +87,6 @@ set by eye against how many spot kicks a season produces, not fitted. Only
 `order == 1` counts, so a second-choice taker gets nothing at all, which is wrong
 for the clubs that rotate them.
 
-**`ep_next` is parsed and shown nowhere.** It is FPL's own expected points.
-Rejected as a model input below, but a comparison column in the player drill-down
-is its one honest use and would be a few lines. Useful precisely because it
-disagrees.
-
 ### Planning and chips
 
 **Chips are advisory and independent.** All four are priced per gameweek across
@@ -190,7 +185,9 @@ caring about variance.
 
 **`ep_next` as a model input.** Consuming FPL's own expected points makes the
 projection partly a copy of theirs and destroys the ability to explain why a
-number is what it is. A comparison column is its only honest use.
+number is what it is. A comparison column is its only honest use, and it now has
+one in the head to head section of the Players tab, where it sits beside ours and
+is read by nothing else.
 
 **ICT index, influence, creativity, threat.** Composites built from the same
 underlying events as expected goals and assists, on an uninterpretable scale, and

@@ -545,6 +545,10 @@ speculatively.
 - Bypass the cache in `api.py` by calling `requests` directly.
 - Hardcode gameweek numbers or the current season. Use `Season.next_gameweek`
   and `Season.gameweeks_played`.
+- Read `ep_next` from anywhere but the front end. It is FPL's own projection,
+  displayed in the head to head section of the Players tab so it can disagree
+  with ours. Consuming it would make our projection partly a copy of theirs and
+  take away the ability to say why a number is what it is.
 - Overstate what the model does. It produces a ranked shortlist to argue with.
   Rotation risk, press conference hints and minutes management are not in the
   API and the output should not imply otherwise.
