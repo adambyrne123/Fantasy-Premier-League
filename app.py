@@ -18,6 +18,7 @@ import pandas as pd
 import streamlit as st
 
 from fpl_manager.api import FplApi
+from fpl_manager.captaincy import HAUL_POINTS, haul_frame, points_pmf
 from fpl_manager.chips import best_per_chip
 from fpl_manager.chips import evaluate as evaluate_chips
 from fpl_manager.data import (
@@ -38,7 +39,7 @@ from fpl_manager.optimiser import (
     suggest_transfers,
 )
 from fpl_manager.prices import is_dormant, movers, price_pressure
-from fpl_manager.projections import load_prior, project
+from fpl_manager.projections import COMPONENT_MINUTES, load_prior, project
 from fpl_manager.roi import LAST_SEASON, MIN_MINUTES, NOTHING_YET, points_source, roi_frame
 from fpl_manager.squad import (
     MySquad,
@@ -78,9 +79,25 @@ GLOSSARY = {
     "minutes_share": "Expected share of a full match, so 0.85 means he is "
     "worth about 76 minutes. Built from how often he starts rather than from "
     "his minutes total, which would cancel against the rate beside it.",
-    "start_rate": "How often he started last season, shrunk towards what his "
-    "price implies. Price is the only input here that is not last season's "
-    "minutes, which is what lets his rate and his role move separately.",
+    "start_rate": "How often he started last season, straight from his starts "
+    "and the games available. The shrunk version the model actually uses is "
+    "the start chance beside it.",
+    "start_chance": "Chance he starts, from how often he has started shrunk "
+    "towards what his price implies, and cut by any published doubt over his "
+    "fitness. The rest of the minutes term is the chance he comes off the "
+    "bench instead, and what is left after both is the chance he does not "
+    "feature at all.",
+    "xpts_gw": "Projected points in the chosen gameweek. The same projection "
+    "as everywhere else, so it includes the clean sheets, saves, defensive "
+    "contributions and cards that the two chances beside it leave out.",
+    "haul_chance": "Chance of ten or more points from goals, assists and "
+    "appearance points in this gameweek, both fixtures counted if he has two. "
+    "Bonus is not in the model at all, and a clean sheet and a defensive "
+    "contribution are not in this number, so for a defender it is not his "
+    "haul chance but his attacking one, and it reads low.",
+    "return_chance": "Chance of at least one goal or assist in this gameweek. "
+    "The floor beside the ceiling: a player can be a poor haul bet and a good "
+    "bet to do something.",
     "prior_p90": "Last season's points per 90, before this season is blended in.",
     "component_p90": "Points per 90 rebuilt from what FPL pays for rather than "
     "read back off what he scored: expected goals and assists, the club's clean "
@@ -438,6 +455,17 @@ def load_roi(_season: Season, projections: pd.DataFrame, stamp: str) -> pd.DataF
     return roi_frame(_season, projections)
 
 
+@st.cache_data(show_spinner="Working out haul chances")
+def load_captaincy(
+    _season: Season,
+    projections: pd.DataFrame,
+    by_gameweek: pd.DataFrame,
+    event: int,
+    stamp: str,
+) -> pd.DataFrame:
+    return haul_frame(_season, projections, by_gameweek, event=event)
+
+
 @st.cache_data(show_spinner="Projecting")
 def load_projections(
     _season: Season, horizon: int, use_prior: bool, stamp: str
@@ -679,6 +707,16 @@ def pool_column_config(horizon: int, gw_cols: list[str], max_xpts: float) -> dic
             "Mins share", format="%.2f", **g("minutes_share")
         ),
         "start_rate": st.column_config.NumberColumn("Start rate", format="%.2f", **g("start_rate")),
+        "start_chance": st.column_config.NumberColumn(
+            "Start chance", format="%.2f", **g("start_chance")
+        ),
+        "xpts_gw": st.column_config.NumberColumn("xPts GW", format="%.1f", **g("xpts_gw")),
+        "haul_chance": st.column_config.NumberColumn(
+            f"{HAUL_POINTS}+ pts", format="percent", **g("haul_chance")
+        ),
+        "return_chance": st.column_config.NumberColumn(
+            "Any return", format="percent", **g("return_chance")
+        ),
         "prior_p90": st.column_config.NumberColumn(
             "Last season p90", format="%.2f", **g("prior_p90")
         ),
@@ -1239,6 +1277,7 @@ if st.sidebar.button("Refresh FPL data", width="stretch"):
     load_projections.clear()
     load_prices.clear()
     load_roi.clear()
+    load_captaincy.clear()
     cached_prior.clear()
 st.sidebar.caption("Prices change daily. Refreshing refetches for everyone on the app.")
 
@@ -1328,6 +1367,7 @@ status_bar(season, len(projections))
 (
     build_tab,
     players_tab,
+    captain_tab,
     roi_tab,
     fixtures_tab,
     transfers_tab,
@@ -1335,10 +1375,12 @@ status_bar(season, len(projections))
     leagues_tab,
     live_tab,
 ) = st.tabs(
-    # Live goes last deliberately. `tests/test_app.py` finds the player pool by
-    # looking for the first dataframe with a GW column, so a tab rendering one
-    # ahead of it would shadow the pool and fail several tests confusingly.
-    ["Squad", "Players", "ROI", "Fixtures", "Transfers", "Chips", "Leagues", "Live"]
+    # Anything rendering a fixture run goes after Players, and Live goes last.
+    # `tests/test_app.py` finds the player pool by looking for a dataframe with
+    # a GW column, so a tab putting one ahead of Players would shadow the pool
+    # and fail several tests confusingly. Captain renders a run too, which is
+    # why it sits where it does rather than beside the Squad it is about.
+    ["Squad", "Players", "Captain", "ROI", "Fixtures", "Transfers", "Chips", "Leagues", "Live"]
 )
 
 with build_tab:
@@ -1679,6 +1721,146 @@ with players_tab:
             "Price moves are not in the projection. A rise is worth chasing only if you "
             "wanted the player anyway."
         )
+
+with captain_tab:
+    st.subheader("Captain")
+    how_to_read(
+        "Everywhere else in this app is a point estimate, which is the right "
+        "shape for deciding who to own and the wrong shape for deciding who to "
+        "captain. The armband is a bet on a ceiling, not on an average, and "
+        "two players projected at the same six points are not the same bet if "
+        "one gets there off a steady floor and the other off a one in six "
+        "chance of a double.\n\n"
+        f"- **{HAUL_POINTS}+ pts** is the chance of a haul: goals, assists and "
+        "appearance points reaching double figures, counting both matches if "
+        "his club has two that week.\n"
+        "- **Any return** is the chance of at least one goal or assist. Read it "
+        "as the floor under the ceiling beside it.\n"
+        "- **The scatter** is the point of the tab. Players off the diagonal "
+        "are the ones where the projection and the ceiling disagree, and they "
+        "are the armband decisions worth thinking about.\n\n"
+        "Three things are deliberately not in these two numbers, and they "
+        "matter:\n\n"
+        "- **Bonus**, which the model has no term for anywhere. A real ten "
+        "point week for a forward is a goal, an assist and three bonus. Here "
+        "that is nine and does not clear the bar, so the haul chance sits "
+        "below the real thing rather than at it.\n"
+        "- **Clean sheets, saves and defensive contributions.** So for a "
+        "keeper or a defender this is not a haul chance at all, only an "
+        "attacking one, which is why the filter starts on midfielders and "
+        "forwards.\n"
+        "- **Any agreement with the xPts column.** That figure blends what a "
+        "player has been scoring against what he is expected to do, and this "
+        "uses the expected side at full weight. They will not add up, and "
+        "making them add up would mean throwing away one of the two."
+    )
+
+    events = sorted(int(e) for e in by_gameweek["event"].dropna().unique())
+    if not events:
+        empty_state(
+            "No fixtures to captain into",
+            "There is no gameweek in the horizon to put a distribution on. Widen the "
+            "horizon in the sidebar, or wait for the fixtures to be published.",
+        )
+    else:
+        picked_gw = st.selectbox(
+            "Gameweek", events, format_func=lambda e: f"GW{e}", key="captain_gw"
+        )
+        haul = load_captaincy(season, projections, by_gameweek, picked_gw, stamp)
+
+    if events and haul.empty:
+        empty_state(
+            "Not enough of this season yet",
+            "A haul chance is built from this season's expected goals and assists, and "
+            f"nobody has the {COMPONENT_MINUTES} minutes of it that takes. Before the "
+            "first deadline the API is still serving last season's figures under the "
+            "same names, so this stays empty on purpose rather than handing you a year "
+            "old number that looks current. It fills in around the fourth gameweek.",
+        )
+    elif events:
+        wanted = st.multiselect(
+            "Positions",
+            ["GKP", "DEF", "MID", "FWD"],
+            default=["MID", "FWD"],
+            help="Defenders and keepers score most of their points from clean sheets, "
+            "which is not in these two numbers.",
+            key="captain_positions",
+        )
+        view = haul[haul["position"].isin(wanted or ["GKP", "DEF", "MID", "FWD"])]
+
+        if view.empty:
+            empty_state(
+                "Nobody in those positions",
+                "No player in the positions chosen has played enough of this season to "
+                "put a distribution on. Add a position back to see the rest.",
+            )
+        else:
+            labels, difficulty = fixture_runs(season, horizon, stamp)
+            shown = projections.loc[view.index].join(
+                view[["xpts_gw", "haul_chance", "return_chance"]]
+            )
+            st.caption(
+                f"Top {min(len(shown), 40)} of {len(shown)} by haul chance for GW{picked_gw}. "
+                "Both chances are goals and assists only."
+            )
+            pool_table(
+                shown.head(40),
+                labels,
+                difficulty,
+                ["price", "xpts_gw", "haul_chance", "return_chance", "ownership"],
+                horizon,
+                key="captain_pool",
+                images=images,
+            )
+
+            st.divider()
+            st.caption(
+                "Projected points against the chance of a haul. Along the line the two "
+                "agree; above it is a player whose ceiling the average is hiding."
+            )
+            plot = shown.head(60).reset_index()
+            st.altair_chart(
+                alt.Chart(plot)
+                .mark_circle(size=110, opacity=0.75)
+                .encode(
+                    x=alt.X("xpts_gw:Q", title=f"Projected points, GW{picked_gw}"),
+                    y=alt.Y(
+                        "haul_chance:Q",
+                        title=f"Chance of {HAUL_POINTS}+",
+                        axis=alt.Axis(format="%"),
+                    ),
+                    color=alt.Color("position:N", title="Position"),
+                    tooltip=[
+                        alt.Tooltip("name:N", title="Player"),
+                        alt.Tooltip("club:N", title="Club"),
+                        alt.Tooltip("xpts_gw:Q", title="xPts", format=".2f"),
+                        alt.Tooltip("haul_chance:Q", title=f"{HAUL_POINTS}+", format=".1%"),
+                        alt.Tooltip("return_chance:Q", title="Any return", format=".1%"),
+                    ],
+                )
+                .interactive()
+            )
+
+            best = list(shown.head(3).index)
+            spread = points_pmf(season, projections, by_gameweek, best, event=picked_gw)
+            if not spread.empty:
+                st.caption(
+                    "The distribution behind the top three, one bar per points total. "
+                    "The tail on the right is what the armband is actually buying."
+                )
+                # `player` rather than `name`, which the comparison charts on the
+                # Players tab colour by and which `tests/test_app.py` counts
+                # across every chart on the page
+                spread = spread.assign(player=spread["id"].map(projections["name"]))
+                st.altair_chart(
+                    alt.Chart(spread)
+                    .mark_bar(opacity=0.7)
+                    .encode(
+                        x=alt.X("points:Q", title="Points"),
+                        y=alt.Y("probability:Q", title="Chance", axis=alt.Axis(format="%")),
+                        color=alt.Color("player:N", title="Player"),
+                    )
+                )
 
 with roi_tab:
     st.subheader("Return on investment")

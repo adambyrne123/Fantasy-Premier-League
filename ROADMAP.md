@@ -49,14 +49,6 @@ id gives the real bench order and the real armband.
 
 ### Model
 
-**Captaincy risk.** Everything is a point estimate. That matters least for the
-fifteenth pick and most for the captain and Triple Captain, which are decisions
-about a ceiling rather than a mean. The smallest useful version is a haul
-probability per player from expected goal involvements through a closed-form
-Poisson, attached to a captaincy view and nothing else. Phase 5 put the xG
-plumbing in, so this is now unblocked. Do not thread it through the objective;
-see the rejected list.
-
 **Position-specific scoring is complete, with two loose ends.**
 `component_rate` now covers every category FPL pays for.
 `corners_and_indirect_freekicks_order` is parsed and deliberately unused, since a
@@ -85,7 +77,10 @@ reparametrises a fixture every test depends on, so it is its own piece of work.
 **Set piece constants are guesses.** `PENALTY_XG_P90` and `FREEKICK_XG_P90` are
 set by eye against how many spot kicks a season produces, not fitted. Only
 `order == 1` counts, so a second-choice taker gets nothing at all, which is wrong
-for the clubs that rotate them.
+for the clubs that rotate them. They now feed a tail as well as a mean, since
+`captaincy.py` reads the same `attacking_rates`, and being wrong about a rate
+costs more in a haul chance than in a projection: an error in the rate moves
+the mean linearly and the chance of two goals roughly quadratically.
 
 ### Planning and chips
 
@@ -180,8 +175,13 @@ a wrong one quietly degrades squad selection, which is a bad trade for a signal
 this rough. Build the rate, surface it, stop there.
 
 **Mean-variance or chance-constrained objectives.** Precision theatre on a model
-this rough. A haul probability on a captaincy view is the useful version of
-caring about variance.
+this rough. The useful version of caring about variance is the Captain tab,
+which prices the ceiling separately and leaves the objective a mean. It is
+deliberately not wired into the optimiser: a squad picked partly on a
+distribution nobody can see is one you cannot argue with, which is the whole
+thing this tool is for. `tests/test_pipeline.py` parses the imports and fails
+if `captaincy.py` reaches any module that chooses a squad, so this stays
+decided rather than needing to be re-argued.
 
 **`ep_next` as a model input.** Consuming FPL's own expected points makes the
 projection partly a copy of theirs and destroys the ability to explain why a

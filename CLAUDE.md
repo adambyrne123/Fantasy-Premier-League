@@ -35,6 +35,7 @@ uv run fpl-manager ticker --horizon 8
 uv run fpl-manager players --position MID --top 25 --sort value
 uv run fpl-manager transfers --squad squad.json --free 1 --max 2
 uv run fpl-manager xi --squad squad.json
+uv run fpl-manager captains --top 20    # haul chances for the armband
 uv run fpl-manager find salah              # resolve player ids by name
 uv run fpl-manager chips --squad squad.json   # when to play each chip
 uv run fpl-manager live --entry 1234567    # what your squad is scoring now
@@ -53,12 +54,12 @@ Data flows one way. Nothing downstream writes back.
 
 ```
 api.py  ──▶  data.py  ──▶  projections.py  ──▶  optimiser.py  ──▶  cli.py
-             │  │  │           ▲                       ▲
-             │  │  ▼       squad.py                chips.py
-             │  │ prices.py  (current holdings)   (chip timing)
-             │  ▼
-             │ live.py  (in-play scoring, this gameweek only)
-             ▼
+             │  │  │        │  ▲                       ▲
+             │  │  ▼        ▼ squad.py             chips.py
+             │  │ prices.py │ (current holdings)   (chip timing)
+             │  ▼           ▼
+             │ live.py    captaincy.py
+             ▼ (in-play)  (haul chances)
           (raw frames)
 ```
 
@@ -72,6 +73,7 @@ api.py  ──▶  data.py  ──▶  projections.py  ──▶  optimiser.py  
 | `prices.py` | Who is close to a price rise or fall. | Anything the points model reads |
 | `live.py` | In-play scoring: live stats, provisional bonus, autosubs. | Anything forward looking, and any selection logic |
 | `roi.py` | Points already returned per million. | Projections, which look forward |
+| `captaincy.py` | Haul and return chances for the armband. Distributions, not point estimates. | Anything the optimiser reads. It is a leaf on purpose |
 | `squad.py` | Loading the user's 15, bank, selling prices. | Projections or optimisation |
 | `leagues.py` | Public manager profiles and classic league tables. | Anything that scores or ranks players |
 | `cli.py` | Argument parsing and printing. | Model logic of any kind |
@@ -81,6 +83,14 @@ api.py  ──▶  data.py  ──▶  projections.py  ──▶  optimiser.py  
 `chips.py` may not import it. They look forward on a six hour cache, it looks at
 the last sixty seconds, and joining the two puts numbers that disagree on the
 same screen. Live points are a realised outcome, not evidence for a projection.
+
+**`captaincy.py` is a leaf for the opposite reason.** Nothing that picks a
+squad may import it. The objective is a mean, and a variance term in it was
+argued out once already and turned down as precision theatre on a model this
+rough. A haul chance read beside the projection is the useful version of caring
+about variance, and one folded into the objective is a squad the user cannot
+argue with. Both leaf rules now have tests in `tests/test_pipeline.py` that
+parse the imports, so neither can be undone by accident.
 
 `Season` (in `data.py`) is the single object holding a loaded season. Pass it
 around rather than re-instantiating, since construction does two API calls.

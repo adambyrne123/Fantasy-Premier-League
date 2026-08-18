@@ -5,7 +5,9 @@ If you add a constraint to `optimiser.py`, add the test that proves it holds.
 
 from __future__ import annotations
 
+import ast
 import math
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
@@ -891,6 +893,75 @@ def test_projection_survives_missing_prior_data(season: Season):
     assert (projections["points_per_90"] >= 0).all()
 
 
+def test_the_minutes_mixture_adds_back_up_to_the_minutes_share(projections: pd.DataFrame):
+    """The model wants the minutes term as one number and `captaincy.py` wants
+    it as the two it is made of. The moment those stop being the same number,
+    one screen is quietly disagreeing with another about how much a player
+    plays, and neither says which one to believe."""
+    from fpl_manager.projections import SUB_SHARE
+
+    rebuilt = (
+        projections["start_chance"] * projections["starter_minutes"]
+        + projections["sub_chance"] * SUB_SHARE
+    )
+    assert (rebuilt - projections["minutes_share"]).abs().max() < 1e-12
+    assert projections["start_chance"].between(0, 1).all()
+    assert projections["starter_minutes"].between(0, 1).all()
+    # what is left over is the chance he does not feature at all
+    assert ((projections["start_chance"] + projections["sub_chance"]) <= 1 + 1e-12).all()
+
+
+def test_the_mixture_leaves_out_anyone_who_is_not_playing(
+    season: Season, projections: pd.DataFrame
+):
+    """An injured player keeps no chance of coming off the bench either. A
+    mixture that split the share without carrying the availability cut into
+    both branches would hand him a cameo, and a haul chance with it."""
+    injured = season.players.index[season.players["status"] == "i"]
+    assert (projections.loc[injured, "start_chance"] == 0).all()
+    assert (projections.loc[injured, "sub_chance"] == 0).all()
+
+
+def test_the_attacking_rates_are_the_ones_the_component_rate_uses():
+    """One definition of expected goals per 90. Two is how the Players tab and
+    the Captain tab come to disagree about the same forward."""
+    from fpl_manager.projections import (
+        COMPONENT_MINUTES,
+        GOAL_POINTS,
+        PENALTY_XG_P90,
+        attacking_rates,
+        component_rate,
+    )
+
+    players = pd.DataFrame(
+        {
+            "minutes": [900.0, float(COMPONENT_MINUTES - 1)],
+            "expected_goals": [5.0, 5.0],
+            "expected_assists": [2.0, 2.0],
+            "penalties_order": [1.0, 1.0],
+            "direct_freekicks_order": [np.nan, np.nan],
+            "position": ["MID", "MID"],
+        },
+        index=[1, 2],
+    )
+    rates = attacking_rates(players)
+    assert rates.loc[1, "xg90"] == pytest.approx(5.0 / 10 + PENALTY_XG_P90, abs=1e-12)
+    assert rates.loc[1, "xa90"] == pytest.approx(2.0 / 10, abs=1e-12)
+    assert bool(rates.loc[1, "played_enough"])
+
+    # below the gate what is left is the set piece duty on its own, zero rather
+    # than NaN, so the term drops out instead of taking the component with it
+    assert rates.loc[2, "xg90"] == pytest.approx(PENALTY_XG_P90, abs=1e-12)
+    assert rates.loc[2, "xa90"] == 0.0
+    assert not bool(rates.loc[2, "played_enough"])
+
+    # and the component rate is reading these rather than keeping its own copy
+    bumped = players.copy()
+    bumped.loc[1, "expected_goals"] = 6.0
+    moved = component_rate(bumped, None)[1] - component_rate(players, None)[1]
+    assert moved == pytest.approx(GOAL_POINTS["MID"] * 0.1, abs=1e-9)
+
+
 # ----------------------------------------------------------------------
 # squad building: these are game rules, not preferences
 # ----------------------------------------------------------------------
@@ -1489,3 +1560,65 @@ def test_the_planning_pool_still_keeps_the_best_players(projections: pd.DataFram
     for pos in ("GKP", "DEF", "MID", "FWD"):
         best = playing[playing["position"] == pos].nlargest(5, "xpts_total").index
         assert all(i in pool.index for i in best), f"{pos} lost a top scorer"
+
+
+# ----------------------------------------------------------------------
+# module boundaries: which module is allowed to know about which
+# ----------------------------------------------------------------------
+PACKAGE = Path(__file__).resolve().parent.parent / "fpl_manager"
+
+
+def _imports_of(module: str) -> set[str]:
+    """Every module inside the package that this one imports.
+
+    Parsed rather than imported, so asking the question does not itself create
+    the dependency, and rather than scanned for substrings, because an import
+    is a shape the grammar already knows how to find.
+    """
+    tree = ast.parse((PACKAGE / f"{module}.py").read_text(encoding="utf-8"))
+    found: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom):
+            if node.level and node.module is None:  # from . import x
+                found.update(alias.name for alias in node.names)
+            elif node.level and node.module:  # from .x import y
+                found.add(node.module.split(".")[0])
+            elif node.module and node.module.startswith("fpl_manager."):
+                found.add(node.module.split(".")[1])
+        elif isinstance(node, ast.Import):
+            for alias in node.names:
+                if alias.name.startswith("fpl_manager."):
+                    found.add(alias.name.split(".")[1])
+    return found
+
+
+def test_the_haul_model_is_a_leaf():
+    """Nothing that chooses a squad may read the haul chances.
+
+    This is the whole reason `captaincy.py` is its own module. A variance term
+    in the objective was argued out once already and turned down: it is
+    precision theatre on a model this rough, and a squad picked partly on a
+    distribution nobody can see is one the user cannot argue with. The useful
+    version of caring about variance is a haul chance on a captaincy view, read
+    beside the projection rather than folded into it. Left as a note in a file,
+    that argument would be relitigated within the year, so it is a test.
+    """
+    for module in ("optimiser", "chips", "projections", "data", "live", "roi", "squad"):
+        assert "captaincy" not in _imports_of(module), f"{module}.py reached for the haul model"
+
+
+def test_captaincy_imports_only_what_it_is_allowed_to():
+    """It reads the rates and the season, and nothing else in the package."""
+    assert _imports_of("captaincy") <= {"data", "projections"}
+
+
+def test_live_stays_a_leaf():
+    """Stated in `CLAUDE.md` and until now checked by nothing.
+
+    The forward looking modules run on a six hour cache and `live.py` looks at
+    the last sixty seconds. Joining them puts two numbers that disagree on the
+    same screen, and a realised score is an outcome rather than evidence for a
+    projection.
+    """
+    for module in ("projections", "optimiser", "chips", "captaincy"):
+        assert "live" not in _imports_of(module), f"{module}.py imported live scoring"

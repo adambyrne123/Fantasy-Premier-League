@@ -69,6 +69,7 @@ uv run fpl-manager find salah                      # look up player ids
 uv run fpl-manager transfers --squad squad.json --free 1 --max 2
 uv run fpl-manager plan --squad squad.json --weeks 3   # several weeks at once
 uv run fpl-manager xi --squad squad.json           # lineup and captain
+uv run fpl-manager captains --top 20               # haul chances for the armband
 uv run fpl-manager chips --squad squad.json        # when to play each chip
 uv run fpl-manager prices                          # who is close to moving
 uv run fpl-manager live --entry 1234567            # what you are scoring now
@@ -202,6 +203,34 @@ sit at the top of `projections.py` if you want a different shape.
 Because the projection is built per fixture rather than per gameweek, doubles
 and blanks come out correctly without any special casing. A club with two
 fixtures in a gameweek gets two contributions, a club with none gets zero.
+
+## Captaincy is a different question
+
+The projection above is an average, which is the right shape for deciding who to
+own and the wrong shape for deciding who to captain. The armband is a bet on a
+ceiling: two players projected at the same six points are not the same bet if
+one gets there off a steady floor and the other off a one in six chance of a
+double.
+
+So the Captain tab puts a distribution on the part of a gameweek that swings.
+Goals and assists as independent Poissons on the same expected rates the
+projection uses, drawn per fixture so a double gameweek is counted rather than
+special-cased, and mixed over whether a player starts, comes on or does not
+feature. Two numbers come out: the chance of ten or more points, and the chance
+of at least one goal or assist.
+
+Read them for what they are. Neither includes bonus, which the model has no term
+for anywhere, so a forward's goal and assist is nine points here and twelve on
+the real thing. Neither includes clean sheets or defensive contributions, so for
+a defender this is an attacking haul chance rather than a haul chance, and the
+tab starts filtered to midfielders and forwards for that reason. And neither
+will add up to the xPts column beside it, because that blends what a player has
+been scoring against what he is expected to do while this uses the expected side
+alone. Making the two agree would mean throwing one of them away.
+
+It is deliberately not wired into squad selection. A squad picked partly on a
+distribution you cannot see is one you cannot argue with, and arguing with it is
+what this is for.
 
 ## How the selection works
 

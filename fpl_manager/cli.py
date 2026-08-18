@@ -5,6 +5,7 @@ python -m fpl_manager ticker --horizon 8
 python -m fpl_manager players --position MID --top 25
 python -m fpl_manager transfers --squad squad.json --free 1 --max 2
 python -m fpl_manager xi --squad squad.json
+python -m fpl_manager captains --top 20
 python -m fpl_manager --formation 3-4-3 build
 python -m fpl_manager live --entry 1234567
 python -m fpl_manager find haaland
@@ -17,12 +18,12 @@ import sys
 
 import pandas as pd
 
-from . import chips, live
+from . import captaincy, chips, live
 from .api import FplApi
 from .data import FORMATIONS, OUTFIELD, Season, format_formation, parse_formation
 from .optimiser import MAX_PLAN_WEEKS, build_squad, pick_xi, plan_transfers, suggest_transfers
 from .prices import is_dormant, movers, price_pressure
-from .projections import BUNDLED_PRIOR, PRIOR_CACHE, load_prior, project
+from .projections import BUNDLED_PRIOR, COMPONENT_MINUTES, PRIOR_CACHE, load_prior, project
 from .squad import MySquad, load_squad, write_squad_file
 
 
@@ -45,6 +46,16 @@ def _fmt(df: pd.DataFrame, cols: list[str]) -> str:
 SQUAD_COLS = ["name", "position", "club", "price", "xpts_next", "xpts_total", "ownership"]
 LIVE_COLS = ["name", "position", "club", "minutes", "points", "provisional_bonus", "bps"]
 PRICE_COLS = ["name", "position", "club", "price", "owners", "net_transfers", "pressure"]
+CAPTAIN_COLS = [
+    "name",
+    "position",
+    "club",
+    "price",
+    "opponents",
+    "xpts_gw",
+    "haul_chance",
+    "return_chance",
+]
 
 
 def _shape(xi: pd.DataFrame, cost: float | None = None) -> str:
@@ -173,6 +184,24 @@ def cmd_xi(args, season, projections, by_gw):
     print("\nBench, in order")
     print(_fmt(bench, SQUAD_COLS))
     print(f"\nCaptain: {captain['name']}")
+
+
+def cmd_captains(args, season, projections, by_gw):
+    table = captaincy.haul_frame(season, projections, by_gw, event=args.gameweek)
+    if table.empty:
+        print("\nNot enough of this season has been played to put a distribution on")
+        print(f"anybody. This wants a finished gameweek and {COMPONENT_MINUTES} minutes of it")
+        print("per player, so it fills in around the fourth.")
+        return
+
+    if args.position:
+        table = table[table["position"] == args.position.upper()]
+    print(f"\nCaptaincy for GW{int(table['event'].iloc[0])}, best haul chance first")
+    print(_fmt(table.head(args.top).reset_index(drop=True), CAPTAIN_COLS))
+    print(f"\nHaul is {captaincy.HAUL_POINTS} or more points from goals and assists alone.")
+    print("Bonus is not in the model at all, and a defender's clean sheet and his")
+    print("defensive contribution are not in these two numbers, so they will not add")
+    print("up to the xPts beside them and they read low for a defender.")
 
 
 def cmd_chips(args, season, projections, by_gw):
@@ -365,6 +394,12 @@ def main(argv: list[str] | None = None) -> int:
     x.add_argument("--squad")
     x.add_argument("--entry", type=int)
     x.set_defaults(func=cmd_xi)
+
+    cp = sub.add_parser("captains", help="haul chances for the armband")
+    cp.add_argument("--gameweek", type=int, help="defaults to the next one")
+    cp.add_argument("--position", help="GKP, DEF, MID or FWD")
+    cp.add_argument("--top", type=int, default=15)
+    cp.set_defaults(func=cmd_captains)
 
     ch = sub.add_parser("chips", help="when to play Bench Boost, Triple Captain or Free Hit")
     ch.add_argument("--squad")

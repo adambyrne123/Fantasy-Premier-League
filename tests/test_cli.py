@@ -68,6 +68,8 @@ def squad_file(tmp_path, wired):
         ["--horizon", "3", "players", "--sort", "value", "--max-price", "8.0"],
         ["--horizon", "3", "find", "a"],
         ["--horizon", "3", "prices"],
+        ["--horizon", "3", "captains", "--top", "5"],
+        ["--horizon", "3", "captains", "--position", "MID"],
     ],
 )
 def test_a_subcommand_that_needs_no_squad_runs(wired, capsys, argv):
