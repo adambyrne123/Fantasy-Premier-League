@@ -488,6 +488,161 @@ def test_turning_zoom_on_gives_the_chart_back_its_wheel(app):
     assert any(_has_scale_binding(spec) for spec in _chart_specs(at))
 
 
+def _compare(at, names):
+    """Pick players by their multiselect labels and rerun."""
+    return at.multiselect(key="compare").set_value(list(names)).run()
+
+
+def _options(at, *clubs):
+    """One option label per club named, so a test can say which club it wants."""
+    options = at.multiselect(key="compare").options
+    return [next(o for o in options if f"({club}," in o) for club in clubs]
+
+
+def _compare_table(at):
+    """The head to head table, found by FPL's own projection only it carries."""
+    return next(d.value for d in at.dataframe if "ep_next" in d.value.columns)
+
+
+def _compare_runs(at):
+    """The rows behind the grouped run chart.
+
+    Streamlit sends the chart's data as a named Arrow dataset rather than
+    inline in the spec, so reading it back means unpacking the payload the
+    browser would get.
+    """
+    import io
+    import json
+
+    import pyarrow as pa
+
+    chart = next(
+        c
+        for c in at.get("vega_lite_chart")
+        if "xOffset" in json.loads(c.proto.spec).get("encoding", {})
+    )
+    dataset = chart.proto.datasets[0]
+    return pa.ipc.open_stream(io.BytesIO(dataset.data.data)).read_pandas()
+
+
+def test_the_comparison_waits_to_be_asked(midseason_app):
+    """Four charts and a table for nobody would push the price pressure
+    section off the bottom of the tab for the whole of a normal visit."""
+    at = midseason_app.run()
+    assert not at.exception
+    assert not [d for d in at.dataframe if "ep_next" in d.value.columns]
+
+
+def test_every_compared_player_gets_a_row(midseason_app):
+    """The point of the section: several players read against each other,
+    rather than the same list read several times over."""
+    at = midseason_app.run()
+    picked = _options(at, "C01", "C02", "C03")
+    at = _compare(at, picked)
+    assert not at.exception
+
+    table = _compare_table(at)
+    assert len(table) == 3
+    assert [f"{n} ({c}," for n, c in zip(table["name"], table["club"], strict=True)] == [
+        p[: p.index(",") + 1] for p in picked
+    ]
+
+
+def test_the_comparison_carries_fpls_own_projection_beside_ours(midseason_app):
+    """`ep_next` is FPL's number and is deliberately not an input to ours, so
+    the one honest place for it is next to ours where it can disagree."""
+    at = midseason_app.run()
+    at = _compare(at, _options(at, "C01", "C02"))
+    assert not at.exception
+
+    table = _compare_table(at)
+    assert table["ep_next"].gt(0).all(), "their projection should be populated"
+    assert not table["ep_next"].equals(table["xpts_next"]), "it is theirs, not a copy of ours"
+
+
+def test_the_comparison_ignores_the_filters_above_it(midseason_app):
+    """It reads the whole pool on purpose. A search that matches nobody empties
+    the table above and must not take the comparison down with it."""
+    at = midseason_app.run()
+    picked = _options(at, "C01", "C02")
+    at = _compare(at, picked)
+    at = at.text_input[0].set_value("no such player anywhere").run()
+    assert not at.exception
+    assert len(_compare_table(at)) == 2
+
+
+def test_a_blank_gameweek_is_a_zero_rather_than_a_missing_bar(monkeypatch, tmp_path):
+    """Two runs drawn only where their clubs play stop lining up under each
+    other, and the week one of them sits out reads as a week nobody asked
+    about. The synthetic season plays every club every week, so the blank has
+    to be made."""
+    from fpl_manager.data import Season
+
+    unblanked = Season.team_fixtures
+
+    def blanked(self, horizon, start_gw=None):
+        runs = unblanked(self, horizon, start_gw)
+        return runs[~((runs["team"] == 1) & (runs["event"] == int(runs["event"].min()) + 1))]
+
+    monkeypatch.setattr(Season, "team_fixtures", blanked)
+
+    at = _app(monkeypatch, tmp_path, played=12).run()
+    at = _compare(at, _options(at, "C01", "C02"))
+    assert not at.exception
+
+    runs = _compare_runs(at)
+    weeks = sorted(int(e) for e in runs["event"].unique())
+    drawn = runs.groupby("name")["event"].apply(lambda events: sorted(int(e) for e in events))
+    assert all(player == weeks for player in drawn), (
+        "every player needs a row in every gameweek, or the bars stop aligning"
+    )
+
+    table = _compare_table(at)
+    resting = table.loc[table["club"] == "C01", "name"].iloc[0]
+    sat_out = runs[(runs["name"] == resting) & (runs["event"] == weeks[1])]
+    assert len(sat_out) == 1
+    assert sat_out.iloc[0]["fixture"] == "—", "the blank should name itself as one"
+    assert sat_out.iloc[0]["xpts"] == 0.0, "a blank scores nothing, which is not nothing shown"
+
+
+def test_the_compared_player_keeps_his_colour_across_every_chart(midseason_app):
+    """Four charts about the same two people. A colour that means one player in
+    the run and the other in the terms below is worse than no colour at all."""
+    import json
+
+    at = midseason_app.run()
+    at = _compare(at, _options(at, "C01", "C02"))
+    assert not at.exception
+
+    scales = [
+        spec["encoding"]["color"]["scale"]
+        for spec in _chart_specs(at)
+        if spec.get("encoding", {}).get("color", {}).get("field") == "name"
+    ]
+    assert len(scales) == 4, "the run and the three terms"
+    assert len({json.dumps(scale, sort_keys=True) for scale in scales}) == 1
+
+
+def test_the_comparison_follows_the_horizon(midseason_app):
+    """The run and the totals beside it are both cut to the slider, so a chart
+    still drawing six gameweeks after it was moved to three would be arguing
+    against the numbers on the same screen."""
+    at = midseason_app.run()
+    at = _compare(at, _options(at, "C01", "C02"))
+    at = next(s for s in at.slider if s.label == "Gameweeks to project over").set_value(3).run()
+    assert not at.exception
+
+    runs = _compare_runs(at)
+    assert runs.groupby("name")["event"].count().eq(3).all()
+
+
+def test_the_comparison_is_capped(midseason_app):
+    """Past about four the grouped bars stop being readable and the table
+    starts scrolling sideways on anything smaller than a laptop."""
+    at = midseason_app.run()
+    assert at.multiselect(key="compare").proto.max_selections == 4
+
+
 def test_the_radar_says_nothing_is_coming_rather_than_showing_a_blank_table(app):
     """The synthetic season has every club playing exactly once a week, which
     is also what a real fixture list looks like until postponements start."""

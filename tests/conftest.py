@@ -132,7 +132,16 @@ class FakeApi:
                             "status": self.rng.choices(["a", "d", "i"], [0.9, 0.05, 0.05])[0],
                             "news": "",
                             "chance_of_playing_next_round": None,
-                            "ep_next": "0.0",
+                            # FPL's own forecast for the next gameweek. It is
+                            # forward looking, so unlike the counting stats
+                            # around it there is nothing stale about it before
+                            # the first deadline and it is published either
+                            # way. Loosely tied to the player's scoring so it
+                            # is neither a copy of our projection nor noise,
+                            # and spread off the id rather than off `rng`
+                            # because drawing here would shift every random
+                            # number after it and rewrite the whole season.
+                            "ep_next": f"{ppg * (0.6 + pid % 9 / 10):.1f}",
                             # Attackers out-shoot defenders and keepers do not
                             # shoot at all, because a component model that saw
                             # one flat rate could not be told apart from no
