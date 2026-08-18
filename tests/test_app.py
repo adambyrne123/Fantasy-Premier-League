@@ -80,6 +80,7 @@ def test_every_tab_renders(app):
     for expected in [
         "Squad",
         "Players",
+        "Captain",
         "ROI",
         "Fixtures",
         "Transfers",
@@ -114,7 +115,17 @@ def test_the_pool_columns_say_what_they_are():
     glossary = re.search(r"^GLOSSARY = \{.*?^\}", source, re.S | re.M)
     assert glossary, "the one place a number is defined"
 
-    for column in ("xpts_next", "xpts_total", "value", "points_per_90", "minutes_share"):
+    for column in (
+        "xpts_next",
+        "xpts_total",
+        "value",
+        "points_per_90",
+        "minutes_share",
+        "haul_chance",
+        "return_chance",
+        "xpts_gw",
+        "start_chance",
+    ):
         assert f'"{column}"' in glossary.group(0), f"{column} is not self explanatory"
 
 
@@ -187,7 +198,18 @@ def _status_bar(at):
 
 
 def _pool(at):
-    """The player pool table, found by the fixture run only it carries."""
+    """The player pool table on the Players tab.
+
+    Keyed rather than guessed at. It used to be found by the fixture run only
+    it carried, which quietly depended on no earlier tab rendering one. The
+    Captain tab renders a run too, and sits after Players so the old scan
+    still lands, but a tab reorder should not silently change which table
+    every assertion below is talking about. The scan stays as a fallback for
+    a Streamlit version that does not expose the key.
+    """
+    for frame in at.dataframe:
+        if getattr(frame, "key", None) == "pool":
+            return frame.value
     return next(
         d.value for d in at.dataframe if any(str(c).startswith("GW") for c in d.value.columns)
     )
@@ -607,7 +629,12 @@ def test_a_blank_gameweek_is_a_zero_rather_than_a_missing_bar(monkeypatch, tmp_p
 
 def test_the_compared_player_keeps_his_colour_across_every_chart(midseason_app):
     """Four charts about the same two people. A colour that means one player in
-    the run and the other in the terms below is worse than no colour at all."""
+    the run and the other in the terms below is worse than no colour at all.
+
+    The scan is over every chart on the page, so a new chart anywhere that
+    colours by a field called `name` lands in this count and fails here rather
+    than where it was written. Colour by something else and it stays out.
+    """
     import json
 
     at = midseason_app.run()
@@ -779,6 +806,38 @@ def test_roi_ranks_players_once_points_exist(midseason_app):
     assert not at.exception
     assert any("Best return" in m.label for m in at.metric)
     assert not any("every return is zero" in info.value for info in at.info)
+
+
+def test_the_captain_tab_says_what_is_missing_before_the_season(app):
+    """The gate is the point of the tab pre-season. A haul chance built on the
+    stale payload the API serves in August would look current and be a year
+    old, so the tab holds an explanation rather than a table."""
+    at = app.run()
+    assert not at.exception
+    assert any("Not enough of this season yet" in card for card in _states(at))
+
+
+def test_the_captain_tab_ranks_on_the_haul_chance(midseason_app):
+    at = midseason_app.run()
+    assert not at.exception
+
+    table = next(d.value for d in at.dataframe if getattr(d, "key", None) == "captain_pool")
+    assert {"haul_chance", "return_chance", "xpts_gw"} <= set(table.columns)
+    assert table["haul_chance"].is_monotonic_decreasing, "best haul chance first"
+    assert table["haul_chance"].between(0, 1).all()
+    # a haul without a return is not a thing that can happen
+    assert (table["haul_chance"] <= table["return_chance"] + 1e-12).all()
+
+
+def test_the_captain_tab_starts_on_the_positions_the_number_suits(midseason_app):
+    """A defender's route to ten is mostly a clean sheet and a defensive
+    contribution, neither of which is in this number, so starting the filter on
+    everybody would put a column of misleadingly low figures at the top."""
+    at = midseason_app.run()
+    assert not at.exception
+
+    positions = next(m for m in at.multiselect if m.key == "captain_positions")
+    assert set(positions.value) == {"MID", "FWD"}
 
 
 def test_price_pressure_says_nothing_before_the_season(app):

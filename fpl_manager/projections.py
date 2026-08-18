@@ -51,6 +51,8 @@ STRENGTH_CEILING = 1.5
 # stops the projection collapsing back into last season's points, see
 # `_minutes_share` for why that matters.
 START_RATE_TRUST = 0.6
+# what a player with nothing to go on either way is assumed to start at
+UNKNOWN_START_RATE = 0.35
 SUB_SHARE = 0.12  # share of a match a substitute appearance is worth
 STARTER_DURATION = 0.85  # share of 90 a starter lasts, absent anything better
 
@@ -65,6 +67,12 @@ GOAL_POINTS = {"GKP": 6, "DEF": 6, "MID": 5, "FWD": 4}
 CLEAN_SHEET_POINTS = {"GKP": 4, "DEF": 4, "MID": 1, "FWD": 0}
 ASSIST_POINTS = 3
 APPEARANCE_POINTS = 2
+# FPL pays one point for an appearance and two for an hour. `component_rate`
+# uses the flat two on purpose, because it is a per 90 rate and asking it
+# which side of an hour a player finished would thread the minutes term into
+# it. `captaincy.py` draws the minutes branch first and can afford the split.
+APPEARANCE_MINUTES = 60
+SHORT_APPEARANCE_POINTS = 1
 
 # One point per three saves, and only a keeper makes them. Position dicts rather
 # than a scalar and a test on position, because that is how the two tables above
@@ -222,6 +230,33 @@ def _role(starts: pd.Series, minutes: pd.Series, games: int, index) -> tuple[pd.
     return (starts / games).clip(0, 1), duration
 
 
+def _start_mixture(
+    players: pd.DataFrame, start_rate: pd.Series, duration: pd.Series
+) -> pd.DataFrame:
+    """The chance a player starts, and the share of 90 that start is worth.
+
+    `_minutes_share` is these two collapsed into one number, and that number
+    stays what everything downstream reads. They are kept apart for
+    `captaincy.py`, because a haul is a tail and a tail does not survive being
+    scaled. The chance of two goals off `p * lambda` is roughly `p` times
+    smaller than the honest mixture of a start and a cameo off the bench.
+    """
+    implied = _price_implied(players, start_rate)
+    blended = np.where(
+        start_rate.isna(),
+        implied,
+        START_RATE_TRUST * start_rate + (1 - START_RATE_TRUST) * implied,
+    )
+    blended = pd.Series(blended, index=players.index).fillna(UNKNOWN_START_RATE).clip(0, 1)
+    lasts = duration.fillna(STARTER_DURATION).clip(0, 1)
+    return pd.DataFrame({"start_chance": blended, "start_minutes": blended * lasts})
+
+
+def _collapse(mixture: pd.DataFrame) -> pd.Series:
+    """The mixture as one expected share of 90, which is what the model uses."""
+    return (mixture["start_minutes"] + (1 - mixture["start_chance"]) * SUB_SHARE).clip(0, 1)
+
+
 def _minutes_share(players: pd.DataFrame, start_rate: pd.Series, duration: pd.Series) -> pd.Series:
     """Expected share of 90 minutes in a single match.
 
@@ -238,15 +273,7 @@ def _minutes_share(players: pd.DataFrame, start_rate: pd.Series, duration: pd.Se
     input that is not last season's minutes, which is what breaks the identity
     and lets a player's rate and his expected role move independently.
     """
-    implied = _price_implied(players, start_rate)
-    blended = np.where(
-        start_rate.isna(),
-        implied,
-        START_RATE_TRUST * start_rate + (1 - START_RATE_TRUST) * implied,
-    )
-    blended = pd.Series(blended, index=players.index).fillna(0.35).clip(0, 1)
-    lasts = duration.fillna(STARTER_DURATION).clip(0, 1)
-    return (blended * lasts + (1 - blended) * SUB_SHARE).clip(0, 1)
+    return _collapse(_start_mixture(players, start_rate, duration))
 
 
 def team_defence_rate(players: pd.DataFrame) -> pd.Series:
@@ -327,6 +354,42 @@ def _poisson_at_least(rate: pd.Series, threshold: pd.Series) -> pd.Series:
     return (1 - cdf).clip(0.0, 1.0)
 
 
+def attacking_rates(players: pd.DataFrame) -> pd.DataFrame:
+    """Expected goals and assists per 90, with set piece duty and the gate.
+
+    Public because `captaincy.py` puts a distribution on exactly these two
+    numbers, and a second definition of a number is how two figures on the same
+    screen come to disagree. `ninetieths` and `played_enough` come back beside
+    them so a caller inherits `COMPONENT_MINUTES` rather than re-deriving it.
+
+    Reads `minutes` and the expected goals fields, which before the first
+    deadline are still last season's. What keeps `component_rate` honest about
+    that is the blend weight being zero rather than anything here, so a second
+    caller needs a guard of its own. See the season rollover section of
+    `docs/model.md`.
+    """
+    minutes = pd.to_numeric(players.get("minutes"), errors="coerce").fillna(0.0)
+    ninetieths = minutes / 90
+    played_enough = minutes >= COMPONENT_MINUTES
+
+    # set piece duty is a claim on future chances rather than a record of past
+    # ones, which is why it is added rather than being left to the xG above
+    order = pd.to_numeric(players.get("penalties_order"), errors="coerce")
+    freekicks = pd.to_numeric(players.get("direct_freekicks_order"), errors="coerce")
+    xg90 = _per_90(players, "expected_goals", ninetieths, played_enough)
+    xg90 = xg90 + (order == 1) * PENALTY_XG_P90 + (freekicks == 1) * FREEKICK_XG_P90
+
+    return pd.DataFrame(
+        {
+            "xg90": xg90,
+            "xa90": _per_90(players, "expected_assists", ninetieths, played_enough),
+            "ninetieths": ninetieths,
+            "played_enough": played_enough,
+        },
+        index=players.index,
+    )
+
+
 def component_rate(players: pd.DataFrame, defence: pd.Series | None = None) -> pd.Series:
     """Points per 90 rebuilt from what a player is expected to do, not what he scored.
 
@@ -369,21 +432,9 @@ def component_rate(players: pd.DataFrame, defence: pd.Series | None = None) -> p
     if not needed <= set(players.columns):
         return pd.Series(np.nan, index=index, dtype="float64")
 
-    minutes = pd.to_numeric(players["minutes"], errors="coerce").fillna(0.0)
-    ninetieths = minutes / 90
-    played_enough = minutes >= COMPONENT_MINUTES
-
-    xg = pd.to_numeric(players["expected_goals"], errors="coerce")
-    xa = pd.to_numeric(players["expected_assists"], errors="coerce")
-    xg90 = (xg / ninetieths).where(played_enough)
-    xa90 = (xa / ninetieths).where(played_enough)
-
-    # set piece duty is a claim on future chances rather than a record of past
-    # ones, which is why it is added rather than being left to the xG above
-    order = pd.to_numeric(players.get("penalties_order"), errors="coerce")
-    freekicks = pd.to_numeric(players.get("direct_freekicks_order"), errors="coerce")
-    xg90 = xg90.fillna(0.0) + (order == 1) * PENALTY_XG_P90 + (freekicks == 1) * FREEKICK_XG_P90
-    xa90 = xa90.fillna(0.0)
+    attacking = attacking_rates(players)
+    xg90, xa90 = attacking["xg90"], attacking["xa90"]
+    ninetieths, played_enough = attacking["ninetieths"], attacking["played_enough"]
 
     position = players["position"]
     goal_points = position.map(GOAL_POINTS).astype("float64")
@@ -505,13 +556,16 @@ def build_rates(season: Season, prior: pd.DataFrame | None = None) -> pd.DataFra
     prior_start_rate, prior_duration = _role(
         prior["prior_starts"], prior_minutes, GAMES_IN_SEASON, p.index
     )
-    prior_share = _minutes_share(out, prior_start_rate, prior_duration)
+    prior_mix = _start_mixture(out, prior_start_rate, prior_duration)
+    prior_share = _collapse(prior_mix)
 
     if played:
         now_start_rate, now_duration = _role(p["starts"], p["minutes"], played, p.index)
-        now_share = _minutes_share(out, now_start_rate, now_duration)
-        share = weight_now * now_share + (1 - weight_now) * prior_share
+        now_mix = _start_mixture(out, now_start_rate, now_duration)
+        mix = weight_now * now_mix + (1 - weight_now) * prior_mix
+        share = weight_now * _collapse(now_mix) + (1 - weight_now) * prior_share
     else:
+        mix = prior_mix
         share = prior_share
 
     out["start_rate"] = prior_start_rate
@@ -522,6 +576,22 @@ def build_rates(season: Season, prior: pd.DataFrame | None = None) -> pd.DataFra
     share = pd.Series(share, index=p.index).where(p["available"], 0.0)
 
     out["minutes_share"] = share.clip(0, 1)
+
+    # The same share, kept as the two things it is made of. A published doubt
+    # and an unavailability cut both sides, so a flagged player loses his cameo
+    # along with his start rather than keeping a chance of coming on. What is
+    # left over, `1 - start_chance - sub_chance`, is the chance he does not
+    # feature at all, and there is a test that these add back up to the share.
+    features = pd.Series(1.0, index=p.index).where(chance.isna(), chance / 100.0)
+    features = features.where(p["available"], 0.0).clip(0, 1)
+    out["start_chance"] = (features * mix["start_chance"]).clip(0, 1)
+    out["sub_chance"] = (features * (1 - mix["start_chance"])).clip(0, 1)
+    # how long a start lasts, which is undefined rather than infinite for
+    # somebody who never starts, so it falls back to the same default `_role`
+    # hands anyone with no duration to go on
+    out["starter_minutes"] = (mix["start_minutes"] / mix["start_chance"]).where(
+        mix["start_chance"] > 0, STARTER_DURATION
+    )
     out["status"] = p["status"]
     out["news"] = p["news"]
     # carried through unchanged so a front end can flag a doubt rather than
@@ -630,8 +700,20 @@ def project(
         merged["points_per_90"] * merged["minutes_share"] * merged["multiplier"]
     ).fillna(0.0)
 
+    # `multiplier` rides along so a consumer can rebuild the same fixture term
+    # rather than re-deriving it off a second call to `team_fixtures`
     by_gw = merged[
-        ["id", "name", "position", "club", "event", "opponent_short", "is_home", "xpts"]
+        [
+            "id",
+            "name",
+            "position",
+            "club",
+            "event",
+            "opponent_short",
+            "is_home",
+            "multiplier",
+            "xpts",
+        ]
     ].copy()
 
     totals = merged.groupby("id")["xpts"].sum()

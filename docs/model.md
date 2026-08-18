@@ -124,10 +124,22 @@ Every counting stat rolls over the same way: `saves`, `yellow_cards`,
 deadline. Checked live on 2026-08-16, five days out from GW1: players were
 carrying three thousand minutes and last season's expected goals. So the 270
 minute gate is wide open pre-season and is **not** what protects the model in
-August. The blend weight being 0 is. All of these are read inside
-`component_rate` and nowhere else, which is what keeps them behind that weight.
-Reading one in `build_rates` beside the observed rate would put it in front of
-the weight, where nothing is standing between it and the projection.
+August. The blend weight being 0 is.
+
+Everything the projection reads them through is `component_rate`, which sits
+behind that weight, and `attacking_rates`, which `component_rate` itself goes
+through so that the expected goals and assists have one definition rather than
+two. Reading one in `build_rates` beside the observed rate would put it in
+front of the weight, where nothing is standing between it and the projection.
+
+`captaincy.py` is the second consumer of `attacking_rates` and it is **not**
+behind the blend weight, because a distribution has nothing to blend against.
+It therefore carries a gate of its own, `season.gameweeks_played > 0` as well
+as `COMPONENT_MINUTES`, and returns an empty frame until both are satisfied.
+The gameweeks check is the one doing the work: the minutes check alone would
+pass in August on a three thousand minute figure from last season. Anything
+else that grows a second consumer needs the same treatment, and a guard that
+only counts minutes is not a guard.
 
 `tests/conftest.py` zeroes these fields pre-season, which is kinder than the real
 payload, so a test that wants to prove the guard has to write the stale values in
@@ -182,6 +194,91 @@ come back. If it fails, the minutes term has stopped doing anything.
 Players with no Premier League history get a per-position fit of rate against
 price. That fallback is weak and is documented as weak. Do not present it as
 better than it is.
+
+`build_rates` also publishes the same term as the two things it is made of,
+`start_chance` and `starter_minutes`, with `sub_chance` for the cameo branch.
+The identity
+
+```
+minutes_share == start_chance * starter_minutes + sub_chance * SUB_SHARE
+```
+
+holds exactly and has a test. The collapse works because both sources are
+blended before being multiplied rather than after: writing `A` for the blended
+start chance and `B` for the blended minutes a start is worth, the share is
+`B + SUB_SHARE * (1 - A)`, which is `A * (B / A) + (1 - A) * SUB_SHARE`. So
+`starter_minutes` is `B / A`, the length of a start weighted by which source
+the starts came from. The published doubt and the availability cut multiply `A`
+and `B` together and leave `B / A` alone, so the identity survives them, and
+what is left over, `1 - start_chance - sub_chance`, is the chance a player does
+not feature at all.
+
+## The haul distribution
+
+`captaincy.py` puts a distribution on the part of a gameweek that swings, so
+that a captaincy decision is not made off a mean. Goals and assists are
+independent Poissons on `attacking_rates`, scaled by the same fixture
+multiplier the projection uses, and the points they pay come from the same
+scoring table.
+
+**Independence is stated rather than modelled, and it errs both ways.** Goals
+and assists share a "his team scored three today" factor, so the true joint
+tail is fatter than independent Poissons give and the haul chance is
+understated. Against that, a player's goals in a match are closer to a sum of
+Bernoullis over his chances than to a Poisson, and a Poisson binomial with the
+same mean has the thinner tail, so treating goals as Poisson overstates.
+Fitting a correlation would be one more constant set by eye, which is what was
+turned down for the negative binomial in the defensive contribution term.
+
+**The role is drawn once for the gameweek, not once per fixture.** Starting is
+a property of a player's week rather than of a match. Three branches, weighted
+by `start_chance`, `sub_chance` and what is left: within a branch the fixtures
+are conditionally independent and their point distributions convolve, which is
+what makes a double gameweek arithmetic rather than a special case. Drawing the
+role per fixture would say a player who starts four weeks in five starts both
+legs of a double 64% of the time, and that error runs in exactly the direction
+a Triple Captain is being weighed for.
+
+**The minutes term is a mixture here and a scaling everywhere else**, which is
+why `build_rates` publishes both halves. A haul is a tail and a tail does not
+survive being scaled: for a rare event `P(2 goals | p * lambda)` is roughly `p`
+times smaller than the honest `p * P(2 goals | lambda)`. Expectation is linear
+in the branch weights, so the mixture leaves the mean exactly where the
+projection has it, at `xg90 * minutes_share * multiplier`.
+
+**Appearance points are split 1 and 2 here and flat 2 in `component_rate`.**
+That is not an inconsistency to fix. `component_rate` is a per 90 rate and
+asking it which side of an hour a player finished would thread the minutes term
+into it. Here the minutes branch is drawn first, so the split is available for
+nothing.
+
+**Truncation.** Ten goals or ten assists in one fixture, past which there is
+nothing left: at the largest rate this model produces the mass above is smaller
+than 1e-8, and the whole distribution sums to one within 1e-9. It is left
+summing to slightly under one rather than renormalised, because renormalising
+would hide the size of the cut. The points grid sizes itself off the scoring
+table rather than being a constant, so changing what a goal pays cannot leave
+it stale.
+
+**It does not reconcile with `xpts_next`, and the front end says so.** Three
+reasons, and hearing only the first leaves the other two assumed away:
+
+1. `xpts_next` also contains clean sheets, saves, goals conceded, defensive
+   contribution and cards. None of them are here, so for a keeper or a defender
+   this is an attacking haul chance rather than a haul chance.
+2. `points_per_90` is `(1 - w)` of an observed rate plus `w` of the component
+   rate, so only `w` of the expected goals ever reaches `xpts_next`. This uses
+   them at full weight with no blending at all. Even the attacking part is a
+   different number.
+3. Bonus is in neither, which makes both understate, but it bites harder here
+   because the threshold is absolute. A forward's goal and assist is nine
+   points on this scale and twelve on the real one.
+
+There is no cheap way to make them agree and the tempting expensive way is
+wrong. Scaling the rates by `w` is not the same claim as a player being `w`
+times as likely to score, and it would drag every haul chance towards zero in
+September, which is when the question is live. What can be said, and is, is the
+narrow true thing in the mixture paragraph above.
 
 ## Selection
 
