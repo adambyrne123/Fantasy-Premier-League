@@ -105,9 +105,19 @@ RED_CARD_POINTS = -3
 PENALTY_XG_P90 = 0.055
 FREEKICK_XG_P90 = 0.012
 
-# Minutes a player needs this season before his own rates mean anything. Below
-# it the component rests on the team's defence and his set piece duty only.
+# Minutes of this season behind a player before his own rates are trusted in
+# full. Used as a scale rather than as a bar: `credibility` divides by it and
+# clips at one, so at and above it nothing has changed and below it a
+# player's own numbers fade in rather than arriving whole on one minute of
+# football.
 COMPONENT_MINUTES = 270
+
+# Minutes of a *finished* season before its points per 90 is worth reading.
+# The same number as `COMPONENT_MINUTES` and a different question: that one
+# scales a season in progress, this one is a sample floor on one that is
+# over, where no more evidence is coming and `_fill_missing_rates` is the
+# defined fallback. Named so the two cannot be quietly unified.
+PRIOR_MINUTES = 270
 
 
 def fetch_prior_season(season: Season, delay: float = 0.15) -> pd.DataFrame:
@@ -199,6 +209,49 @@ def _fill_missing_rates(players: pd.DataFrame, rate_col: str) -> pd.Series:
     return filled.fillna(0.0)
 
 
+def _price_implied_rate(
+    players: pd.DataFrame, measured: pd.Series, sampled: pd.Series
+) -> pd.Series:
+    """Per-position straight line fit of a per 90 rate against price.
+
+    The shrinkage target for a player whose own season is too short to read.
+    Neither of the two fits above will do, and the reasons are worth stating
+    because they look interchangeable. `_price_implied` answers the same shape
+    of question for a *share* and clips to nought and one, which would crush a
+    rate. `_fill_missing_rates` drops zeros from its fit, because there a zero
+    means no history at all; here a zero means he played ninety minutes and did
+    not shoot, which is a reading and belongs in the fit. A keeper is the
+    clearest case of that.
+
+    Fitting a noisy column is fine and is the whole idea. Noise in the response
+    widens the interval around the line, it does not bias the slope, and price
+    is measured exactly. Pooled over a position the line is a stable estimate of
+    what a player at that price is expected to do even in a week where no single
+    player's own rate means anything.
+
+    What it costs: it shrinks towards conventional wisdom, and a genuinely
+    underpriced player is pulled down towards his price for as long as his own
+    sample is short. That is bounded by `1 - credibility` and gone by his third
+    match, and it is said on screen rather than only here.
+    """
+    fitted = pd.Series(np.nan, index=players.index, dtype=float)
+    known_all = measured.where(sampled).dropna()
+    # Both columns are needed to fit anything, and a payload missing either
+    # should lose the shrinkage rather than take the caller down with it. That
+    # is the same tolerance `_per_90` has and for the same reason.
+    if not {"now_cost", "position"} <= set(players.columns) or known_all.empty:
+        return fitted.fillna(float(known_all.median()) if len(known_all) else 0.0)
+
+    for _pos, group in players.groupby("position"):
+        known = known_all.reindex(group.index).dropna()
+        if len(known) < 10:
+            fitted.loc[group.index] = float(known.median()) if len(known) else known_all.median()
+            continue
+        slope, intercept = np.polyfit(players.loc[known.index, "now_cost"], known, 1)
+        fitted.loc[group.index] = intercept + slope * players.loc[group.index, "now_cost"]
+    return fitted.clip(lower=0.0).fillna(0.0)
+
+
 def _price_implied(players: pd.DataFrame, observed: pd.Series) -> pd.Series:
     """Per-position straight line fit of some share against price.
 
@@ -276,6 +329,35 @@ def _minutes_share(players: pd.DataFrame, start_rate: pd.Series, duration: pd.Se
     return _collapse(_start_mixture(players, start_rate, duration))
 
 
+def credibility(minutes: pd.Series) -> pd.Series:
+    """How much of a usable sample this season's minutes are, nought to one.
+
+    The projection used to gate on `COMPONENT_MINUTES`, which meant a player
+    contributed nothing of his own until his 270th minute and then contributed
+    everything: at 269 minutes his rate was entirely last season's, at 270 it
+    was 36% last season, 24% this one and 40% rebuilt. Sixty four percent of a
+    rate arriving on one minute of football is a step function of an arbitrary
+    bar, not a model.
+
+    This is the same constant used as a scale instead. At and above it the
+    value is exactly one, so everything it multiplies behaves as it did when it
+    was a gate and nothing mid-season moves. Below it the fade is linear.
+
+    Linear rather than the `m / (m + k)` form `weight_now` uses, and
+    `docs/model.md` carries the argument. In short: that form never reaches
+    one, so it would cut current-season weight in every week of the season to
+    fix a hole in the first four, and rescaling it so that it does reach one at
+    the bar makes it *more* aggressive at the small samples that need
+    protecting, not less.
+
+    It is a weight and not a guard, and reading it as a guard is how August
+    goes wrong. Pre-season the API serves last season's minutes, so this is one
+    for everybody. What protects the model then is `weight_now` being zero.
+    """
+    minutes = pd.to_numeric(minutes, errors="coerce").fillna(0.0)
+    return (minutes / COMPONENT_MINUTES).clip(0.0, 1.0)
+
+
 def team_defence_rate(players: pd.DataFrame) -> pd.Series:
     """Goals each club is expected to concede per 90, by club id.
 
@@ -302,9 +384,15 @@ def team_defence_rate(players: pd.DataFrame) -> pd.Series:
 
 
 def _per_90(
-    players: pd.DataFrame, column: str, ninetieths: pd.Series, played_enough: pd.Series
+    players: pd.DataFrame, column: str, ninetieths: pd.Series, sampled: pd.Series
 ) -> pd.Series:
     """A counting stat as a rate, zero wherever it cannot be one.
+
+    `sampled` is "has he played at all" rather than "has he played enough".
+    How much a small sample is worth is `credibility`'s job and it is applied
+    once, by `build_rates`, on the whole component. Masking here as well would
+    make the value jump at the same bar the weight now fades across, which is
+    the thing the ramp exists to remove.
 
     `DataFrame.get` on a column that is not there gives NaN rather than raising,
     so the arithmetic still produces a series of the right shape and the term
@@ -313,7 +401,7 @@ def _per_90(
     rather than the whole component.
     """
     counted = pd.to_numeric(players.get(column), errors="coerce")
-    return (counted / ninetieths).where(played_enough).fillna(0.0)
+    return (counted / ninetieths).where(sampled).fillna(0.0)
 
 
 def _conceded_points(xgc: pd.Series) -> pd.Series:
@@ -359,8 +447,16 @@ def attacking_rates(players: pd.DataFrame) -> pd.DataFrame:
 
     Public because `captaincy.py` puts a distribution on exactly these two
     numbers, and a second definition of a number is how two figures on the same
-    screen come to disagree. `ninetieths` and `played_enough` come back beside
-    them so a caller inherits `COMPONENT_MINUTES` rather than re-deriving it.
+    screen come to disagree.
+
+    Comes back with both a raw and a shrunk pair, because the two consumers
+    need different things and neither should be recomputing the other's.
+    `component_rate` takes the raw pair: it is already weighted by
+    `credibility` once, in `build_rates`, and handing it the shrunk pair would
+    apply the same quantity twice. `captaincy.py` takes the shrunk pair,
+    because it sits behind no blend weight at all and a rate off ninety minutes
+    would otherwise reach a tail undiluted. Above `COMPONENT_MINUTES` the
+    shrinkage is the identity and the two pairs are equal, which has a test.
 
     Reads `minutes` and the expected goals fields, which before the first
     deadline are still last season's. What keeps `component_rate` honest about
@@ -370,21 +466,37 @@ def attacking_rates(players: pd.DataFrame) -> pd.DataFrame:
     """
     minutes = pd.to_numeric(players.get("minutes"), errors="coerce").fillna(0.0)
     ninetieths = minutes / 90
-    played_enough = minutes >= COMPONENT_MINUTES
+    cred = credibility(minutes)
+    # nothing at all to read, as opposed to not much. The distinction is what
+    # lets `component_rate` hand back NaN and have the caller fall back, rather
+    # than being given a confident zero for a player who has not kicked a ball.
+    has_played = cred > 0
 
-    # set piece duty is a claim on future chances rather than a record of past
-    # ones, which is why it is added rather than being left to the xG above
+    measured_g = _per_90(players, "expected_goals", ninetieths, has_played)
+    measured_a = _per_90(players, "expected_assists", ninetieths, has_played)
+
+    # Set piece duty stays outside the shrinkage. It is a claim on future
+    # chances rather than a record of past ones, which is why it is added
+    # rather than left to the xG above, and shrinking it towards what a price
+    # implies would dilute the one signal it exists to add. A player given the
+    # penalties last week should be more visible in his first gameweek, not
+    # less.
     order = pd.to_numeric(players.get("penalties_order"), errors="coerce")
     freekicks = pd.to_numeric(players.get("direct_freekicks_order"), errors="coerce")
-    xg90 = _per_90(players, "expected_goals", ninetieths, played_enough)
-    xg90 = xg90 + (order == 1) * PENALTY_XG_P90 + (freekicks == 1) * FREEKICK_XG_P90
+    setpiece = (order == 1) * PENALTY_XG_P90 + (freekicks == 1) * FREEKICK_XG_P90
+
+    shrunk_g = cred * measured_g + (1 - cred) * _price_implied_rate(players, measured_g, has_played)
+    shrunk_a = cred * measured_a + (1 - cred) * _price_implied_rate(players, measured_a, has_played)
 
     return pd.DataFrame(
         {
-            "xg90": xg90,
-            "xa90": _per_90(players, "expected_assists", ninetieths, played_enough),
+            "xg90": measured_g + setpiece,
+            "xa90": measured_a,
+            "xg90_shrunk": shrunk_g + setpiece,
+            "xa90_shrunk": shrunk_a,
             "ninetieths": ninetieths,
-            "played_enough": played_enough,
+            "played_enough": minutes >= COMPONENT_MINUTES,
+            "credibility": cred,
         },
         index=players.index,
     )
@@ -434,7 +546,11 @@ def component_rate(players: pd.DataFrame, defence: pd.Series | None = None) -> p
 
     attacking = attacking_rates(players)
     xg90, xa90 = attacking["xg90"], attacking["xa90"]
-    ninetieths, played_enough = attacking["ninetieths"], attacking["played_enough"]
+    ninetieths = attacking["ninetieths"]
+    # every term hangs off "has he played", not "has he played enough". What a
+    # short sample is worth is decided once, by `build_rates`, on the whole
+    # component. See `credibility`.
+    played_enough = attacking["credibility"] > 0
 
     position = players["position"]
     goal_points = position.map(GOAL_POINTS).astype("float64")
@@ -520,33 +636,48 @@ def build_rates(season: Season, prior: pd.DataFrame | None = None) -> pd.DataFra
 
     # points per 90, from each source, only where the sample is worth using
     prior_rate = np.where(
-        prior_minutes.fillna(0) >= 270, prior_points / (prior_minutes / 90), np.nan
+        prior_minutes.fillna(0) >= PRIOR_MINUTES, prior_points / (prior_minutes / 90), np.nan
     )
-    now_rate = np.where(p["minutes"] >= 270, p["total_points"] / (p["minutes"] / 90), np.nan)
+    # No bar on this one, only a guard against dividing by nothing. A rate off
+    # ten minutes is nonsense read on its own and `credibility` is what makes it
+    # safe to carry: the minutes cancel, since `(m / 270) * (points * 90 / m)`
+    # is `points / 3` whatever `m` was. So what a short spell contributes is
+    # this season's points over three, not the four figure rate it implies.
+    minutes = pd.to_numeric(p["minutes"], errors="coerce").fillna(0.0)
+    now_rate = np.where(minutes > 0, p["total_points"] / (minutes / 90), np.nan)
 
     out["prior_p90"] = prior_rate
     out["current_p90"] = now_rate
     out["prior_p90"] = _fill_missing_rates(out, "prior_p90")
 
-    blended = np.where(
-        np.isnan(now_rate),
-        out["prior_p90"],
-        weight_now * np.nan_to_num(now_rate) + (1 - weight_now) * out["prior_p90"],
-    )
-    observed = pd.Series(np.clip(blended, 0, None), index=p.index)
+    # How much of his own season is behind `current_p90`, which is a different
+    # question from how much of the league's season is behind `weight_now`. A
+    # player injured since August is twelve gameweeks in by the league's clock
+    # and one by his own, and only the product of the two describes him.
+    out["credibility"] = credibility(minutes)
+    current_weight = np.where(np.isnan(now_rate), 0.0, weight_now * out["credibility"])
+    observed = pd.Series(
+        current_weight * np.nan_to_num(now_rate) + (1 - current_weight) * out["prior_p90"],
+        index=p.index,
+    ).clip(lower=0.0)
 
     # What he is expected to do, blended over what he has been scoring, by the
     # same weight that governs current against prior. Pre-season that weight is
     # zero, so this contributes nothing and the old behaviour stands, which is
     # the defined pre-season behaviour every new term needs. It also has to be:
     # FPL publishes the expected goals fields as zero until the season starts.
+    #
+    # `weight_now * credibility` is monotone in minutes and equals `weight_now`
+    # at `COMPONENT_MINUTES`, so nobody below that bar is ever trusted more than
+    # somebody standing on it already was. That is the whole safety argument for
+    # having removed the bar.
     out["component_p90"] = component_rate(p, team_defence_rate(p))
+    component_weight = np.where(out["component_p90"].isna(), 0.0, weight_now * out["credibility"])
     out["points_per_90"] = np.clip(
-        np.where(
-            out["component_p90"].isna(),
-            observed,
-            (1 - weight_now) * observed + weight_now * out["component_p90"],
-        ),
+        (1 - component_weight) * observed
+        # filled because nought times NaN is NaN, and the weight is already
+        # nought wherever the component has nothing to say
+        + component_weight * out["component_p90"].fillna(0.0),
         0,
         None,
     )

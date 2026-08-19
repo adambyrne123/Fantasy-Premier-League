@@ -55,6 +55,7 @@ CAPTAIN_COLS = [
     "xpts_gw",
     "haul_chance",
     "return_chance",
+    "credibility",
 ]
 
 
@@ -189,16 +190,23 @@ def cmd_xi(args, season, projections, by_gw):
 def cmd_captains(args, season, projections, by_gw):
     table = captaincy.haul_frame(season, projections, by_gw, event=args.gameweek)
     if table.empty:
-        print("\nNot enough of this season has been played to put a distribution on")
-        print(f"anybody. This wants a finished gameweek and {COMPONENT_MINUTES} minutes of it")
-        print("per player, so it fills in around the fourth.")
+        print("\nNo gameweek has been finished, so there is nothing to put a")
+        print("distribution on. Before the first deadline the API is still serving")
+        print("last season's figures under the same field names, so this waits")
+        print("rather than hand you a year old number that looks current.")
         return
 
     if args.position:
         table = table[table["position"] == args.position.upper()]
-    print(f"\nCaptaincy for GW{int(table['event'].iloc[0])}, best haul chance first")
+    print(f"\nCaptaincy for GW{int(table['event'].iloc[0])}, best projection first")
     print(_fmt(table.head(args.top).reset_index(drop=True), CAPTAIN_COLS))
+    print("\nThe armband doubles a score, so if you are after points the captain is")
+    print("the top of the xPts column and the two chances beside it are context.")
+    print("They earn their place when you are chasing a rival, where a ceiling beats")
+    print("an average, and when choosing the week to spend Triple Captain on.")
     print(f"\nHaul is {captaincy.HAUL_POINTS} or more points from goals and assists alone.")
+    print("Credibility is how much of the two chances is his own record rather than")
+    print(f"what his price implies, reaching one at {COMPONENT_MINUTES} minutes played.")
     print("Bonus is not in the model at all, and a defender's clean sheet and his")
     print("defensive contribution are not in these two numbers, so they will not add")
     print("up to the xPts beside them and they read low for a defender.")

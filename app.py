@@ -103,7 +103,12 @@ GLOSSARY = {
     "read back off what he scored: expected goals and assists, the club's clean "
     "sheet chance and the goals it concedes, saves, defensive contributions and "
     "cards. The last two are chances of clearing a bar in a match, estimated "
-    "from an average. Empty until he has 270 minutes this season.",
+    "from an average. Weighted by how much of this season he has played, at "
+    f"full weight from {COMPONENT_MINUTES} minutes and faded in below that.",
+    "credibility": "How much of the numbers beside this are the player's own "
+    "record rather than what his price implies for his position. It reaches "
+    f"one at {COMPONENT_MINUTES} minutes this season. A row at 0.3 is mostly a "
+    "statement about his price, so read it before reading the rest.",
     "form": "FPL's own figure: average points over the last 30 days.",
     "points_per_game": "FPL's own figure: average points per appearance.",
     "total_points": "Points actually scored so far, straight from the API.",
@@ -717,6 +722,9 @@ def pool_column_config(horizon: int, gw_cols: list[str], max_xpts: float) -> dic
         "return_chance": st.column_config.NumberColumn(
             "Any return", format="percent", **g("return_chance")
         ),
+        "credibility": st.column_config.NumberColumn(
+            "His own", format="percent", **g("credibility")
+        ),
         "prior_p90": st.column_config.NumberColumn(
             "Last season p90", format="%.2f", **g("prior_p90")
         ),
@@ -849,7 +857,8 @@ def player_detail(
         "Scoring rate times expected minutes times a fixture multiplier, summed over the "
         f"run below. The rate blends last season at {row['prior_p90']:.2f} per 90 with this "
         + (f"season at {current:.2f}" if pd.notna(current) else "season, which has no sample yet")
-        + ", weighted by how much of the season has been played."
+        + ", weighted by how much of the season has been played and how much of "
+        "it he has played."
     )
 
     if weeks.empty:
@@ -1725,20 +1734,30 @@ with players_tab:
 with captain_tab:
     st.subheader("Captain")
     how_to_read(
-        "Everywhere else in this app is a point estimate, which is the right "
-        "shape for deciding who to own and the wrong shape for deciding who to "
-        "captain. The armband is a bet on a ceiling, not on an average, and "
-        "two players projected at the same six points are not the same bet if "
-        "one gets there off a steady floor and the other off a one in six "
-        "chance of a double.\n\n"
+        "**The armband doubles a score, so if you are after points the answer "
+        "is the top of the xPts column.** That is why this table is ranked on "
+        "the projection rather than on the two chances beside it. No "
+        "distribution is needed to pick a captain, and a table sorted by haul "
+        "chance would be claiming otherwise.\n\n"
+        "The chances are here for the three things the average cannot say:\n\n"
+        "- **You are usually chasing a rank, not a points total.** Against a "
+        "rival what matters is the chance you finish above him. Behind, the "
+        "volatile captain is right even at slightly lower expected points. "
+        "Ahead, the steady one is.\n"
+        "- **Triple Captain is a one-shot**, so you cannot average over many "
+        "weeks and the ceiling matters more than it does for a decision you "
+        "make every week. The Chips tab prices the week, this says who.\n"
+        "- **If most of the field captains the same player**, captaining him "
+        "barely moves your rank whatever he scores. This app does not know "
+        "what the field is doing, so read the owned column beside these.\n\n"
         f"- **{HAUL_POINTS}+ pts** is the chance of a haul: goals, assists and "
         "appearance points reaching double figures, counting both matches if "
         "his club has two that week.\n"
         "- **Any return** is the chance of at least one goal or assist. Read it "
         "as the floor under the ceiling beside it.\n"
-        "- **The scatter** is the point of the tab. Players off the diagonal "
-        "are the ones where the projection and the ceiling disagree, and they "
-        "are the armband decisions worth thinking about.\n\n"
+        "- **The scatter** shows where the two disagree. Players above the "
+        "trend have a ceiling their average is hiding, which is what makes "
+        "them worth a second look when you need variance.\n\n"
         "Three things are deliberately not in these two numbers, and they "
         "matter:\n\n"
         "- **Bonus**, which the model has no term for anywhere. A real ten "
@@ -1771,11 +1790,12 @@ with captain_tab:
     if events and haul.empty:
         empty_state(
             "Not enough of this season yet",
-            "A haul chance is built from this season's expected goals and assists, and "
-            f"nobody has the {COMPONENT_MINUTES} minutes of it that takes. Before the "
-            "first deadline the API is still serving last season's figures under the "
-            "same names, so this stays empty on purpose rather than handing you a year "
-            "old number that looks current. It fills in around the fourth gameweek.",
+            "These are built from this season's expected goals and assists, and no "
+            "gameweek has been finished yet. Before the first deadline the API is "
+            "still serving last season's figures under the same field names, so this "
+            "stays empty on purpose rather than handing you a year old number that "
+            "looks current. It fills in as soon as a gameweek has been scored, and "
+            "sharpens over the following month as players build up minutes.",
         )
     elif events:
         wanted = st.multiselect(
@@ -1791,8 +1811,9 @@ with captain_tab:
         if view.empty:
             empty_state(
                 "Nobody in those positions",
-                "No player in the positions chosen has played enough of this season to "
-                "put a distribution on. Add a position back to see the rest.",
+                "No player in the positions chosen has played a minute of this season, "
+                "so there is nothing to put a distribution on. Add a position back to "
+                "see the rest.",
             )
         else:
             labels, difficulty = fixture_runs(season, horizon, stamp)
@@ -1800,14 +1821,15 @@ with captain_tab:
                 view[["xpts_gw", "haul_chance", "return_chance"]]
             )
             st.caption(
-                f"Top {min(len(shown), 40)} of {len(shown)} by haul chance for GW{picked_gw}. "
+                f"Top {min(len(shown), 40)} of {len(shown)} by projected points for "
+                f"GW{picked_gw}, which is the captaincy answer if you are after points. "
                 "Both chances are goals and assists only."
             )
             pool_table(
                 shown.head(40),
                 labels,
                 difficulty,
-                ["price", "xpts_gw", "haul_chance", "return_chance", "ownership"],
+                ["price", "xpts_gw", "haul_chance", "return_chance", "credibility", "ownership"],
                 horizon,
                 key="captain_pool",
                 images=images,
