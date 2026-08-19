@@ -69,7 +69,7 @@ uv run fpl-manager find salah                      # look up player ids
 uv run fpl-manager transfers --squad squad.json --free 1 --max 2
 uv run fpl-manager plan --squad squad.json --weeks 3   # several weeks at once
 uv run fpl-manager xi --squad squad.json           # lineup and captain
-uv run fpl-manager captains --top 20               # haul chances for the armband
+uv run fpl-manager captains --top 20               # who to captain, and how safe
 uv run fpl-manager chips --squad squad.json        # when to play each chip
 uv run fpl-manager prices                          # who is close to moving
 uv run fpl-manager live --entry 1234567            # what you are scoring now
@@ -163,13 +163,20 @@ The rest of the scoring is there too, including the parts that cost points:
 - **Cards**, minus one and minus three. Small, but systematically larger for
   defenders and holding midfielders, which is more position separation.
 
-The whole rebuilt rate contributes nothing in August, and deliberately. A player
-needs 270 minutes this season before his own rates are used at all, and until a
-gameweek has been played the blend weight is zero, so the term arrives around the
-fourth gameweek rather than pretending to know something in the first. That
-matters more than it sounds: before the first deadline the API is still serving
-last season's minutes and counts, so the weight is the only thing standing
-between the projection and a year-old number.
+The whole rebuilt rate contributes nothing in August, and deliberately. Until a
+gameweek has been played the blend weight is zero, so it cannot contribute at
+all. After that a player's own numbers fade in with his minutes, at full weight
+from 270 and proportionally below that, rather than being switched on at a
+threshold. That matters more than it sounds: before the first deadline the API
+is still serving last season's minutes and counts, so the weight is the only
+thing standing between the projection and a year-old number.
+
+The fade replaced a hard 270 minute bar, which meant a player contributed
+nothing until his 270th minute and then contributed everything. Sixty four
+percent of his rate arrived on one minute of football, which is a step function
+of an arbitrary number rather than a model. The minutes cancel out of the fade,
+so a ten minute cameo contributes the points he actually scored rather than the
+four figure rate they imply.
 
 **expected_minutes_share** is how often a player starts multiplied by how long
 he lasts when he does, rather than his share of the minutes available. The
@@ -204,15 +211,30 @@ Because the projection is built per fixture rather than per gameweek, doubles
 and blanks come out correctly without any special casing. A club with two
 fixtures in a gameweek gets two contributions, a club with none gets zero.
 
-## Captaincy is a different question
+## Captaincy, and what the average already answers
 
-The projection above is an average, which is the right shape for deciding who to
-own and the wrong shape for deciding who to captain. The armband is a bet on a
-ceiling: two players projected at the same six points are not the same bet if
-one gets there off a steady floor and the other off a one in six chance of a
-double.
+The armband doubles a score, so a captain's contribution to your expected total
+is exactly his expected points. If you are maximising points, the right captain
+is the top of the projection and no distribution is needed. The Captain tab is
+ranked on that, and anyone telling you the haul chance is the decision is
+selling you something.
 
-So the Captain tab puts a distribution on the part of a gameweek that swings.
+The distribution earns its place in three narrower cases, and they are worth
+being precise about:
+
+- **You are usually chasing a rank, not a points total.** Against a rival what
+  matters is the chance you finish above him. Behind, the volatile captain is
+  right even at slightly lower expected points, and ahead the steady one is.
+- **Triple Captain is a one-shot**, so you cannot average over many weeks and
+  the ceiling matters in a way it does not for a weekly decision.
+- **Effective ownership.** If most of the field captains the same player,
+  captaining him barely moves your rank whatever he scores.
+
+The first and the third need a rival or the field, which these numbers do not
+have on their own. That is on the roadmap rather than built.
+
+With that said, the Captain tab puts a distribution on the part of a gameweek
+that swings.
 Goals and assists as independent Poissons on the same expected rates the
 projection uses, drawn per fixture so a double gameweek is counted rather than
 special-cased, and mixed over whether a player starts, comes on or does not

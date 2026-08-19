@@ -96,6 +96,14 @@ bad component estimate can only move the answer partway. Pre-season that weight
 is 0 and this contributes nothing, which is also required: FPL publishes the
 expected goals fields as zero until the season is under way.
 
+`COMPONENT_MINUTES` is now used as a denominator as well as a bar, and its value
+did not change when that happened, so the rule above still holds: the blend
+weight is the same one and no new constant appeared. `PRIOR_MINUTES` is a name
+put on a literal that was already in `build_rates`, not an addition. It is the
+sample floor on a *finished* season, which is a different question from scaling
+one in progress, and naming it is what stops the two being unified by somebody
+tidying up.
+
 ## The season rollover
 
 **`total_points` changes meaning at the season rollover.** Before the first
@@ -106,16 +114,22 @@ the data rather than the calendar, because the reset does not line up neatly
 with `gameweeks_played`. Anything new that divides by or ranks on
 `total_points` has the same problem and should go through it.
 
-**The rollover catches the expected goals fields too, and `COMPONENT_MINUTES` is
-what saves them.** Like `total_points`, `minutes` and `expected_goals` still hold
-last season's figures before the first deadline, so pre-season
+**The rollover catches the expected goals fields too, and nothing but the blend
+weight saves them.** Like `total_points`, `minutes` and `expected_goals` still
+hold last season's figures before the first deadline, so pre-season
 `component_rate` happily builds a rate for 331 players out of data that is a
-year old. It does no harm only because the blend weight is 0 until a gameweek
-is played. Once one is, minutes reset to this season's and the 270 minute gate
-fails for everybody, so the term stays out until roughly GW4 when there is
-enough of this season to mean anything. That is the intended progression rather
-than a happy accident, and anything new reading these fields needs the same
-guard or it will read a year-old number as though it were current.
+year old. It does no harm only because the blend weight is 0 until a gameweek is
+played.
+
+Once one is, minutes reset to this season's and a player's own numbers fade in
+across his first few matches in proportion to `credibility`, reaching full
+weight at `COMPONENT_MINUTES`. That used to be a bar rather than a scale, which
+meant the term stayed out entirely until roughly GW4 and then arrived whole; see
+the credibility ramp section below for why that was wrong and what replaced it.
+
+Anything new reading these fields needs a guard of its own or it will read a
+year-old number as though it were current, and a guard that counts minutes is
+not one.
 
 The list above is not exhaustive and reading it as though it were is the trap.
 Every counting stat rolls over the same way: `saves`, `yellow_cards`,
@@ -134,12 +148,19 @@ front of the weight, where nothing is standing between it and the projection.
 
 `captaincy.py` is the second consumer of `attacking_rates` and it is **not**
 behind the blend weight, because a distribution has nothing to blend against.
-It therefore carries a gate of its own, `season.gameweeks_played > 0` as well
-as `COMPONENT_MINUTES`, and returns an empty frame until both are satisfied.
-The gameweeks check is the one doing the work: the minutes check alone would
-pass in August on a three thousand minute figure from last season. Anything
-else that grows a second consumer needs the same treatment, and a guard that
-only counts minutes is not a guard.
+Its gate is `season.gameweeks_played > 0` and nothing else, and that is the one
+doing all the work: a minutes check would pass in August on a three thousand
+minute figure from last season, which is the whole trap. **A guard that only
+counts minutes is not a guard.**
+
+Because it has no outer weight, it cannot down-weight a short sample the way
+`build_rates` does, so it shrinks instead. `attacking_rates` returns a shrunk
+pair beside the raw one, `credibility` of a player's own reading and the rest
+from a per-position fit of the rate against price. `component_rate` takes the
+raw pair, since it is already weighted by `credibility` once in `build_rates`
+and taking the shrunk pair would apply the same quantity twice. Above
+`COMPONENT_MINUTES` the shrinkage is the identity and the two pairs are equal,
+which has a test, so nothing mid-season moved.
 
 `tests/conftest.py` zeroes these fields pre-season, which is kinder than the real
 payload, so a test that wants to prove the guard has to write the stale values in
@@ -213,13 +234,103 @@ and `B` together and leave `B / A` alone, so the identity survives them, and
 what is left over, `1 - start_chance - sub_chance`, is the chance a player does
 not feature at all.
 
+## The credibility ramp
+
+`points_per_90` used to gate a player's own record on 270 minutes this season.
+Below it he contributed nothing and above it he contributed everything, so at
+269 minutes his rate was entirely last season's and at 270 it was 36% last
+season, 24% this one and 40% rebuilt. **Sixty four percent of a rate arrived on
+one minute of football.** Nothing about a player changes between his 269th
+minute and his 270th, and the two gates that produced it read the same column
+against the same number, so there was no partial state to soften it.
+
+What gave it away is that the minutes term never worked that way.
+`minutes_share`, `start_chance` and `sub_chance` have always blended this season
+against last by `weight_now`, with no minutes bar at all. Only the scoring rate
+threw current-season data away, which makes this a hole rather than a design.
+
+`credibility` is `min(minutes / COMPONENT_MINUTES, 1)`, multiplied into
+`weight_now` for both the observed half and the component half. Two facts make
+it safe, and the second is the one to keep.
+
+**The minutes cancel.** Below the bar the current-season contribution is
+
+```
+credibility * now_rate = (m / 270) * (points * 90 / m) = points / 3
+```
+
+with no `m` left in it. A ten minute hat-trick implies 162 points per 90 and
+contributes `weight_now * 5`, because what carries through is the points he
+actually scored and not the rate they imply. The same cancellation runs through
+every `_per_90` term in the component: `credibility * xg90` is `xG / 3`. There
+is no `m` small enough to break this, which is why the only guard on the
+division is `m > 0`.
+
+**The envelope.** `weight_now * credibility` is monotone in minutes and equals
+`weight_now` exactly at `COMPONENT_MINUTES`. So nobody below the bar is ever
+trusted more than somebody standing on it already was. The change fills in the
+interior of an envelope the model accepted at its edge, and it moves nothing at
+or above that edge, which has a test.
+
+**Why linear, and not `m / (m + k)`.** That form is the standard credibility
+curve and `weight_now` itself uses it, so the swap looks like a tidy-up and is
+not. It never reaches one, so it would cut current-season weight by 8% at three
+thousand minutes and more in mid-season, which is repricing GW30 to fix GW1. The
+repair that makes it reach one at the bar, `2m / (m + 270)` clipped, is *more*
+aggressive below the bar rather than less: 0.5 at ninety minutes against the
+linear 0.333. Normalising a concave curve to hit one at a point pushes it up
+everywhere beneath that point, and the concavity is claiming trust accumulates
+fastest at the start, which is the least defensible thing to claim when the
+sample is one match against one opponent. The property is separable from the
+shape: `min(1, f(m) / f(COMPONENT_MINUTES))` keeps it for any increasing `f`.
+
+**What the cancellation does not cover.** Four terms in the component have no
+minutes to cancel: appearance points, the clean sheet, the conceded charge and
+the defensive contribution. The first three are constants or bounded club terms.
+The fourth is the one to watch, because `_poisson_at_least` is non-linear and so
+a short sample is genuinely misread rather than merely down-weighted: a
+midfielder with one tackle in five minutes reads 18 actions per 90 and clears a
+bar of 12 at probability 0.94. All four are bounded, so the component below the
+bar sits in roughly `[-1, 10]` however few minutes produced it, and the defcon
+term's badness is anti-correlated with its weight, which is a second thing the
+linear ramp buys and the concave form would not.
+
+**A new noise source, named but not fixed.** `team_defence_rate` has no gate of
+its own and never needed one, because its only consumer was gated. A club's
+conceding rate off one keeper's ninety minutes now reaches the projection, and
+that error is correlated across the twenty-odd players at that club rather than
+diversified away. It is bounded by the two club terms above and by the ramp.
+`ROADMAP.md` carries it.
+
+**Where it can be worse than the old answer.** One case: a player who faced a
+promoted side at home in GW1 has an inflated rate, the ramp reads that as
+talent, and `fixture_multiplier` then adjusts for his next opponent on top, so
+the opponent is counted twice. The model has the same defect at 270 minutes and
+it is sharper at one match, where a single opponent is the whole sample. What
+bounds it is the composite weight, which for a ninety minute player in GW1 is
+`(1/7) * (1/3)`, so a rate wrong by half moves the projection by about 2%. By
+the time the weight is material he has faced two or three different opponents.
+
 ## The haul distribution
 
-`captaincy.py` puts a distribution on the part of a gameweek that swings, so
-that a captaincy decision is not made off a mean. Goals and assists are
-independent Poissons on `attacking_rates`, scaled by the same fixture
-multiplier the projection uses, and the points they pay come from the same
-scoring table.
+**The mean already answers the captaincy question, and this does not replace
+it.** FPL doubles the captain's score, so his contribution to the expected total
+is exactly his expected points, and under a points objective the right captain
+is `argmax xpts_gw`. `haul_frame` therefore ranks on the projection. It ranked
+on `haul_chance` when it was first written, which stated a decision rule this
+model does not hold, and there is now a test that it does not go back.
+
+What the distribution adds is the three things a mean cannot express: that you
+are usually maximising rank rather than points, so a rival's position decides
+whether you want variance or want to avoid it; that Triple Captain is a one-shot
+and cannot be averaged over many weeks; and that a captain most of the field
+already has moves your rank very little. The first and third want a rival or the
+field and are not built. See `ROADMAP.md`.
+
+With that established: `captaincy.py` puts a distribution on the part of a
+gameweek that swings. Goals and assists are independent Poissons on
+`attacking_rates`, scaled by the same fixture multiplier the projection uses,
+and the points they pay come from the same scoring table.
 
 **Independence is stated rather than modelled, and it errs both ways.** Goals
 and assists share a "his team scored three today" factor, so the true joint
@@ -260,8 +371,8 @@ would hide the size of the cut. The points grid sizes itself off the scoring
 table rather than being a constant, so changing what a goal pays cannot leave
 it stale.
 
-**It does not reconcile with `xpts_next`, and the front end says so.** Three
-reasons, and hearing only the first leaves the other two assumed away:
+**It does not reconcile with `xpts_next`, and the front end says so.** Four
+reasons, and hearing only the first leaves the rest assumed away:
 
 1. `xpts_next` also contains clean sheets, saves, goals conceded, defensive
    contribution and cards. None of them are here, so for a keeper or a defender
@@ -270,7 +381,12 @@ reasons, and hearing only the first leaves the other two assumed away:
    rate, so only `w` of the expected goals ever reaches `xpts_next`. This uses
    them at full weight with no blending at all. Even the attacking part is a
    different number.
-3. Bonus is in neither, which makes both understate, but it bites harder here
+3. Below `COMPONENT_MINUTES` the two read different columns as well as
+   different weights: the tab takes `xg90_shrunk` and the projection takes raw
+   `xg90`. So the one narrow claim that does hold, that the distribution's
+   expected goals are `xg90 * minutes_share * multiplier` exactly, holds at and
+   above the bar and is approximate below it.
+4. Bonus is in neither, which makes both understate, but it bites harder here
    because the threshold is absolute. A forward's goal and assist is nine
    points on this scale and twelve on the real one.
 

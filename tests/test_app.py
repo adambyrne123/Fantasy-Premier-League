@@ -125,6 +125,7 @@ def test_the_pool_columns_say_what_they_are():
         "return_chance",
         "xpts_gw",
         "start_chance",
+        "credibility",
     ):
         assert f'"{column}"' in glossary.group(0), f"{column} is not self explanatory"
 
@@ -817,13 +818,16 @@ def test_the_captain_tab_says_what_is_missing_before_the_season(app):
     assert any("Not enough of this season yet" in card for card in _states(at))
 
 
-def test_the_captain_tab_ranks_on_the_haul_chance(midseason_app):
+def test_the_captain_tab_ranks_on_projected_points(midseason_app):
+    """Doubling a score means the captain is whoever is expected to score most.
+    The chances beside it are context for chasing a rank and for Triple
+    Captain, and sorting on them would say otherwise."""
     at = midseason_app.run()
     assert not at.exception
 
     table = next(d.value for d in at.dataframe if getattr(d, "key", None) == "captain_pool")
     assert {"haul_chance", "return_chance", "xpts_gw"} <= set(table.columns)
-    assert table["haul_chance"].is_monotonic_decreasing, "best haul chance first"
+    assert table["xpts_gw"].is_monotonic_decreasing, "best projection first"
     assert table["haul_chance"].between(0, 1).all()
     # a haul without a return is not a thing that can happen
     assert (table["haul_chance"] <= table["return_chance"] + 1e-12).all()

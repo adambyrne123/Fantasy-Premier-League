@@ -35,7 +35,7 @@ uv run fpl-manager ticker --horizon 8
 uv run fpl-manager players --position MID --top 25 --sort value
 uv run fpl-manager transfers --squad squad.json --free 1 --max 2
 uv run fpl-manager xi --squad squad.json
-uv run fpl-manager captains --top 20    # haul chances for the armband
+uv run fpl-manager captains --top 20    # who to captain, and how safe
 uv run fpl-manager find salah              # resolve player ids by name
 uv run fpl-manager chips --squad squad.json   # when to play each chip
 uv run fpl-manager live --entry 1234567    # what your squad is scoring now
@@ -173,7 +173,11 @@ Three terms, deliberately separable so any one can be replaced without touching
 the others. Tuning constants sit at the top of `projections.py`:
 `SHRINKAGE_GAMES`, `DIFFICULTY_ALPHA`, `HOME_BONUS`, `START_RATE_TRUST`,
 `SUB_SHARE`, `STARTER_DURATION`, `STRENGTH_WEIGHT`, `STRENGTH_ALPHA`,
-`PENALTY_XG_P90`, `FREEKICK_XG_P90`, `COMPONENT_MINUTES`, `SAVE_REMAINDER`.
+`PENALTY_XG_P90`, `FREEKICK_XG_P90`, `COMPONENT_MINUTES`, `PRIOR_MINUTES`,
+`SAVE_REMAINDER`. `PRIOR_MINUTES` is a sample floor on a finished season and
+not a tuning knob, and it is deliberately a separate name from
+`COMPONENT_MINUTES` even though both are 270. That one scales a season in
+progress, this one gates one that is over.
 
 **The minutes term must not be derived from minutes.** This is the trap the
 model already fell into once. If `expected_minutes_share` is computed as
@@ -193,15 +197,32 @@ normalisation that the headline number being points depends on.
 deadline every counting stat is last season's, including `total_points`,
 `minutes`, `expected_goals`, `saves`, cards and the defensive contribution
 parts. There is no schema change to notice. What protects the model in August is
-the blend weight being 0, not the 270 minute gate, and those fields are read
-inside `component_rate` and nowhere else so that they stay behind that weight.
-Anything new reading them needs the same guard, and anything ranking on
-`total_points` should go through `roi.points_source`. Full detail, including
-what `tests/conftest.py` does and does not simulate, is in `docs/model.md`.
+the blend weight being 0, and now that the 270 minute bar is a scale rather than
+a gate that is the **only** thing protecting it. Those fields are read through
+`attacking_rates`, which `component_rate` goes through so the rates have one
+definition, and everything on that path sits behind the weight.
+
+`captaincy.py` is the exception and reads them in front of the weight, which is
+why it carries an explicit `gameweeks_played > 0` gate of its own. Anything new
+reading them needs the same, and **a guard that only counts minutes is not a
+guard**. Checked against the live payload on 2026-08-19, two days before GW1:
+median minutes 581, maximum 3420, and 56% of the game already clearing a 270
+minute bar on figures that are entirely last season's.
+Anything ranking on `total_points` should go through `roi.points_source`. Full
+detail, including what `tests/conftest.py` does and does not simulate, is in
+`docs/model.md`.
 
 **Pre-season means no current data.** `gameweeks_played` is 0 until late August,
 so projections rest entirely on last season. Any new model term needs a defined
 pre-season behaviour.
+
+**A player's own numbers fade in, they do not switch on.** `credibility` is
+`min(minutes / COMPONENT_MINUTES, 1)` and multiplies `weight_now` wherever
+current-season data is blended. It is exactly 1 at and above 270 minutes, so
+nothing mid-season moved when it replaced the bar, and the minutes cancel below
+it so a cameo contributes the points scored rather than the rate they imply.
+Do not swap it for the `m / (m + k)` form used by `weight_now`; `docs/model.md`
+says why, and there is a test that fails if you do.
 
 **Doubles and blanks are already handled.** `Season.team_fixtures` emits one row
 per club per fixture. Do not add special casing. If you find yourself writing

@@ -49,6 +49,23 @@ id gives the real bench order and the real armband.
 
 ### Model
 
+**Captaincy against the field, rather than against the scoring table.** The
+Captain tab ranks on projected points, which is the right answer under a points
+objective and is not the question most managers are actually asking. What
+decides a season is rank, and against a rival the useful number is the chance
+you finish above him, which depends on what he captains as much as on what you
+do. A captain sixty percent of the field already has moves your rank very little
+however well he does.
+
+The pieces are in place. `captaincy.py` already produces a points distribution
+per player, `ownership` is parsed, and convolving two managers' distributions is
+the same machinery a double gameweek already uses. What is missing is a model of
+what the field captains: the API gives ownership but not captaincy, so it would
+rest on ownership as a proxy, probably ownership raised to some power and
+normalised, which is a constant set by eye and should be argued for before it is
+written. Start with a single named rival through `leagues.py` rather than the
+whole field, since that needs no proxy at all.
+
 **Position-specific scoring is complete, with two loose ends.**
 `component_rate` now covers every category FPL pays for.
 `corners_and_indirect_freekicks_order` is parsed and deliberately unused, since a
@@ -64,6 +81,26 @@ corner taker's assists are already in his expected assists. What is left:
   overdispersed, so it understates for anyone below his bar. A negative binomial
   would be better and there is nothing to fit its dispersion against. Revisit
   once there is a season of per-match counts to fit one on.
+
+**The captaincy shrinkage target should be last season's expected goals.** Below
+`COMPONENT_MINUTES` the Captain tab shrinks a player's rate towards a
+per-position fit against price, because that is the only stable thing available.
+The right target is his own previous-season xG per 90, with the price fit as the
+fallback for anyone who has none. It is blocked on the parquet:
+`fetch_prior_season` stores points, minutes, starts and end cost only.
+`history_past` does carry `expected_goals` and `expected_assists`, as strings,
+for every season back to 2022/23, so this is a schema change plus a refetch
+rather than a modelling problem. Note the refetch would become mandatory rather
+than advisable, since `build_rates` backfills absent prior columns with NaN and
+a stale parquet would silently not blend.
+
+**`team_defence_rate` has no gate.** It never needed one: its only consumer was
+`component_rate`, which was gated at 270 minutes, so a club rate off one
+keeper's ninety minutes could not reach anything. Now that the gate is a ramp it
+can. It is bounded by the clean sheet and conceded terms and by the ramp itself,
+but unlike the per-player terms the error is correlated across every player at
+that club rather than diversified away, so it does not wash out across a squad.
+The fix is presumably the same credibility treatment on the club's minutes.
 
 **`FakeApi` is kinder pre-season than the real payload.** It zeroes `minutes`,
 `expected_goals` and the counting stats when `played=0`, and the API does not:

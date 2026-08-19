@@ -1,11 +1,26 @@
 """Haul and return chances for the armband.
 
-Everything else in the model is a point estimate, which is the right shape for
-deciding who to own and the wrong shape for deciding who to captain. Two
-players projected at six points are not the same bet if one gets there off a
-steady floor and the other off a one in six chance of a double. This puts a
-distribution on the part of a gameweek that actually swings, so the two can be
-told apart.
+Be clear about what this is for, because it is easy to oversell and it was
+oversold once already. FPL doubles the captain's score, so his contribution to
+your expected total is exactly his expected points. If you are maximising
+points, the right captain is the top of `xpts_gw` and no distribution is
+needed. That is why `haul_frame` ranks on the projection and not on the
+chances: the mean is the answer, and what follows is context for the cases the
+mean cannot express.
+
+There are three of those, and they are narrower than a table of haul chances
+implies:
+
+- **You are usually maximising rank, not points.** Against a rival what
+  matters is the chance you finish above him. Behind, the volatile captain is
+  right even at slightly lower expected points, and ahead the steady one is.
+- **Triple Captain is a one-shot.** You cannot average over many weeks, so the
+  ceiling matters in a way it does not for a decision made every week.
+- **Effective ownership.** If most of the field captains the same player,
+  captaining him barely moves your rank whatever he scores.
+
+The first and the third need a rival or the field, which these two numbers do
+not have on their own. `ROADMAP.md` carries what that would take.
 
 Goals and assists are independent Poissons on the same expected rates
 `component_rate` uses, drawn per fixture, so a double gameweek is a convolution
@@ -87,6 +102,7 @@ COLUMNS = [
     "xpts_gw",
     "haul_chance",
     "return_chance",
+    "credibility",
 ]
 
 __all__ = ["CHART_FLOOR", "COLUMNS", "HAUL_POINTS", "haul_frame", "points_pmf"]
@@ -240,12 +256,27 @@ def _working_set(
     fixtures = fixtures[fixtures["event"] == event]
 
     rates = attacking_rates(season.players)
-    eligible = rates.index[rates["played_enough"].astype(bool)]
+    # Admitted from his first minute rather than his 270th, with `credibility`
+    # saying how much of the number is his own and how much is what his price
+    # implies for his position. A player with no minutes at all is still out,
+    # because there is nothing to put a distribution on, and that is the same
+    # floor `component_rate` uses so the two consumers agree on what having
+    # nothing to say looks like.
+    eligible = rates.index[rates["credibility"] > 0]
     fixtures = fixtures[fixtures["id"].isin(eligible) & fixtures["id"].isin(projections.index)]
     if fixtures.empty:
         return None
 
-    players = projections.loc[sorted(set(fixtures["id"]))].join(rates[["xg90", "xa90"]])
+    # The shrunk pair, because nothing here sits behind a blend weight and a
+    # rate off ninety minutes would otherwise reach a tail undiluted. Read by
+    # their own names throughout rather than renamed on the join, or `xg90`
+    # inside this module would mean something other than `xg90` outside it.
+    # `credibility` is already on the projections frame, put there by
+    # `build_rates` off the same function, so it is read rather than joined a
+    # second time.
+    players = projections.loc[sorted(set(fixtures["id"]))].join(
+        rates[["xg90_shrunk", "xa90_shrunk"]]
+    )
     return players, fixtures, event
 
 
@@ -290,8 +321,8 @@ def _distribution(
                 continue
             block = _gameweek_pmf(
                 np.nan_to_num(wide.to_numpy()[rows][:, :count]),
-                players["xg90"].to_numpy()[rows],
-                players["xa90"].to_numpy()[rows],
+                players["xg90_shrunk"].to_numpy()[rows],
+                players["xa90_shrunk"].to_numpy()[rows],
                 GOAL_POINTS[position],
                 players["start_chance"].to_numpy()[rows],
                 players["sub_chance"].to_numpy()[rows],
@@ -311,7 +342,7 @@ def _return_chance(players: pd.DataFrame, fixtures: pd.DataFrame) -> pd.Series:
     also makes it the sharper of the two tests on the machinery above.
     """
     total = fixtures.groupby("id")["multiplier"].sum().reindex(players.index).fillna(0.0)
-    involvement = (players["xg90"] + players["xa90"]) * total
+    involvement = (players["xg90_shrunk"] + players["xa90_shrunk"]) * total
     quiet = players["start_chance"] * np.exp(-involvement * players["starter_minutes"])
     quiet = quiet + players["sub_chance"] * np.exp(-involvement * SUB_SHARE)
     quiet = quiet + (1.0 - players["start_chance"] - players["sub_chance"]).clip(lower=0.0)
@@ -324,15 +355,20 @@ def haul_frame(
     by_gameweek: pd.DataFrame,
     event: int | None = None,
 ) -> pd.DataFrame:
-    """Haul and return chances for one gameweek, best haul first.
+    """Projected points and the distribution behind them, best projection first.
 
     `haul_chance` is the chance of `HAUL_POINTS` or more from goals, assists and
     appearance points, over however many fixtures the club has that week.
     `return_chance` is the chance of at least one goal or assist.
 
-    Empty until there is enough of this season to mean anything. Players who
-    have not played `COMPONENT_MINUTES` are dropped rather than carried as NaN,
-    since a column of blanks sorts badly and reads as broken.
+    `credibility` is how much of the two chances is the player's own record and
+    how much is what his price implies for his position. It reaches one at
+    `COMPONENT_MINUTES`, and a row at 0.3 is mostly a statement about his price.
+    Read it: absent used to mean no opinion, and a number always reads as a
+    view, so the only honest way to show a short sample is to show how short.
+
+    Empty until a gameweek has been finished. Only a player with no minutes at
+    all is dropped, because there is nothing to put a distribution on.
     """
     solved = _distribution(season, projections, by_gameweek, event)
     if solved is None:
@@ -354,7 +390,11 @@ def haul_frame(
     out["xpts_gw"] = fixtures.groupby("id")["xpts"].sum().reindex(players.index).fillna(0.0)
     out["haul_chance"] = pmf[:, HAUL_POINTS:].sum(axis=1)
     out["return_chance"] = _return_chance(players, fixtures)
-    return out.sort_values("haul_chance", ascending=False)
+    out["credibility"] = players["credibility"]
+    # Ranked on the projection, not on the chances. Doubling a score means the
+    # captain worth having is the one expected to score most, and sorting on
+    # `haul_chance` would state a decision rule this model does not hold.
+    return out.sort_values("xpts_gw", ascending=False)
 
 
 def points_pmf(

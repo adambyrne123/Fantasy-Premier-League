@@ -116,8 +116,8 @@ def test_the_return_chance_is_the_poisson_zero():
     nothing still banks his appearance, so no return and no points differ."""
     players = pd.DataFrame(
         {
-            "xg90": [0.5],
-            "xa90": [0.3],
+            "xg90_shrunk": [0.5],
+            "xa90_shrunk": [0.3],
             "start_chance": [0.7],
             "sub_chance": [0.2],
             "starter_minutes": [0.85],
@@ -209,7 +209,26 @@ def test_the_frame_is_a_table_of_probabilities(season: Season, projections: pd.D
     assert (frame["haul_chance"] <= frame["return_chance"] + 1e-12).all(), (
         "a haul without a return is not a thing that can happen"
     )
-    assert frame["haul_chance"].is_monotonic_decreasing, "best haul chance first"
+    assert frame["xpts_gw"].is_monotonic_decreasing, "best projection first"
+
+
+def test_the_ranking_is_the_projection_and_not_the_haul_chance(
+    season: Season, projections: pd.DataFrame
+):
+    """The armband doubles a score, so the captain worth having is the one
+    expected to score most. Ranking on the haul chance would state a decision
+    rule this model does not hold, and it did once. The two orders differ on
+    real data, which is the whole reason the distinction is worth a test."""
+    if not season.gameweeks_played:
+        pytest.skip("this is the mid-season half of the fixture")
+
+    _, by_gw = project(season, horizon=6)
+    frame = haul_frame(season, projections, by_gw)
+
+    assert frame["xpts_gw"].is_monotonic_decreasing
+    assert not frame["haul_chance"].is_monotonic_decreasing, (
+        "if these two agree the test proves nothing, pick a fixture where they do not"
+    )
 
 
 def test_a_blank_gameweek_has_no_row(season: Season, projections: pd.DataFrame):
@@ -229,20 +248,65 @@ def test_a_blank_gameweek_has_no_row(season: Season, projections: pd.DataFrame):
     assert len(frame)
 
 
-def test_a_player_short_of_the_minutes_gate_is_left_out(season: Season, projections: pd.DataFrame):
-    """Dropped rather than carried as NaN. A column of blanks sorts badly and
-    reads as broken, and there is nothing honest to put in it."""
+def test_a_player_short_of_the_minutes_gate_is_carried_with_his_credibility(
+    season: Season, projections: pd.DataFrame
+):
+    """He used to be dropped, which read as the model having no opinion. It has
+    one, it is mostly his price, and the honest thing is to show the number and
+    say how much of it is his. Somebody who has not played at all is still out,
+    because there is nothing to put a distribution on.
+
+    The short sample is written in rather than looked for. `FakeApi` draws
+    minutes from a fixed set that jumps from 0 to 300, so the fixture cannot
+    reach the regime this whole change is about.
+    """
     if not season.gameweeks_played:
         pytest.skip("this is the mid-season half of the fixture")
 
     from fpl_manager.projections import COMPONENT_MINUTES
 
-    _, by_gw = project(season, horizon=6)
-    short = season.players.index[season.players["minutes"] < COMPONENT_MINUTES]
-    frame = haul_frame(season, projections, by_gw)
+    players = season.players
+    for column in ("minutes", "expected_goals", "expected_assists"):
+        players[column] = pd.to_numeric(players[column], errors="coerce").astype("float64")
 
-    assert len(short), "the fixture should have somebody who has barely played"
-    assert not frame.index.isin(short).any()
+    forwards = players.index[(players["position"] == "FWD") & (players["minutes"] > 0)]
+    cameo = int(forwards[0])
+    never = int(players.index[players["minutes"] == 0][0])
+    # one match played, and one match worth of expected goals to go with it.
+    # Leaving the counting stats where they were would divide a season of xG
+    # by ninety minutes and produce a rate nobody has ever had.
+    players.loc[cameo, "minutes"] = 90.0
+    players.loc[cameo, "expected_goals"] = 0.45
+    players.loc[cameo, "expected_assists"] = 0.20
+
+    fresh, by_gw = project(season, horizon=6)
+    frame = haul_frame(season, fresh, by_gw)
+
+    assert cameo in frame.index, "a short sample is shown, not hidden"
+    assert frame.loc[cameo, "credibility"] == pytest.approx(90 / COMPONENT_MINUTES, abs=1e-12)
+    assert 0 < frame.loc[cameo, "haul_chance"] < 1
+    assert never not in frame.index, "no minutes means no distribution"
+
+
+def test_a_full_sample_is_carried_unshrunk(season: Season, projections: pd.DataFrame):
+    """The property that makes the ramp safe to ship. Anyone past
+    `COMPONENT_MINUTES` has credibility of exactly one, so the shrinkage is the
+    identity for him and his numbers are what they were before any of this."""
+    if not season.gameweeks_played:
+        pytest.skip("this is the mid-season half of the fixture")
+
+    from fpl_manager.projections import COMPONENT_MINUTES, attacking_rates
+
+    _, by_gw = project(season, horizon=6)
+    frame = haul_frame(season, projections, by_gw)
+    full = season.players.index[season.players["minutes"] >= COMPONENT_MINUTES]
+
+    assert len(frame.index.intersection(full))
+    assert (frame.loc[frame.index.intersection(full), "credibility"] == 1.0).all()
+
+    rates = attacking_rates(season.players).loc[full]
+    pd.testing.assert_series_equal(rates["xg90_shrunk"], rates["xg90"], check_names=False)
+    pd.testing.assert_series_equal(rates["xa90_shrunk"], rates["xa90"], check_names=False)
 
 
 def test_the_chart_frame_carries_the_distribution(season: Season, projections: pd.DataFrame):

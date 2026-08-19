@@ -350,17 +350,55 @@ def test_a_neutral_strength_pulls_the_fixture_towards_average(season: Season):
     assert abs(neutral - 1.0) < abs(plain - 1.0), "a neutral rating should soften the rating"
 
 
-def test_the_component_rate_is_inert_pre_season(season: Season):
-    """FPL publishes the expected goals fields as zero until the season starts,
-    so in August this term has nothing to say and the projection has to rest on
-    last season exactly as it did before."""
+def test_the_component_rate_is_inert_with_nothing_played(season: Season):
+    """Nothing played means nothing to rebuild a rate from, so the caller is
+    handed NaN and falls back rather than being given a confident zero.
+
+    Note what this does not prove. It passes because the fixture zeroes minutes
+    pre-season, not because of anything protecting August. The real payload
+    carries three thousand minutes in August and this term produces a full rate
+    off them. See the test below, which is the one about the guard.
+    """
     from fpl_manager.projections import component_rate, team_defence_rate
 
     if season.gameweeks_played:
         pytest.skip("this is the pre-season half of the fixture")
 
     rate = component_rate(season.players, team_defence_rate(season.players))
-    assert rate.isna().all(), "nothing played means nothing to rebuild a rate from"
+    assert rate.isna().all()
+
+
+def test_the_component_rate_is_not_what_protects_august(season: Season):
+    """It builds a rate on the August payload happily and wrongly.
+
+    What stops those numbers reaching the projection is the blend weight being
+    zero until a gameweek has been played. That was always true and it used to
+    have a 270 minute bar standing beside it doing nothing; now the bar is a
+    scale, so the weight is the only thing left. Worth a test at the cause
+    rather than only at the consequence.
+    """
+    from fpl_manager.projections import (
+        build_rates,
+        component_rate,
+        load_prior,
+        team_defence_rate,
+    )
+
+    if season.gameweeks_played:
+        pytest.skip("this is the pre-season half of the fixture")
+
+    fitted = load_prior(season)
+    before = build_rates(season, fitted)["points_per_90"]
+
+    stale = season.players
+    stale["minutes"] = 3000
+    stale["expected_goals"] = 12.0
+    stale["expected_assists"] = 8.0
+    stale["expected_goals_conceded"] = 45.0
+
+    rate = component_rate(stale, team_defence_rate(stale))
+    assert rate.notna().any(), "it happily rebuilds a rate out of last season"
+    pd.testing.assert_series_equal(before, build_rates(season, fitted)["points_per_90"])
 
 
 def test_a_penalty_taker_outprojects_an_identical_team_mate(season: Season):
@@ -875,15 +913,29 @@ def test_unavailable_players_project_no_minutes(season: Season, projections: pd.
 
 
 def test_shrinkage_shifts_weight_towards_current_season(prior: pd.DataFrame):
-    """Pre-season leans entirely on prior data, mid-season blends it."""
+    """Pre-season leans entirely on prior data, mid-season blends it.
+
+    Asserted on `points_per_90` rather than on `current_p90` being NaN. The
+    latter is a property of the fixture, which zeroes minutes pre-season, and
+    would pass whether or not the model did the right thing.
+    """
     from .conftest import FakeApi
 
     pre = Season(FakeApi(played=0))
     mid = Season(FakeApi(played=12))
     pre_proj = project(pre, horizon=6, prior=prior.reindex(pre.players.index))[0]
     mid_proj = project(mid, horizon=6, prior=prior.reindex(mid.players.index))[0]
-    assert pre_proj["current_p90"].isna().all()
-    assert mid_proj["current_p90"].notna().any()
+
+    pd.testing.assert_series_equal(
+        pre_proj["points_per_90"], pre_proj["prior_p90"], check_names=False
+    )
+    assert not mid_proj["points_per_90"].equals(mid_proj["prior_p90"])
+
+    # and how far a player has moved off his prior is ordered by how much of
+    # his own season is behind him, which is the ramp doing its job
+    moved = (mid_proj["points_per_90"] - mid_proj["prior_p90"]).abs()
+    assert moved[mid_proj["credibility"] == 0].max() == pytest.approx(0.0, abs=1e-12)
+    assert moved[mid_proj["credibility"] > 0].max() > 0
 
 
 def test_projection_survives_missing_prior_data(season: Season):
@@ -926,7 +978,6 @@ def test_the_attacking_rates_are_the_ones_the_component_rate_uses():
     """One definition of expected goals per 90. Two is how the Players tab and
     the Captain tab come to disagree about the same forward."""
     from fpl_manager.projections import (
-        COMPONENT_MINUTES,
         GOAL_POINTS,
         PENALTY_XG_P90,
         attacking_rates,
@@ -935,31 +986,286 @@ def test_the_attacking_rates_are_the_ones_the_component_rate_uses():
 
     players = pd.DataFrame(
         {
-            "minutes": [900.0, float(COMPONENT_MINUTES - 1)],
-            "expected_goals": [5.0, 5.0],
-            "expected_assists": [2.0, 2.0],
-            "penalties_order": [1.0, 1.0],
-            "direct_freekicks_order": [np.nan, np.nan],
-            "position": ["MID", "MID"],
+            "minutes": [900.0, 135.0, 0.0],
+            "expected_goals": [5.0, 0.30, 0.0],
+            "expected_assists": [2.0, 0.15, 0.0],
+            "penalties_order": [1.0, 1.0, 1.0],
+            "direct_freekicks_order": [np.nan, np.nan, np.nan],
+            "position": ["MID", "MID", "MID"],
+            "now_cost": [95, 75, 45],
         },
-        index=[1, 2],
+        index=[1, 2, 3],
     )
     rates = attacking_rates(players)
+
+    # a full sample: measured, and the shrinkage is the identity
     assert rates.loc[1, "xg90"] == pytest.approx(5.0 / 10 + PENALTY_XG_P90, abs=1e-12)
     assert rates.loc[1, "xa90"] == pytest.approx(2.0 / 10, abs=1e-12)
+    assert rates.loc[1, "credibility"] == 1.0
+    assert rates.loc[1, "xg90_shrunk"] == pytest.approx(rates.loc[1, "xg90"], abs=1e-12)
+    assert rates.loc[1, "xa90_shrunk"] == pytest.approx(rates.loc[1, "xa90"], abs=1e-12)
     assert bool(rates.loc[1, "played_enough"])
 
-    # below the gate what is left is the set piece duty on its own, zero rather
-    # than NaN, so the term drops out instead of taking the component with it
-    assert rates.loc[2, "xg90"] == pytest.approx(PENALTY_XG_P90, abs=1e-12)
-    assert rates.loc[2, "xa90"] == 0.0
-    assert not bool(rates.loc[2, "played_enough"])
+    # half a sample: measured at full strength in the raw pair, half shrunk in
+    # the other, and the set piece bump outside the shrinkage in both
+    assert rates.loc[2, "credibility"] == pytest.approx(0.5, abs=1e-12)
+    measured_g = 0.30 / 1.5
+    assert rates.loc[2, "xg90"] == pytest.approx(measured_g + PENALTY_XG_P90, abs=1e-12)
+
+    # Too few in the position group to fit a line, so the target degrades to
+    # the median of what has been measured, which is the two players who have
+    # played. Half his own reading and half that, and the bump added after.
+    target = float(np.median([5.0 / 10, measured_g]))
+    assert rates.loc[2, "xg90_shrunk"] == pytest.approx(
+        0.5 * measured_g + 0.5 * target + PENALTY_XG_P90, abs=1e-12
+    )
+    assert rates.loc[2, "xg90_shrunk"] != pytest.approx(rates.loc[2, "xg90"], abs=1e-6)
+
+    # nothing played: the set piece duty on its own, which adjusts a rate and
+    # never makes one, and a component the caller is told nothing about
+    assert rates.loc[3, "xg90"] == pytest.approx(PENALTY_XG_P90, abs=1e-12)
+    assert rates.loc[3, "xa90"] == 0.0
+    assert rates.loc[3, "credibility"] == 0.0
+    assert np.isnan(component_rate(players, None)[3])
 
     # and the component rate is reading these rather than keeping its own copy
     bumped = players.copy()
     bumped.loc[1, "expected_goals"] = 6.0
     moved = component_rate(bumped, None)[1] - component_rate(players, None)[1]
     assert moved == pytest.approx(GOAL_POINTS["MID"] * 0.1, abs=1e-9)
+
+
+COUNTS_THAT_SCALE = (
+    "total_points",
+    "expected_goals",
+    "expected_assists",
+    "saves",
+    "defensive_contribution",
+    "yellow_cards",
+    "red_cards",
+)
+
+
+def _rate_at_minutes(season: Season, prior: pd.DataFrame, pid: int, minutes: int) -> float:
+    """Rebuild one player at `minutes`, with his per 90 rates held constant.
+
+    Every counting stat is scaled with the minutes, so the only thing changing
+    between calls is how much of a sample there is, not what the sample says.
+    """
+    from fpl_manager.projections import COMPONENT_MINUTES, build_rates
+
+    scale = minutes / COMPONENT_MINUTES
+    season.players.loc[pid, "minutes"] = float(minutes)
+    for column in COUNTS_THAT_SCALE:
+        if column in season.players.columns:
+            season.players.loc[pid, column] = float(BASE_COUNTS[column] * scale)
+    return float(build_rates(season, prior).loc[pid, "points_per_90"])
+
+
+BASE_COUNTS = {
+    "total_points": 18.0,
+    "expected_goals": 1.5,
+    "expected_assists": 0.9,
+    "saves": 0.0,
+    "defensive_contribution": 30.0,
+    "yellow_cards": 1.0,
+    "red_cards": 0.0,
+}
+
+
+def test_the_rate_does_not_jump_at_the_minutes_gate(prior: pd.DataFrame):
+    """The bug this exists for.
+
+    The rate used to be gated on 270 minutes this season, so at 269 minutes a
+    player was entirely last season and at 270 he was 36% last season, 24% this
+    one and 40% rebuilt. Sixty four percent of a rate arrived on one minute of
+    football. Nothing about a player changes between his 269th minute and his
+    270th, so nothing about his projection should either.
+
+    Rates are held constant across the sweep, so every step here is the ramp
+    fading his own record in and nothing else.
+    """
+    from .conftest import FakeApi
+
+    season = Season(FakeApi(played=3))
+    for column in (*COUNTS_THAT_SCALE, "minutes"):
+        if column in season.players.columns:
+            season.players[column] = season.players[column].astype("float64")
+
+    pid = int(season.players.index[5])
+    fitted = prior.reindex(season.players.index)
+    rates = {m: _rate_at_minutes(season, fitted, pid, m) for m in range(255, 291)}
+
+    steps = [abs(rates[m + 1] - rates[m]) for m in range(255, 290)]
+    at_the_bar = abs(rates[270] - rates[269])
+    assert at_the_bar <= max(steps) + 1e-12, "the old bar is no longer a special minute"
+    assert max(steps) < 0.05, "no step big enough to read as a cliff"
+
+    # below it his own record fades in, above it he is already fully trusted so
+    # nothing moves at all. That second half is what says the change is
+    # confined to the hole it was meant to fill.
+    assert rates[269] > rates[255], "more of his own season counts for more"
+    above = [rates[m] for m in range(271, 291)]
+    assert max(above) - min(above) < 1e-12, "past the bar the ramp is spent"
+
+
+def test_the_credibility_ramp_has_the_shape_it_claims():
+    """Reaching exactly one at `COMPONENT_MINUTES` is the property that makes
+    this safe: it is what says nothing at or above the old bar moved. A
+    well-meaning swap to the `m / (m + k)` form used elsewhere would never
+    reach one and would quietly reprice every week of the season."""
+    from fpl_manager.projections import COMPONENT_MINUTES, credibility
+
+    assert credibility(pd.Series([0.0])).iloc[0] == 0.0
+    assert credibility(pd.Series([float(COMPONENT_MINUTES)])).iloc[0] == 1.0
+    assert credibility(pd.Series([10_000.0])).iloc[0] == 1.0
+    assert credibility(pd.Series([135.0])).iloc[0] == pytest.approx(0.5, abs=1e-12)
+
+    sweep = credibility(pd.Series([0.0, 45.0, 90.0, 200.0, 269.0, 270.0, 5000.0]))
+    assert sweep.is_monotonic_increasing
+    assert sweep.between(0, 1).all()
+
+
+def test_a_cameo_contributes_its_points_and_not_the_rate_they_imply(prior: pd.DataFrame):
+    """Ten minutes and fifteen points implies 162 points per 90 and must not be
+    read that way.
+
+    It is not, and the reason is that the minutes cancel: `(m / 270) * (points
+    * 90 / m)` is `points / 3` whatever `m` was. So two players with the same
+    points from wildly different cameos contribute exactly the same amount, and
+    there is no `m` small enough to break it. Asserted as that equality rather
+    than as a bound, because the equality is the actual property.
+    """
+    from fpl_manager.projections import COMPONENT_MINUTES, SHRINKAGE_GAMES, build_rates
+
+    from .conftest import FakeApi
+
+    season = Season(FakeApi(played=1))
+    for column in (*COUNTS_THAT_SCALE, "minutes"):
+        if column in season.players.columns:
+            season.players[column] = season.players[column].astype("float64")
+
+    fitted = prior.reindex(season.players.index)
+    # two players of the same position and club, so the component terms that do
+    # not cancel are identical for both and only the cameo differs
+    mids = season.players.index[season.players["position"] == "MID"]
+    brief, longer = int(mids[0]), int(mids[1])
+    for pid in (brief, longer):
+        for column in COUNTS_THAT_SCALE:
+            if column in season.players.columns:
+                season.players.loc[pid, column] = 0.0
+        season.players.loc[pid, "total_points"] = 15.0
+        season.players.loc[pid, "team"] = season.players.loc[brief, "team"]
+    fitted.loc[[brief, longer], "prior_points"] = 120.0
+    fitted.loc[[brief, longer], "prior_minutes"] = 2700.0
+    fitted.loc[[brief, longer], "prior_starts"] = 30.0
+
+    season.players.loc[brief, "minutes"] = 10.0
+    season.players.loc[longer, "minutes"] = 100.0
+    rates = build_rates(season, fitted)
+
+    # ten times the minutes, so exactly a tenth of the implied rate. That gap
+    # is the thing the ramp has to absorb.
+    assert rates.loc[brief, "current_p90"] == pytest.approx(
+        10 * rates.loc[longer, "current_p90"], abs=1e-9
+    )
+
+    # and it absorbs it exactly. What each carries into the blend is his
+    # credibility times his rate, which is his points times ninety over
+    # `COMPONENT_MINUTES` and has no minutes left in it.
+    carried = rates["credibility"] * rates["current_p90"]
+    expected = 15.0 * 90 / COMPONENT_MINUTES
+    assert carried[brief] == pytest.approx(expected, abs=1e-9)
+    assert carried[longer] == pytest.approx(expected, abs=1e-9)
+
+    # The two rates still differ a little, and should: the same fixed
+    # contribution sits on top of a prior that the longer sample discounts more.
+    # What matters is that both stay inside the same bound, which is what the
+    # cancellation buys. With no counting stats on either player the component
+    # half is only appearance points and the club's defence, so this is close to
+    # the observed half on its own.
+    prior_p90 = rates.loc[brief, "prior_p90"]
+    bound = (1 / (1 + SHRINKAGE_GAMES)) * expected
+    for pid in (brief, longer):
+        assert abs(rates.loc[pid, "points_per_90"] - prior_p90) <= bound + 1e-9, (
+            "a cameo moved the rate by more than the points it actually scored"
+        )
+
+
+def test_the_credibility_ramp_is_not_a_guard_and_never_was(season: Season):
+    """On the payload the API actually serves in August every player looks
+    fully credible, because his three thousand minutes are last season's. The
+    ramp is a weight and reading it as a gate is how August goes wrong. What
+    protects the model then is the blend weight being zero, and now that the
+    minutes bar is a scale that is the only thing left doing it."""
+    from fpl_manager.projections import build_rates, credibility, load_prior
+
+    if season.gameweeks_played:
+        pytest.skip("this is the pre-season half of the fixture")
+
+    fitted = load_prior(season)
+    before = build_rates(season, fitted)["points_per_90"]
+
+    stale = season.players
+    stale["minutes"] = 3000
+    stale["total_points"] = 150
+    stale["expected_goals"] = 12.0
+
+    assert (credibility(season.players["minutes"]) == 1.0).all(), "wide open, as designed"
+    pd.testing.assert_series_equal(before, build_rates(season, fitted)["points_per_90"])
+
+
+def test_the_shrinkage_degrades_rather_than_raising():
+    """`attacking_rates` is public and reads a frame it does not own. A payload
+    without a price or a position loses the shrinkage target, which costs the
+    Captain tab some caution and costs the projection nothing, because
+    `component_rate` reads the raw pair. Losing one term beats raising."""
+    from fpl_manager.projections import attacking_rates
+
+    full = pd.DataFrame(
+        {
+            "minutes": [900.0, 900.0],
+            "expected_goals": [5.0, 1.0],
+            "expected_assists": [2.0, 1.0],
+            "now_cost": [95, 55],
+            "position": ["MID", "MID"],
+        },
+        index=[1, 2],
+    )
+    for missing in ("now_cost", "position"):
+        rates = attacking_rates(full.drop(columns=[missing]))
+        assert rates["xg90_shrunk"].notna().all(), f"dropping {missing} should not raise"
+        assert rates["xg90"].notna().all()
+
+    # and a frame where nobody has played at all still comes back whole
+    idle = full.assign(minutes=0.0)
+    rates = attacking_rates(idle)
+    assert (rates["credibility"] == 0.0).all()
+    assert rates["xg90_shrunk"].notna().all()
+
+
+def test_the_set_piece_bump_is_not_shrunk():
+    """It is a claim about a job a player has just been given, not a reading
+    off his past. Shrinking it towards what his price implies would make a
+    newly appointed penalty taker less visible in his first gameweek than he is
+    in his tenth, which is backwards."""
+    from fpl_manager.projections import PENALTY_XG_P90, attacking_rates
+
+    players = pd.DataFrame(
+        {
+            "minutes": [90.0, 90.0],
+            "expected_goals": [0.0, 0.0],
+            "expected_assists": [0.0, 0.0],
+            "penalties_order": [1.0, np.nan],
+            "direct_freekicks_order": [np.nan, np.nan],
+            "position": ["MID", "MID"],
+            "now_cost": [75, 75],
+        },
+        index=[1, 2],
+    )
+    rates = attacking_rates(players)
+    gap = rates.loc[1, "xg90_shrunk"] - rates.loc[2, "xg90_shrunk"]
+    assert gap == pytest.approx(PENALTY_XG_P90, abs=1e-12), "the bump survives at full size"
 
 
 # ----------------------------------------------------------------------
