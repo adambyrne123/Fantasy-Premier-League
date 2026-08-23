@@ -270,11 +270,17 @@ class FakeApi:
     def fixtures_for_event(self, gameweek: int) -> list[dict]:
         """One gameweek's fixtures, with in-play stats on the live ones.
 
-        The first fixture of the gameweek is finished and has had its bonus
-        applied, the second is under way with bonus still to be decided, the
-        third has played out but not been audited, and the rest have not kicked
-        off. That is the mix a live view has to render correctly on a Saturday
-        afternoon.
+        The first fixture of the gameweek is audited, the second is under way
+        with bonus still to be decided, the third has played out in the minutes
+        before its bonus landed, the fourth has played out with its bonus
+        applied and no audit yet, and the rest have not kicked off. That is the
+        mix a live view has to render correctly on a Saturday afternoon.
+
+        The fourth is the state most of a real weekend is actually in, and it
+        was missing. Checked against GW1 2026/27: nine of ten matches were over
+        with their real bonus applied and `finished` false on every one of
+        them. Without a fixture in that state nothing here could tell a bonus
+        caption that reads the whistle from one that reads the audit.
 
         The third one is the case that matters and the one this used to be
         missing. FPL sets `finished` only once it has confirmed the gameweek's
@@ -309,12 +315,26 @@ class FakeApi:
                 fixture["finished_provisional"] = False
                 fixture["stats"] = [{"identifier": "bps", "h": bps_h, "a": bps_a}]
             elif i == 2:
-                # over, but not yet audited: no bonus block, so the bonus for it
-                # is still ours to work out while the substitutions are not
+                # over, and in the few minutes before bonus is applied: the
+                # bonus is still ours to work out while the substitutions are not
                 fixture["started"] = True
                 fixture["finished"] = False
                 fixture["finished_provisional"] = True
                 fixture["stats"] = [{"identifier": "bps", "h": bps_h, "a": bps_a}]
+            elif i == 3:
+                # over with its bonus applied, and still unaudited, which is
+                # where a real match sits for most of the weekend after it ends
+                fixture["started"] = True
+                fixture["finished"] = False
+                fixture["finished_provisional"] = True
+                fixture["stats"] = [
+                    {"identifier": "bps", "h": bps_h, "a": bps_a},
+                    {
+                        "identifier": "bonus",
+                        "h": [{"element": home[0], "value": 3}],
+                        "a": [{"element": away[0], "value": 2}],
+                    },
+                ]
             else:
                 fixture["started"] = False
                 fixture["finished"] = False

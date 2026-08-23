@@ -207,15 +207,28 @@ class LiveGameweek:
         return bool(self.played_out.all())
 
     @property
-    def all_confirmed(self) -> bool:
-        """Every match audited by FPL, so bonus is the real thing and not ours.
+    def bonus_is_final(self) -> bool:
+        """Whether every bonus point on screen is FPL's own rather than ours.
 
-        A separate question from `all_settled` and a later one. Bonus really is
-        applied at audit time, so this is the one the bonus caption reads.
+        The second flag to be caught reading the audit for a question the
+        whistle answers. This used to be `all_confirmed` and read `finished`,
+        on the belief that bonus lands when FPL confirms the gameweek. It does
+        not. Checked against GW1 2026/27 with nine of ten matches played: every
+        one of them carried its real bonus block with `finished` still false,
+        so the caption read "Provisional" all weekend over figures FPL had
+        already awarded.
+
+        Asked of started fixtures only, because a match that has not kicked off
+        contributes no bonus either way and waiting on it would call the
+        weekend provisional over an arithmetic nobody is doing. That makes this
+        exactly the condition under which `provisional_bonus` returns nothing,
+        which is the honest reading of the caption: not that the gameweek is
+        settled, but that no number in front of you is a guess.
         """
         if self.fixtures.empty:
             return False
-        return bool(self.fixtures["finished"].all())
+        awaiting = self.fixtures["started"] & ~self.fixtures["bonus_added"]
+        return not bool(awaiting.any())
 
     def points(self, element: int) -> int:
         """A player's score including bonus that has not been applied yet."""

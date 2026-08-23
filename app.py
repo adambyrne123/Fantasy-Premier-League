@@ -3366,10 +3366,10 @@ with live_tab:
                 _cell("Gameweek", f"GW{live_gw}"),
                 _cell(
                     "Fixtures",
-                    f"{finished} of {total} finished",
+                    f"{finished} of {total} played out",
                     "soon" if state.in_play else "",
                 ),
-                _cell("Bonus", "Final" if state.all_confirmed else "Provisional"),
+                _cell("Bonus", "Final" if state.bonus_is_final else "Provisional"),
                 _cell("Updated", age if polling else "Not polling"),
             ]
             st.markdown(f'<div class="statusbar">{"".join(cells)}</div>', unsafe_allow_html=True)
@@ -3403,9 +3403,14 @@ with live_tab:
             )
 
             if not score.lineup.settled:
+                # in play and still to come are different states, and a weekend
+                # gameweek spends hours in the second one with nothing on
                 st.caption(
-                    "Matches are still being played, so bonus and any automatic "
+                    "Matches are being played, so bonus and any automatic "
                     "substitutions below can still change."
+                    if state.in_play
+                    else "Some of your players have a match still to come, so "
+                    "automatic substitutions below can still change."
                 )
             if my_squad.captain_id is None:
                 st.caption(

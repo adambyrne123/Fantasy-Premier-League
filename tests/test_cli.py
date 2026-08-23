@@ -130,6 +130,41 @@ def test_live_scores_the_gameweek_under_way(wired, squad_file, capsys):
     assert "Starting XI" in out
 
 
+def test_live_counts_fixtures_by_the_whistle_not_the_audit(wired, squad_file, capsys):
+    """The app was fixed for this and the CLI was not, so it went on printing
+    zero of ten all weekend with eight of them long over."""
+    cli.main(["--horizon", "3", "live", "--squad", squad_file])
+    out = capsys.readouterr().out
+
+    assert "0 of" not in out, "the fake has matches that have played out"
+    assert "played out." in out
+
+
+def test_live_does_not_call_a_gameweek_between_matches_not_started(
+    monkeypatch, wired, squad_file, capsys
+):
+    """A weekend gameweek spends hours with nothing in play and plenty played,
+    and a status ladder without that rung reads as though nothing has happened.
+    """
+    real = api.FplApi.fixtures_for_event
+
+    def between(self, gameweek):
+        rows = [dict(f) for f in real(self, gameweek)]
+        for fixture in rows:
+            if fixture["started"] and not fixture["finished_provisional"]:
+                # send the one still being played to the whistle, leaving the
+                # unplayed fixtures alone
+                fixture["finished_provisional"] = True
+        return rows
+
+    monkeypatch.setattr(api.FplApi, "fixtures_for_event", between)
+    cli.main(["--horizon", "3", "live", "--squad", squad_file])
+    out = capsys.readouterr().out
+
+    assert "not started" not in out
+    assert "under way" in out
+
+
 def test_live_says_so_rather_than_raising_before_a_kickoff(monkeypatch, wired, squad_file, capsys):
     """Out of season every live endpoint is empty. Saying nothing is being
     played beats a traceback."""

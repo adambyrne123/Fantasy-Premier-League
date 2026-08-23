@@ -76,9 +76,30 @@ payload during GW1 on 2026-08-23: eight of ten fixtures had `minutes: 90` and
 earlier. Reading `finished` is why the fixture counter said zero of ten and why
 automatic substitutions never resolved during a weekend, which is the one time
 anybody is watching. `LiveGameweek.played_out` is the property to ask, and
-`settled` goes through it. `all_confirmed` is the separate, later question and
-is the one bonus reads, because bonus really is applied at audit time.
-`Season.club_form` documents the same trap from the fixtures side.
+`settled` goes through it. `Season.club_form` documents the same trap from the
+fixtures side.
+
+This used to go on to say that bonus is the separate, later question, applied at
+audit time, and that a property reading `finished` was the right one for it.
+That was wrong, and the same weekend disproved it. Bonus is applied at the
+whistle along with `finished_provisional`: all nine played fixtures of GW1 on
+2026-08-23 carried a populated `bonus` block with `finished` still false, so the
+caption gated on it read "Provisional" over figures FPL had already awarded.
+`LiveGameweek.bonus_is_final` is the replacement and asks whether any started
+fixture is still waiting on its `bonus` block, which is exactly the condition
+under which `provisional_bonus` has anything to say.
+
+**The fixture payload moves at the whistle and the entry payload moves at the
+audit.** The rule behind both of the above, and the one to apply to any new
+question. Anything read off `fixtures/?event=` is current within the minute.
+Anything hanging off an entry, meaning `automatic_subs`, each pick's
+`multiplier` and the gameweek totals in `entry/{id}/history/`, is recomputed
+only when FPL processes the gameweek. Measured on GW1 with nine of ten matches
+played out: the entry history reported 29 points while its own per player live
+figures summed to 35 over its own multipliers, the gap being every match after
+Saturday. So an entry total is not an oracle for a live score, and the site's
+own live total is built from `event/{gw}/live/` client side, the same way this
+is.
 
 **A month is ours, not FPL's, and it costs a request per manager.** There is no
 monthly endpoint and no monthly field anywhere in the API.
@@ -127,13 +148,29 @@ Routing it through `optimiser.pick_xi` would field a better XI than FPL actually
 will, which is a wrong answer stated confidently, and would import the optimiser
 into a module that must stay a leaf.
 
-**None of the live code has met a real match yet.** It was written pre-season,
-when `event/{gw}/live/` returns zero elements and no fixture carries a stats
-array, so every test behind it runs on synthetic payloads shaped like the
-documented one. The empty case is handled and verified against the real API,
-but the bonus ranking and the substitution rule have only ever been exercised
-against a fake. Treat the first matchday of the season as the real test, and
-check a scored gameweek against the FPL site before trusting a number on it.
+**The live code is checked against the API rather than against the site.**
+`tests/test_live_against_the_api.py` diffs what it works out against what FPL
+published: our bonus arithmetic against the fixture's own `bonus` block, our
+substitutions against `automatic_subs`, our eleven against the `multiplier` FPL
+rewrites onto each pick, and our total against the entry history. Every test in
+it carries the `network` marker, which `addopts` deselects, so `pytest -m
+network` is the way in and CI never runs it. Nothing in it hardcodes a
+gameweek: each test finds the most recent one that can answer it and skips when
+none can, which is what makes it worth running again after every weekend rather
+than once.
+
+Two gates, and the split is the point. The bonus tests need only a fixture with
+its bonus applied. Everything reading the entry payload waits for `finished`
+across the gameweek, because of the lag above; gating those on the whistle
+produces a confident failure in the window between the two, which was
+demonstrated rather than guessed at.
+
+What GW1 proved: the bonus ranking, across nine fixtures and two real tie cases,
+and that filtering the bonus points system to positive scores never costs a
+winner, on a weekend where scores reached -14 and the lowest winning score was
+27. What it could not prove: a gameweek containing an actual automatic
+substitution, since none was needed, and a double gameweek, where the
+per-fixture and summed bonus figures diverge.
 
 ## Fixtures
 
@@ -151,9 +188,10 @@ gameweeks with no fixtures at all, or the far end of the horizon reads as twenty
 clubs blanking at once.
 
 **`finished` on a fixture does not mean the match has been played.** FPL sets it
-only once the whole gameweek's bonus has been confirmed, which is a day or more
-after the final whistle, and `finished_provisional` is what flips when the
-referee does. Checked against the live payload during GW1 on 2026-08-23: six
+only once it has audited the gameweek's data, which is a day or more after the
+final whistle, and `finished_provisional` is what flips when the referee does.
+Bonus is not what it is waiting on: that lands at the whistle, as the live
+scoring section above sets out. Checked against the live payload during GW1 on 2026-08-23: six
 matches had final scorelines and `finished_provisional` true with `finished`
 still false, one of them played two days earlier.
 

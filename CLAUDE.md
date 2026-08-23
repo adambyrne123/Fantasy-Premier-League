@@ -277,13 +277,32 @@ visitor until someone reboots by hand. After a push that adds or renames
 anything in `fpl_manager`, load the app and reboot it if it errors.
 `docs/delivery.md` explains why the traceback misleads you while it lasts.
 
-**The live code met its first real match in GW1 and got one thing wrong.** It
-was written pre-season on synthetic payloads, and the first live weekend found
-that `finished` is the audit rather than the whistle, which left the fixture
-counter reading zero of ten and automatic substitutions unresolved all weekend.
-`LiveGameweek.played_out` is the fix and `docs/gotchas.md` carries the detail.
-The bonus ranking still has not been checked against a real award, so treat that
-as the part not yet proven.
+**The live payloads move at two different times, and reading the wrong one is
+the mistake this code keeps making.** A fixture updates at the whistle:
+`finished_provisional` goes true, and the real `bonus` block appears, both a day
+or more before FPL sets `finished`. Everything hanging off an entry, meaning
+`automatic_subs`, each pick's `multiplier` and the gameweek total in the entry
+history, is recomputed only at that audit. Measured on GW1 2026/27 with nine of
+ten matches played out: the entry history said 29 while its own live figures
+summed to 35.
+
+That has produced the same bug twice. `finished` for "is this match over" left
+the fixture counter reading zero of ten and automatic substitutions unresolved
+all weekend, fixed by `LiveGameweek.played_out`. `finished` for "is this bonus
+FPL's or ours" called FPL's own award provisional for the whole weekend, fixed
+by `LiveGameweek.bonus_is_final`, which asks whether any started fixture is
+still waiting on its bonus block. Read `played_out` and `bonus_is_final`, never
+`finished` directly, and if a third question comes up, work out which payload
+answers it before picking a flag. `docs/gotchas.md` carries the detail.
+
+**The bonus ranking is now checked against real awards.**
+`tests/test_live_against_the_api.py` diffs it against the `bonus` block FPL
+published, along with the substitutions, the eleven and the total, using the API
+as its own oracle. It is `network` marked so it stays out of CI and out of a
+normal run; `uv run pytest -m network` is the way in, and it is worth running
+after a gameweek is audited. Nine GW1 fixtures agreed, tie cases included. Still
+unproven: a gameweek containing an actual automatic substitution, and a double,
+where the per-fixture and summed bonus figures diverge.
 
 ## Testing
 
