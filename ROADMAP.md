@@ -57,14 +57,21 @@ you finish above him, which depends on what he captains as much as on what you
 do. A captain sixty percent of the field already has moves your rank very little
 however well he does.
 
-The pieces are in place. `captaincy.py` already produces a points distribution
-per player, `ownership` is parsed, and convolving two managers' distributions is
-the same machinery a double gameweek already uses. What is missing is a model of
-what the field captains: the API gives ownership but not captaincy, so it would
-rest on ownership as a proxy, probably ownership raised to some power and
-normalised, which is a constant set by eye and should be argued for before it is
-written. Start with a single named rival through `leagues.py` rather than the
-whole field, since that needs no proxy at all.
+The blocker is gone. This used to say that the API gives ownership but not
+captaincy, so a model of the field would have to rest on ownership raised to
+some power set by eye. `elite.py` measures it instead: a hundred squads say who
+was captained and what effective ownership was, and the Captain tab already
+shows both. What is left is the arithmetic, which is convolving your
+distribution against the field's the way a double gameweek is already convolved,
+and `captaincy.py` produces the distributions for it.
+
+Two things to know before starting. `captaincy.py` is held to importing `data`
+and `projections` only, so the shares go in as an argument rather than as an
+import, and there is a test that fails if that is done the other way. And the
+shares describe the gameweek just gone: last week's armband is a decent guide to
+next week's and it is not the same question, so whatever uses them has to say
+which one it is answering. A single named rival through `leagues.py` is still
+the easier first version, since it needs no sample at all.
 
 **Position-specific scoring is complete, with two loose ends.**
 `component_rate` now covers every category FPL pays for.
@@ -159,6 +166,36 @@ reconcile with it exactly. Left as a choice to revisit rather than a defect: the
 alternatives are counting the captain over the horizon, which overstates, or
 reporting everything per gameweek.
 
+### The field
+
+**Transfers in and out among the top managers.** `elite.py` counts one
+gameweek's squads. Two gameweeks and a diff gives what the best managers are
+actually moving, which is the other half of what makes ownership worth reading,
+and it is what the public spreadsheets show as their most transferred lists. The
+cost is what stops it being obvious: it doubles a fetch that is already one
+request per manager, and the second gameweek is only useful while it is recent.
+Sample fewer managers rather than fetching twice as many payloads.
+
+**The field describes the gameweek just gone, and could describe this one.**
+`app.py` asks for `season.gameweeks_played`, so the shares are the last settled
+gameweek. Picks are published the moment a deadline passes, so from the deadline
+onwards the current gameweek is readable and is the more useful question: what
+the top managers are playing this week, armband included, rather than what they
+played last week. Two things make it a separate piece of work rather than
+changing one argument. `elite_entries` reads a league table that only moves when
+a gameweek is scored, so the sample would be last week's managers with this
+week's squads, which is fine but needs saying on screen. And mid-gameweek the
+multipliers have not been rewritten by automatic substitutions yet, so
+`elite_start_share` would read the lineup named rather than the one that
+counted, which is the right answer for planning and the wrong one for a record.
+
+**Nothing reads the chips the field has played.** `elite_picks` carries
+`active_chip` per manager and nothing counts it. How many of the top hundred
+have used their wildcard is a real input to chip timing and it is one groupby
+away, and it belongs beside `chips.py` output rather than inside it, since
+`chips.py` prices a chip against your own squad and this is a fact about other
+people.
+
 ### Live
 
 **A price rate rather than a running total.** `prices.py` computes
@@ -229,6 +266,8 @@ is read by nothing else.
 **ICT index, influence, creativity, threat.** Composites built from the same
 underlying events as expected goals and assists, on an uninterpretable scale, and
 lagging. Adding xG made them redundant. Not parsed, and should stay that way.
+Every public FPL spreadsheet carries them prominently, so this one comes back
+round whenever one of those is read for ideas.
 
 **`my-team/{id}/`** for true selling prices and real free-transfer counts. Needs
 authentication. Read-only is a design decision, not a limitation to be fixed, and
@@ -237,6 +276,16 @@ live work will drift towards this if allowed to.
 **Routing automatic substitutions through `optimiser.pick_xi`.** It would field a
 better XI than FPL actually will, which is a wrong answer stated confidently, and
 it would import the optimiser into `live.py`, which has to stay a leaf.
+
+**Recent club form as a term in the fixture multiplier.** `Season.club_form`
+counts what each club has scored and conceded lately and the Fixtures tab shows
+it, and it deliberately feeds nothing. `strength_multiplier` already blends
+FPL's attack and defence ratings, which are continuous, separate for home and
+away, and move during the season off these same results, so putting the results
+in again would mostly count them twice. It would also need a weight, and there
+is nothing to fit one against. If this is revisited, the case to make is that
+the published ratings lag the results rather than that recent form is
+informative, and it should be measured before it is written.
 
 **Tableau or any BI tool**, a static page from a scheduled GitHub Action, and a
 FastAPI plus JS front end. All three were ruled out when Streamlit was chosen;

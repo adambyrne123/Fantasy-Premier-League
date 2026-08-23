@@ -220,6 +220,10 @@ class Season:
             "team_a_difficulty",
             "finished",
             "kickoff_time",
+            # what was actually scored, which is absent until a match is played
+            # and is the only record of club form the payload carries
+            "team_h_score",
+            "team_a_score",
         ]
         df = df[[c for c in keep if c in df.columns]].copy()
         df["kickoff_time"] = pd.to_datetime(df["kickoff_time"], utc=True)
@@ -495,3 +499,88 @@ class Season:
         return out.sort_values("swing", ascending=False).reset_index(drop=True)[
             ["club", "now", "later", "swing", "now_games", "later_games"]
         ]
+
+    def club_form(self, window: int = 5) -> pd.DataFrame:
+        """What each club has actually scored and conceded lately.
+
+        One row per club over its last `window` finished fixtures, with the
+        scorelines that make it up so a run can be read rather than trusted.
+        Sorted by goals scored per game, best attack first.
+
+        This is a record and not a projection, and it deliberately feeds
+        nothing. The fixture term already blends FPL's attack and defence
+        ratings, which move during the season off the same results, so putting
+        recent scorelines into the model as well would mostly count them twice.
+        `ROADMAP.md` carries that argument.
+
+        A match counts once it has a scoreline, and deliberately not once it is
+        `finished`. That flag is the obvious filter and it is the wrong one:
+        FPL only sets it when the whole gameweek's bonus has been confirmed,
+        which is a day or more after the last whistle. Checked against the live
+        payload during GW1 on 2026-08-23, where six matches had final scores,
+        `finished_provisional` true and `finished` still false, one of them
+        played two days earlier. Filtering on it would have shown an empty
+        table through most of every gameweek. Both scores being present is the
+        same question asked of the data rather than of a flag: they are null
+        until kick off.
+
+        Empty before anything has been played, which is the whole of August.
+        """
+        columns = [
+            "club",
+            "games",
+            "scored",
+            "conceded",
+            "scored_per_game",
+            "conceded_per_game",
+            "goal_difference",
+            "results",
+        ]
+        fx = self.fixtures
+        played = fx[fx["team_h_score"].notna() & fx["team_a_score"].notna()]
+        if played.empty or window < 1:
+            return pd.DataFrame(columns=columns)
+
+        # kickoff time rather than gameweek, so a rearranged match sits where it
+        # was played rather than where it was originally scheduled
+        # reset so the index itself is chronological: the two sides are split
+        # apart below and stitched back together on it
+        played = played.sort_values(["kickoff_time", "id"]).reset_index(drop=True)
+        short = self.teams["short_name"]
+        played = played.assign(
+            label=short.reindex(played["team_h"]).to_numpy()
+            + " "
+            + played["team_h_score"].astype(int).astype(str)
+            + " - "
+            + played["team_a_score"].astype(int).astype(str)
+            + " "
+            + short.reindex(played["team_a"]).to_numpy()
+        )
+
+        sides = []
+        for team, opponent, scored, conceded in (
+            ("team_h", "team_a", "team_h_score", "team_a_score"),
+            ("team_a", "team_h", "team_a_score", "team_h_score"),
+        ):
+            side = played[[team, opponent, scored, conceded, "label"]].copy()
+            side.columns = ["team", "opponent", "scored", "conceded", "label"]
+            sides.append(side)
+
+        rows = pd.concat(sides, ignore_index=False).sort_index()
+        recent = rows.groupby("team", group_keys=False).tail(window)
+
+        agg = recent.groupby("team").agg(
+            games=("scored", "size"),
+            scored=("scored", "sum"),
+            conceded=("conceded", "sum"),
+            results=("label", list),
+        )
+        agg.insert(0, "club", short.reindex(agg.index))
+        agg["scored_per_game"] = agg["scored"] / agg["games"]
+        agg["conceded_per_game"] = agg["conceded"] / agg["games"]
+        agg["goal_difference"] = agg["scored"] - agg["conceded"]
+        return (
+            agg[columns]
+            .sort_values(["scored_per_game", "goal_difference"], ascending=False)
+            .reset_index(drop=True)
+        )

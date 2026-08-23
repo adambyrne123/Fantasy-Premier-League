@@ -139,6 +139,71 @@ def test_a_positive_swing_means_it_gets_easier(season: Season):
     assert best["now"] > best["later"], "a positive swing is a hard run now, an easier one after"
 
 
+def test_club_form_reads_only_matches_that_have_been_played(season: Season):
+    """Empty for the whole of August, which is not an edge case but the state
+    the panel showing it ships in."""
+    form = season.club_form(window=5)
+    if season.gameweeks_played == 0:
+        assert form.empty
+        assert "scored_per_game" in form.columns
+        return
+
+    assert len(form) == len(season.teams)
+    assert (form["games"] <= 5).all()
+    assert (form["games"] <= season.gameweeks_played).all()
+    assert form["scored_per_game"].is_monotonic_decreasing
+
+
+def test_club_form_totals_reconcile_with_the_scorelines_behind_them(season: Season):
+    """A form table nobody can check is worse than none, so the row carries the
+    matches it was built from and they have to add up."""
+    form = season.club_form(window=5)
+    if form.empty:
+        pytest.skip("nothing has been played yet")
+
+    for _, row in form.iterrows():
+        assert len(row["results"]) == row["games"]
+        assert row["goal_difference"] == row["scored"] - row["conceded"]
+        assert row["scored_per_game"] == pytest.approx(row["scored"] / row["games"])
+
+
+def test_a_window_longer_than_the_season_is_the_season(season: Season):
+    """Asking for twenty games twelve gameweeks in gives twelve, not an error
+    and not a shorter table."""
+    form = season.club_form(window=50)
+    if form.empty:
+        pytest.skip("nothing has been played yet")
+    assert (form["games"] == season.gameweeks_played).all()
+
+
+def test_club_form_counts_a_match_that_has_been_played_but_not_settled():
+    """The trap this was written into, read off the live API rather than guessed.
+
+    FPL sets a fixture's `finished` flag only once the whole gameweek's bonus is
+    confirmed, which is a day or more after the final whistle. During GW1 on
+    2026-08-23 six matches had final scorelines, `finished_provisional` true and
+    `finished` still false, one of them played two days earlier. A form table
+    filtered on `finished` is empty through most of every gameweek, so the
+    scoreline is what counts a match.
+    """
+    from .conftest import FakeApi
+
+    class BonusNotConfirmedYet(FakeApi):
+        def fixtures(self):
+            played = super().fixtures()
+            for fixture in played:
+                if fixture["event"] == 1:
+                    fixture["finished"] = False
+                    fixture["finished_provisional"] = True
+            return played
+
+    season = Season(BonusNotConfirmedYet(played=1))
+    form = season.club_form(window=5)
+
+    assert not form.empty, "a played match went uncounted because bonus was pending"
+    assert (form["games"] == 1).all()
+
+
 def test_next_deadline_belongs_to_the_next_gameweek(season: Season):
     """The status bar puts the two side by side, so a deadline lifted from a
     different event than the gameweek shown next would be worse than none."""
@@ -1928,3 +1993,22 @@ def test_live_stays_a_leaf():
     """
     for module in ("projections", "optimiser", "chips", "captaincy"):
         assert "live" not in _imports_of(module), f"{module}.py imported live scoring"
+
+
+def test_the_field_stays_a_leaf():
+    """`elite.py` counts squads that already exist. Nothing that projects or
+    picks may read it.
+
+    The captaincy case is the one to watch. Knowing what the field captains is
+    exactly what the rank question needs, so the temptation is to import it
+    there, and `captaincy.py` is held to `data` and `projections` for reasons
+    of its own. When that arithmetic gets built the shares go in as an
+    argument: data crosses the boundary, an import does not.
+    """
+    for module in ("projections", "optimiser", "chips", "captaincy", "live", "roi", "squad"):
+        assert "elite" not in _imports_of(module), f"{module}.py reached for the field"
+
+
+def test_the_field_reads_only_what_it_is_allowed_to():
+    """It reshapes a league table and some picks, and that is all it does."""
+    assert _imports_of("elite") <= {"data", "leagues"}

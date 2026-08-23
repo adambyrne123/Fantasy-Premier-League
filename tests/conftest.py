@@ -232,6 +232,12 @@ class FakeApi:
                         "team_a_difficulty": self.rng.randint(2, 5),
                         "finished": gw <= self.played,
                         "kickoff_time": f"2026-08-{min(28, 21 + gw):02d}T14:00:00Z",
+                        # null until a match is played, the way the real payload
+                        # is. Derived from the ids rather than drawn, so adding
+                        # them does not move the random stream every other
+                        # generated value in this fixture rides on.
+                        "team_h_score": (fid + teams[i]) % 4 if gw <= self.played else None,
+                        "team_a_score": (fid + teams[i + 1]) % 3 if gw <= self.played else None,
                     }
                 )
                 fid += 1
@@ -363,6 +369,71 @@ class FakeApi:
                 {"season_name": "2023/24", "total_points": 2000, "rank": 900_000},
                 {"season_name": "2025/26", "total_points": 2300, "rank": 120_000},
             ],
+        }
+
+    def entry_picks(self, entry_id: int, gameweek: int, ttl: int | None = None) -> dict:
+        """One manager's fifteen for a gameweek that has been scored.
+
+        Raises for anything not yet played, which is what the real endpoint
+        does: there are no picks to publish until a deadline has passed, so
+        before the first one every id is a 404.
+
+        The squads overlap heavily on purpose. Drawing fifteen at random per
+        entry would give every player the same one-in-n share and a test could
+        not tell a working count from a constant. Two entries in five captain
+        someone other than the favourite, and entry ids divisible by seven play
+        a triple captain, so the shares and the multipliers both have something
+        to separate.
+        """
+        if not self.played or not 1 <= gameweek <= self.played:
+            raise RuntimeError(f"no picks for entry {entry_id} in gameweek {gameweek}")
+
+        by_type: dict[int, list[int]] = {}
+        for element in self._elements:
+            by_type.setdefault(element["element_type"], []).append(element["id"])
+
+        # a small rotation, so most of one squad is also in the next
+        shift = entry_id % 3
+
+        def take(etype: int, n: int) -> int:
+            pool = by_type[etype]
+            return pool[(n + shift) % len(pool)]
+
+        starters = (
+            [take(1, 0)]
+            + [take(2, n) for n in range(4)]
+            + [take(3, n) for n in range(4)]
+            + [take(4, n) for n in range(2)]
+        )
+        bench = [take(1, 1), take(2, 4), take(3, 4), take(4, 2)]
+
+        captain = take(3, 0) if entry_id % 5 == 0 else take(4, 0)
+        vice = take(3, 1)
+        chip = "3xc" if entry_id % 7 == 0 else None
+
+        picks = []
+        for slot, element in enumerate(starters + bench, start=1):
+            playing = slot <= len(starters)
+            multiplier = 0
+            if playing:
+                multiplier = 1
+                if element == captain:
+                    multiplier = 3 if chip == "3xc" else 2
+            picks.append(
+                {
+                    "element": element,
+                    "position": slot,
+                    "multiplier": multiplier,
+                    "is_captain": element == captain,
+                    "is_vice_captain": element == vice,
+                }
+            )
+
+        return {
+            "active_chip": chip,
+            "automatic_subs": [],
+            "entry_history": {"event": gameweek, "points": 60 + entry_id % 11},
+            "picks": picks,
         }
 
     def league_standings(self, league_id: int, page: int = 1) -> dict:

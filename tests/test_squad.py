@@ -187,10 +187,27 @@ def test_a_departed_player_does_not_break_the_frame(season: Season, projections,
     assert squad.missing_from(projections) == [999_999]
 
 
+def _season_without_picks(played: int) -> Season:
+    """A season whose picks endpoint refuses, whatever the gameweek.
+
+    Which is what the real one does before a deadline and for an id that does
+    not exist. Spelled out rather than leaning on the fixture not implementing
+    the endpoint: it implements it now, and a test that passed because a method
+    was missing would have gone quiet the moment one was added.
+    """
+    from .conftest import FakeApi
+
+    class NoPicks(FakeApi):
+        def entry_picks(self, entry_id: int, gameweek: int, ttl: int | None = None) -> dict:
+            raise RuntimeError("404")
+
+    return Season(NoPicks(played=played))
+
+
 def test_reading_an_entry_fails_clearly_without_published_picks(season: Season):
     """Picks are not public until a deadline passes, and that must not traceback."""
     with pytest.raises(RuntimeError):
-        load_from_entry(season, entry_id=1234567)
+        load_from_entry(_season_without_picks(season.gameweeks_played), entry_id=1234567)
 
 
 def _entry_season(played: int, picks: list[dict], gameweek_seen: list[int]) -> Season:
@@ -255,11 +272,26 @@ def test_a_triple_captain_multiplier_is_kept(owned):
 
 
 def test_load_squad_falls_back_to_the_file(tmp_path, season: Season, owned):
+    """An entry that cannot be read is the file's cue, not an error."""
     path = tmp_path / "squad.json"
     write_squad_file(path, MySquad(player_ids=owned, bank_tenths=5), season)
-    loaded = load_squad(season, path=path, entry_id=1234567)
+    loaded = load_squad(_season_without_picks(season.gameweeks_played), path=path, entry_id=1234567)
     assert loaded.player_ids == owned
     assert loaded.bank_tenths == 5
+
+
+def test_load_squad_prefers_the_entry_when_it_can_be_read(tmp_path, season: Season, owned):
+    """The other half of the same rule, and until the fake grew a picks endpoint
+    there was no way to reach it: live data wins, and the file is only there for
+    the purchase prices an entry does not publish."""
+    if season.gameweeks_played == 0:
+        pytest.skip("no picks are published before the first deadline")
+
+    path = tmp_path / "squad.json"
+    write_squad_file(path, MySquad(player_ids=owned, bank_tenths=5), season)
+    loaded = load_squad(season, path=path, entry_id=1001)
+    assert loaded.entry_id == 1001
+    assert loaded.player_ids != owned
 
 
 def test_load_squad_needs_one_source_or_the_other(season: Season):
