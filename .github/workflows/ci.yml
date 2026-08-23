@@ -26,11 +26,6 @@ jobs:
     # hours, which is the wrong failure mode for a solve that hangs rather than
     # one that fails.
     timeout-minutes: 30
-    env:
-      # No test should reach a cache at all. Pointing it at the runner's temp
-      # directory means an accidental write lands somewhere disposable rather
-      # than in $HOME, where it would be invisible and would seed the next step.
-      FPL_CACHE_DIR: ${{ runner.temp }}/fpl-cache
     steps:
       - uses: actions/checkout@v4
 
@@ -68,4 +63,12 @@ jobs:
       # -rs prints the skip report. A skip exits zero, and noticing that a
       # particular test has stopped skipping is most of why this runs on Linux.
       - name: Test
+        # No test should reach a cache at all. Pointing it at the runner's temp
+        # directory means an accidental write lands somewhere disposable rather
+        # than in $HOME, where it would be invisible and would seed the next
+        # step. It sits on the step rather than on the job because `runner` is
+        # not a context a job-level `env` may read, and putting it there made
+        # every run an invalid workflow file rather than a test result.
+        env:
+          FPL_CACHE_DIR: ${{ runner.temp }}/fpl-cache
         run: uv run pytest -rs
