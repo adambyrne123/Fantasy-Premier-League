@@ -295,12 +295,31 @@ bar sits in roughly `[-1, 10]` however few minutes produced it, and the defcon
 term's badness is anti-correlated with its weight, which is a second thing the
 linear ramp buys and the concave form would not.
 
-**A new noise source, named but not fixed.** `team_defence_rate` has no gate of
-its own and never needed one, because its only consumer was gated. A club's
-conceding rate off one keeper's ninety minutes now reaches the projection, and
-that error is correlated across the twenty-odd players at that club rather than
-diversified away. It is bounded by the two club terms above and by the ramp.
-`ROADMAP.md` carries it.
+**The club rate gets the same ramp, for a reason the per-player terms do not
+have.** `team_defence_rate` had no gate of its own and never needed one, because
+its only consumer was gated. Once that gate became a ramp, a club's conceding
+rate off one keeper's ninety minutes could reach the projection, and unlike
+every other term that error is correlated across the twenty-odd players at that
+club rather than diversified away: an overstated defence moves five defenders
+the same way at once.
+
+So it is shrunk towards the league mean by `credibility` on the club's own
+keeper minutes, with `TEAM_DEFENCE_MINUTES` as the scale. Three matters:
+
+- **The scale is a club's minutes, not a player's.** A club banks ninety keeper
+  minutes per match however many players it fields, so 270 is three matches.
+  It is a separate constant from `COMPONENT_MINUTES` at the same value for the
+  same reason `PRIOR_MINUTES` is.
+- **Towards the league mean, not towards nothing.** `component_rate` fills an
+  absent defence with zero, which reads as no clean sheet points *and* no
+  concession charge. The average club is a better answer than that.
+- **The mean is unweighted.** Weighting the target by minutes would let the
+  clubs with the most football behind them set the number the short-sampled
+  clubs are pulled towards, which is the wrong way round.
+
+Measured on the real payload one match into 2026/27: eighteen clubs spread from
+0.20 to 3.87 per 90, all off ninety minutes each, shrinking to a range of 1.07
+to 2.30 with the league mean unmoved.
 
 **Where it can be worse than the old answer.** One case: a player who faced a
 promoted side at home in GW1 has an inflated rate, the ramp reads that as

@@ -509,6 +509,84 @@ def test_the_component_rate_is_not_what_protects_august(season: Season):
     pd.testing.assert_series_equal(before, build_rates(season, fitted)["points_per_90"])
 
 
+def test_a_club_defence_off_one_match_is_shrunk_towards_the_league(season: Season):
+    """The club rate is the one term whose error does not diversify away.
+
+    Every defender at a club reads the same number, so a defence overstated off
+    ninety minutes moves five players the same way at once. It used to be
+    unreachable because `component_rate` was barred below 270 player minutes,
+    and that gate is a ramp now. Measured on the real payload one match into
+    2026/27: eighteen clubs between 0.20 and 3.87 per 90, all off one match.
+    """
+    from fpl_manager.projections import TEAM_DEFENCE_MINUTES, team_defence_rate
+
+    players = season.players.copy()
+    keepers = players[players["position"] == "GKP"]
+    if keepers.empty or "expected_goals_conceded" not in players.columns:
+        pytest.skip("needs keepers carrying a conceding rate")
+
+    def one_match(frame, club, conceded):
+        """Give a club exactly one match of keeper football, however many
+        keepers it carries: the club total is what the rate divides by."""
+        index = keepers.index[keepers["team"] == club]
+        frame.loc[index, ["minutes", "expected_goals_conceded"]] = 0.0
+        frame.loc[index[0], ["minutes", "expected_goals_conceded"]] = (90.0, conceded)
+
+    # one club ships four in its only match, another keeps its only clean sheet
+    leaky, tight = keepers["team"].unique()[:2]
+    one_match(players, leaky, 4.0)
+    one_match(players, tight, 0.0)
+
+    rate = team_defence_rate(players)
+
+    assert rate[leaky] < 4.0, "a rate off one match must not be trusted whole"
+    assert rate[tight] > 0.0, "nor may a single clean sheet buy a shut out defence"
+    assert rate[leaky] > rate[tight], "and the ordering has to survive the shrinkage"
+
+    # a club with the full sample behind it is left exactly where it was
+    full = players.copy()
+    index = keepers.index[keepers["team"] == leaky]
+    full.loc[index, ["minutes", "expected_goals_conceded"]] = 0.0
+    full.loc[index[0], "minutes"] = float(TEAM_DEFENCE_MINUTES)
+    full.loc[index[0], "expected_goals_conceded"] = 4.0
+    assert team_defence_rate(full)[leaky] == pytest.approx(4.0 / (TEAM_DEFENCE_MINUTES / 90))
+
+
+def test_shrinking_the_club_defence_leaves_the_league_where_it_was(season: Season):
+    """Shrinking towards the mean must not move the mean, or every defender in
+    the game gets quietly cheaper or dearer to project."""
+    from fpl_manager.projections import team_defence_rate
+
+    rate = team_defence_rate(season.players)
+    if rate.empty:
+        pytest.skip("pre-season, where there is no club rate to shrink")
+
+    raw = season.players[season.players["position"] == "GKP"]
+    conceded = pd.to_numeric(raw["expected_goals_conceded"], errors="coerce").fillna(0.0)
+    minutes = pd.to_numeric(raw["minutes"], errors="coerce").fillna(0.0)
+    totals = pd.DataFrame({"team": raw["team"], "xgc": conceded, "minutes": minutes})
+    totals = totals.groupby("team")[["xgc", "minutes"]].sum()
+    unshrunk = (
+        (totals["xgc"] / (totals["minutes"] / 90)).replace([np.inf, -np.inf], np.nan).dropna()
+    )
+
+    assert rate.mean() == pytest.approx(unshrunk.mean())
+    assert rate.std() <= unshrunk.std(), "shrinkage pulls in, it does not spread out"
+
+
+def test_the_club_defence_stays_empty_before_anybody_has_played(season: Season):
+    """Callers read an empty series as unknown. A league of clubs conceding the
+    mean of nothing would be a confident answer to a question with no data."""
+    from fpl_manager.projections import team_defence_rate
+
+    players = season.players.copy()
+    players["minutes"] = 0.0
+    players["expected_goals_conceded"] = 0.0
+    assert team_defence_rate(players).empty
+
+    assert team_defence_rate(players.drop(columns=["expected_goals_conceded"])).empty
+
+
 def test_a_penalty_taker_outprojects_an_identical_team_mate(season: Season):
     """Spot kicks are a claim on chances still to come, so they cannot be read
     off the expected goals a player has already accumulated."""

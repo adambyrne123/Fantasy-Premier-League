@@ -119,6 +119,13 @@ COMPONENT_MINUTES = 270
 # defined fallback. Named so the two cannot be quietly unified.
 PRIOR_MINUTES = 270
 
+# Keeper minutes behind a club before its own conceding rate is trusted in
+# full. Three matches, and the third constant to share the number 270 for a
+# third reason: this one scales a *club's* sample rather than a player's, and
+# a club only accumulates ninety of these per match however many players it
+# fields. Named apart for the same reason `PRIOR_MINUTES` is.
+TEAM_DEFENCE_MINUTES = 270
+
 
 def fetch_prior_season(season: Season, delay: float = 0.15) -> pd.DataFrame:
     """Pull last season's totals for every player via element-summary.
@@ -329,7 +336,7 @@ def _minutes_share(players: pd.DataFrame, start_rate: pd.Series, duration: pd.Se
     return _collapse(_start_mixture(players, start_rate, duration))
 
 
-def credibility(minutes: pd.Series) -> pd.Series:
+def credibility(minutes: pd.Series, scale: float = COMPONENT_MINUTES) -> pd.Series:
     """How much of a usable sample this season's minutes are, nought to one.
 
     The projection used to gate on `COMPONENT_MINUTES`, which meant a player
@@ -353,9 +360,13 @@ def credibility(minutes: pd.Series) -> pd.Series:
     It is a weight and not a guard, and reading it as a guard is how August
     goes wrong. Pre-season the API serves last season's minutes, so this is one
     for everybody. What protects the model then is `weight_now` being zero.
+
+    `scale` is here so `team_defence_rate` can use the same ramp on a club's
+    minutes rather than growing a second copy of it. Everything above about the
+    shape of the fade applies whatever it is measuring.
     """
     minutes = pd.to_numeric(minutes, errors="coerce").fillna(0.0)
-    return (minutes / COMPONENT_MINUTES).clip(0.0, 1.0)
+    return (minutes / scale).clip(0.0, 1.0)
 
 
 def team_defence_rate(players: pd.DataFrame) -> pd.Series:
@@ -365,6 +376,22 @@ def team_defence_rate(players: pd.DataFrame) -> pd.Series:
     player only while he was on the pitch, and a keeper is on it for all of it.
     Summing outfielders instead would count the same goals once per defender
     and give a number several times too large.
+
+    Shrunk towards the league mean by how much football is behind it, because
+    a club's own rate off one match is noise and this is the one term whose
+    error does not wash out across a squad: every defender at a club reads the
+    same number, so an overstated defence moves five players the same way at
+    once rather than being diversified away.
+
+    Measured on 2026-08-23, one match into the season: eighteen clubs with
+    rates from 0.20 to 3.87 per 90, all off ninety keeper minutes each. The
+    gate that used to make that harmless was `component_rate` being barred
+    below 270 player minutes. That is a ramp now, so a third of a rate like
+    3.87 would otherwise reach every defender at that club in week two.
+
+    Shrunk towards the league mean rather than dropped, because `component_rate`
+    fills an absent defence with zero, which reads as no clean sheet points and
+    no concession charge at all. The average club is a better answer than that.
 
     Empty when nobody has the column or nobody has played, which is what
     pre-season looks like, and callers treat that as unknown rather than as a
@@ -379,8 +406,16 @@ def team_defence_rate(players: pd.DataFrame) -> pd.Series:
 
     by_club = pd.DataFrame({"team": keepers["team"], "xgc": conceded, "minutes": minutes})
     totals = by_club.groupby("team")[["xgc", "minutes"]].sum()
-    rate = totals["xgc"] / (totals["minutes"] / 90)
-    return rate.replace([np.inf, -np.inf], np.nan).dropna()
+    rate = (totals["xgc"] / (totals["minutes"] / 90)).replace([np.inf, -np.inf], np.nan).dropna()
+    if rate.empty:
+        return rate
+
+    # the mean of the clubs that have played, which is the only league to
+    # compare against. Weighting it by minutes would let the clubs with the
+    # most football set the target they are being shrunk towards
+    league = float(rate.mean())
+    cred = credibility(totals["minutes"].reindex(rate.index), TEAM_DEFENCE_MINUTES)
+    return cred * rate + (1 - cred) * league
 
 
 def _per_90(
