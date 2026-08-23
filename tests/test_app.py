@@ -34,6 +34,9 @@ def _app(monkeypatch, tmp_path, played: int):
     monkeypatch.setattr(api.FplApi, "entry", lambda self, e: fake.entry(e))
     monkeypatch.setattr(api.FplApi, "entry_history", lambda self, e: fake.entry_history(e))
     monkeypatch.setattr(
+        api.FplApi, "entry_picks", lambda self, e, gw, ttl=None: fake.entry_picks(e, gw, ttl)
+    )
+    monkeypatch.setattr(
         api.FplApi, "league_standings", lambda self, lid, page=1: fake.league_standings(lid, page)
     )
     monkeypatch.setattr(api.FplApi, "_get", lambda self, *a, **kw: {})
@@ -78,12 +81,13 @@ def test_every_tab_renders(app):
     assert not at.exception
     labels = [tab.label for tab in at.tabs] if at.tabs else []
     for expected in [
-        "Squad",
+        "My squad",
+        "Wildcard",
         "Players",
         "Captain",
         "ROI",
         "Fixtures",
-        "Transfers",
+        "Planner",
         "Chips",
         "Leagues",
         "Live",
@@ -144,6 +148,64 @@ def test_the_leagues_tab_asks_before_it_fetches(app):
     at = app.run()
     assert not at.exception
     assert any("Enter a manager id" in info.value for info in at.info)
+
+
+def _field_toggle(at):
+    return next(t for t in at.sidebar.toggle if "top managers" in t.label)
+
+
+def test_the_field_waits_to_be_asked(app):
+    """A hundred requests should never fire because somebody opened a tab."""
+    at = app.run()
+    assert not at.exception
+    assert any("Turn on" in info.value for info in at.info)
+
+
+def test_the_field_says_why_it_is_empty_before_a_gameweek_is_scored(app):
+    """The state it ships in. Picks are not published until a deadline passes,
+    so switching it on in August has to explain itself rather than look broken."""
+    at = app.run()
+    _field_toggle(at).set_value(True).run()
+    assert not at.exception
+    assert any("No squads to read yet" in state for state in _states(at))
+
+
+def test_the_template_fills_in_once_the_field_is_read(midseason_app):
+    at = midseason_app.run()
+    _field_toggle(at).set_value(True).run()
+    assert not at.exception
+
+    assert any("of the top" in c.value and "as they lined up" in c.value for c in at.caption)
+    assert any("Start %" in m.value for m in at.markdown), "no template pitch"
+    assert any("did with the armband" in c.value for c in at.caption), "captain tab missed it"
+
+
+def test_the_divergence_table_carries_both_ownerships(midseason_app):
+    """The whole point of reading the top of the table is the gap between what
+    they own and what everyone owns, so both have to be on the same row."""
+    at = midseason_app.run()
+    _field_toggle(at).set_value(True).run()
+    assert not at.exception
+
+    tables = [d.value for d in at.dataframe if "elite_ownership" in d.value.columns]
+    assert tables, "no divergence table"
+    assert "ownership" in tables[0].columns
+    assert "elite_gap" in tables[0].columns
+
+
+def test_club_form_waits_for_a_match_to_be_played(app):
+    at = app.run()
+    assert not at.exception
+    assert any("Nothing played yet" in state for state in _states(at))
+
+
+def test_club_form_lists_every_club_once_there_are_results(midseason_app):
+    at = midseason_app.run()
+    assert not at.exception
+    tables = [d.value for d in at.dataframe if "scored_per_game" in d.value.columns]
+    assert tables, "no club form table"
+    assert len(tables[0]) == 20
+    assert tables[0]["scored_per_game"].is_monotonic_decreasing
 
 
 def test_a_manager_id_shows_their_record(midseason_app):
@@ -900,27 +962,81 @@ def app_with_squad(monkeypatch, tmp_path):
     # legal transfer plan out of a squad that breaks the club cap
     fake_season = Season(FakeApi(played=12))
     built, _ = project(fake_season, horizon=6, prior=make_prior(fake_season))
-    owned = [int(i) for i in build_squad(built).squad.index]
+    solved = build_squad(built)
+    # an entry publishes its picks in order, the eleven first and the bench
+    # after, plus the armband. Shape the fake the same way or the My squad
+    # pitch has nothing true to draw.
+    xi_ids = [int(i) for i in solved.xi.index]
+    owned = xi_ids + [int(i) for i in solved.squad.index if int(i) not in xi_ids]
     monkeypatch.setattr(
         squad_module,
         "load_from_entry",
         lambda season, entry_id, gameweek=None: squad_module.MySquad(
-            player_ids=owned, bank_tenths=10, free_transfers=2, entry_id=entry_id
+            player_ids=owned,
+            bank_tenths=10,
+            free_transfers=2,
+            entry_id=entry_id,
+            captain_id=xi_ids[0],
+            vice_captain_id=xi_ids[1],
+        ),
+    )
+    return at
+
+
+@pytest.fixture
+def app_with_a_bad_lineup(monkeypatch, tmp_path):
+    """The same fifteen, lined up the wrong way round.
+
+    The caption saying what your own selection gives up only appears when there
+    is something to give up, and `app_with_squad` deliberately lines up exactly
+    as the solver would, so nothing else reaches it.
+    """
+    at = _app(monkeypatch, tmp_path, played=12)
+
+    from fpl_manager import squad as squad_module
+    from fpl_manager.data import Season
+    from fpl_manager.optimiser import build_squad
+    from fpl_manager.projections import project
+
+    from .conftest import FakeApi, make_prior
+
+    fake_season = Season(FakeApi(played=12))
+    built, _ = project(fake_season, horizon=6, prior=make_prior(fake_season))
+    solved = build_squad(built)
+    xi_ids = [int(i) for i in solved.xi.index]
+    bench_ids = [int(i) for i in solved.squad.index if int(i) not in xi_ids]
+    started_the_bench = bench_ids + xi_ids
+    monkeypatch.setattr(
+        squad_module,
+        "load_from_entry",
+        lambda season, entry_id, gameweek=None: squad_module.MySquad(
+            player_ids=started_the_bench,
+            bank_tenths=10,
+            free_transfers=2,
+            entry_id=entry_id,
+            captain_id=started_the_bench[0],
+            vice_captain_id=started_the_bench[1],
         ),
     )
     return at
 
 
 def _load_the_squad(at):
-    at.sidebar.radio[0].set_value("FPL entry id").run()
-    at.sidebar.number_input[1].set_value(123).run()
+    """Drive the sidebar the way a user does, by key rather than by position.
+
+    The id box is a text input, not a number: an entry id is not a quantity and
+    steppers on one imply it can be nudged.
+    """
+    next(r for r in at.sidebar.radio if r.key == "squad_source").set_value("FPL entry id").run()
+    next(t for t in at.sidebar.text_input if t.key == "sidebar_entry").set_value("123").run()
     return at
 
 
-def test_a_loaded_squad_fills_the_transfer_tab(app_with_squad):
+def test_a_loaded_squad_fills_my_squad(app_with_squad):
     at = _load_the_squad(app_with_squad.run())
     assert not at.exception
-    assert any("Plan across several gameweeks" in t.label for t in at.toggle)
+    assert any(m.label == "In the bank" for m in at.metric)
+    assert any(n.label == "Max transfers to consider" for n in at.number_input)
 
 
 def test_missing_selling_prices_are_warned_about(app_with_squad):
@@ -930,9 +1046,99 @@ def test_missing_selling_prices_are_warned_about(app_with_squad):
     assert any("valued at today's price" in w.value for w in at.warning)
 
 
+def test_my_squad_says_so_when_nothing_is_loaded(app):
+    at = app.run()
+    assert not at.exception
+    assert any("No squad loaded" in card for card in _states(at))
+
+
+def test_my_squad_reads_the_armband_off_the_entry(app_with_squad):
+    """The armband and the bench order come from the entry and nowhere else, so
+    a page that shows the solver's instead is showing a team nobody picked."""
+    at = _load_the_squad(app_with_squad.run())
+    assert not at.exception
+    assert any("As you have it · captain " in c.value for c in at.caption)
+    assert any(m.label == "In the bank" for m in at.metric)
+    # the fixture lines up exactly as the solver would, so there is nothing to
+    # disagree about and the second-guessing caption must stay away
+    assert not any("would start a different eleven" in c.value for c in at.caption)
+
+
+def test_a_lineup_the_model_disagrees_with_is_argued_with(app_with_a_bad_lineup):
+    at = _load_the_squad(app_with_a_bad_lineup.run())
+    assert not at.exception
+    assert any("would start a different eleven" in c.value for c in at.caption)
+
+
+def test_a_squad_file_has_no_lineup_to_show(app_with_squad, monkeypatch):
+    """A file carries fifteen ids and nothing about how they were arranged, so
+    the page has to say why it is showing the solver's eleven instead."""
+    from fpl_manager import squad as squad_module
+
+    real = squad_module.load_from_entry
+    monkeypatch.setattr(
+        squad_module,
+        "load_from_entry",
+        lambda season, entry_id, gameweek=None: squad_module.MySquad(
+            player_ids=real(season, entry_id).player_ids
+        ),
+    )
+    at = _load_the_squad(app_with_squad.run())
+    assert not at.exception
+    assert any("nothing about how you lined them up" in i.value for i in at.info)
+
+
+def test_a_mistyped_entry_id_is_an_error_not_a_traceback(app):
+    """Anyone can put a name or a URL in that box. It has to say so."""
+    at = app.run()
+    next(r for r in at.sidebar.radio if r.key == "squad_source").set_value("FPL entry id").run()
+    next(t for t in at.sidebar.text_input if t.key == "sidebar_entry").set_value("salah").run()
+    assert not at.exception
+    assert any("just digits" in e.value for e in at.error)
+
+
+def test_a_remembered_id_comes_back_from_the_url(app_with_squad):
+    """The URL is the only place the id can be kept. The deploy is public and
+    multi tenant, so there is nowhere per user to write it."""
+    at = app_with_squad
+    at.query_params["entry"] = "123"
+    at.run()
+    assert not at.exception
+    box = next(t for t in at.sidebar.text_input if t.key == "sidebar_entry")
+    assert box.value == "123", "a bookmarked id should not need retyping"
+    assert any(m.label == "In the bank" for m in at.metric), "and should load on its own"
+
+
+def test_an_impossible_build_leaves_the_other_tabs_standing(monkeypatch, tmp_path):
+    """Locks and a budget can be set to something with no legal fifteen in it.
+
+    Wildcard is the second of ten tabs, so reporting that with st.stop() would
+    take the eight below it down as well.
+    """
+    at = _app(monkeypatch, tmp_path, played=12)
+
+    from fpl_manager import optimiser
+
+    def nothing_fits(*args, **kwargs):
+        raise RuntimeError("No legal squad under those constraints")
+
+    monkeypatch.setattr(optimiser, "build_squad", nothing_fits)
+
+    at.run()
+    assert not at.exception
+    assert any("Try relaxing the locks" in e.value for e in at.error)
+    assert any(str(c).startswith("GW") for c in _pool(at).columns), "Players still renders"
+
+
 def test_an_illegal_squad_is_an_error_not_a_traceback(monkeypatch, tmp_path):
     """Anyone can upload a hand-edited file, and fifteen from one club has no
-    legal plan out of it. That has to read as a message, not a stack trace."""
+    legal plan out of it. That has to read as a message, not a stack trace.
+
+    Every tab that touches the squad has to survive it, not just the first one
+    to notice. This passed for a while because the transfer tab called
+    st.stop() here, which halted the script before Chips could try to price a
+    chip against a squad with no legal eleven in it.
+    """
     at = _app(monkeypatch, tmp_path, played=12)
 
     from fpl_manager import squad as squad_module
@@ -953,11 +1159,20 @@ def test_an_illegal_squad_is_an_error_not_a_traceback(monkeypatch, tmp_path):
 
 
 def test_the_multi_week_planner_runs(app_with_squad):
+    """Planner is the whole tab now, so it solves as soon as a squad is loaded
+    rather than waiting behind a toggle."""
     at = _load_the_squad(app_with_squad.run())
-    planner = next(t for t in at.toggle if "Plan across several gameweeks" in t.label)
-    planner.set_value(True).run()
     assert not at.exception
     assert any("Projected over" in m.label for m in at.metric)
+
+
+def test_the_single_week_answer_lives_in_one_place(app_with_squad):
+    """My squad owns the one week move and Planner owns the route. Two tabs
+    solving the same week is two tabs that can disagree about the best move."""
+    at = _load_the_squad(app_with_squad.run())
+    assert not at.exception
+    assert sum(n.label == "Max transfers to consider" for n in at.number_input) == 1
+    assert sum(s.label == "Gameweeks to plan" for s in at.slider) == 1
 
 
 def test_the_live_tab_survives_empty_live_endpoints(app):

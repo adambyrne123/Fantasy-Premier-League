@@ -132,16 +132,22 @@ class FplApi:
         """Public profile for an FPL manager (name, rank, squad value)."""
         return self._get(f"entry/{entry_id}/", key=f"entry_{entry_id}", ttl=3600)
 
-    def entry_picks(self, entry_id: int, gameweek: int) -> dict:
+    def entry_picks(self, entry_id: int, gameweek: int, ttl: int | None = None) -> dict:
         """A manager's picks for a finished gameweek.
 
         Only available once the gameweek deadline has passed, so this returns
         404 before the first deadline of the season.
+
+        The default hour suits a gameweek in progress, where automatic
+        substitutions are written into this payload as the matches finish. A
+        caller reading a settled gameweek should pass a much longer ttl: those
+        picks can no longer change, and anything sampling a hundred managers at
+        once would otherwise refetch a hundred immutable payloads every hour.
         """
         return self._get(
             f"entry/{entry_id}/event/{gameweek}/picks/",
             key=f"picks_{entry_id}_{gameweek}",
-            ttl=3600,
+            ttl=3600 if ttl is None else ttl,
         )
 
     def entry_history(self, entry_id: int) -> dict:

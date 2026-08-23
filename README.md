@@ -36,6 +36,19 @@ weight, lock and ban lists, a fixture heatmap, a transfer planner and a live
 matchday view, all re-solving as you change them. The CLI below does the same
 things without a browser.
 
+Give the sidebar your FPL entry id and **My squad** shows the fifteen you own,
+laid out as you have them set up, with the one move worth making this week. The
+id is kept in the page's address, so bookmarking the page saves typing it again.
+Each tab answers one question: My squad is what you own, **Wildcard** is what
+you would buy starting over, and **Planner** is the route across several
+gameweeks.
+
+One thing in the app has no CLI equivalent, because it is a lookup rather than a
+calculation: switching on **The field** in the sidebar samples the top of the
+overall league and counts what those managers own and captain. It is off by
+default, since it is one request per manager, and it is empty until the first
+deadline has passed.
+
 Responses are cached on disk under `FPL_CACHE_DIR`, defaulting to
 `~/.cache/fpl_manager`. On Streamlit Community Cloud set it to a writable path,
 which makes reruns cheap within one container. It does not survive a restart or
