@@ -127,6 +127,36 @@ def test_load_live_reads_a_gameweek_in_progress(season: Season):
     assert (live.elements["minutes"] >= 0).all()
 
 
+def test_a_match_is_over_at_the_whistle_not_at_the_audit(season: Season):
+    """The one that kept automatic substitutions unresolved all weekend.
+
+    FPL sets `finished` only once it has confirmed the gameweek's data, a day or
+    more after the last whistle, so a match that is plainly over reads
+    `finished_provisional` true and `finished` false for most of a live
+    weekend. Anything asking whether a player's matches are done has to read the
+    first, or he never counts as having blanked and nobody ever comes on for
+    him.
+    """
+    live = load_live(season, season.next_gameweek)
+
+    awaiting = live.fixtures[live.fixtures["finished_provisional"] & ~live.fixtures["finished"]]
+    assert not awaiting.empty, "the fake needs a match that is over but not audited"
+    assert live.played_out.loc[awaiting.index].all(), "over is over"
+    assert live.played_out.sum() > int(live.fixtures["finished"].sum()), "and it counts for more"
+
+    # a player whose only fixture is one of those has finished playing
+    done = pd.Series(list(awaiting["team_h"]), index=list(awaiting["team_h"]))
+    assert live.settled(done).all(), "his matches are done, so a blank is a blank"
+
+
+def test_bonus_stays_ours_until_the_audit(season: Season):
+    """Being over is not the same question as being confirmed, and bonus is the
+    later one: FPL applies the real figure at audit time, so a gameweek that has
+    played out in full still shows our own arithmetic until then."""
+    live = load_live(season, season.next_gameweek)
+    assert not live.all_confirmed, "the fake leaves matches unaudited"
+
+
 def test_a_blank_club_counts_as_settled(season: Season):
     """Waiting for a match that does not exist would leave a blank gameweek
     provisional forever."""

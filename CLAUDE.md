@@ -277,10 +277,13 @@ visitor until someone reboots by hand. After a push that adds or renames
 anything in `fpl_manager`, load the app and reboot it if it errors.
 `docs/delivery.md` explains why the traceback misleads you while it lasts.
 
-**None of the live code has met a real match yet.** It was written pre-season on
-synthetic payloads. The empty case is verified against the real API. The bonus
-ranking and the substitution rule are not. Treat the first scored gameweek as
-the real test.
+**The live code met its first real match in GW1 and got one thing wrong.** It
+was written pre-season on synthetic payloads, and the first live weekend found
+that `finished` is the audit rather than the whistle, which left the fixture
+counter reading zero of ten and automatic substitutions unresolved all weekend.
+`LiveGameweek.played_out` is the fix and `docs/gotchas.md` carries the detail.
+The bonus ranking still has not been checked against a real award, so treat that
+as the part not yet proven.
 
 ## Testing
 
