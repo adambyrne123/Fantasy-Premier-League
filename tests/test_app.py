@@ -208,6 +208,65 @@ def test_club_form_lists_every_club_once_there_are_results(midseason_app):
     assert tables[0]["scored_per_game"].is_monotonic_decreasing
 
 
+def test_where_they_sit_comes_before_the_league_table(midseason_app):
+    """Their standing across every league is the first thing wanted, and last
+    season's history is the last. Order asserted because it is the whole point
+    of the layout and nothing else would catch it moving."""
+    at = midseason_app.run()
+    _leagues_entry(at).set_value(1).run()
+    assert not at.exception
+
+    captions = [c.value for c in at.caption]
+    sits = next(i for i, c in enumerate(captions) if "Where they sit" in c)
+    table = next(i for i, c in enumerate(captions) if "Their classic leagues" in c)
+    previous = next(i for i, c in enumerate(captions) if "Previous seasons" in c)
+    assert sits < table < previous
+
+
+def test_every_league_they_are_in_carries_their_rank(midseason_app):
+    at = midseason_app.run()
+    _leagues_entry(at).set_value(1).run()
+    assert not at.exception
+    tables = [d.value for d in at.dataframe if "kind" in d.value.columns]
+    assert tables, "no standing-per-league table"
+    assert {"name", "rank"} <= set(tables[0].columns)
+
+
+def _month_box(at):
+    return next(c for c in at.checkbox if c.key == "league_month")
+
+
+def test_the_month_waits_to_be_asked(midseason_app):
+    """One request per manager in the league, so it must not fire because
+    somebody opened a tab."""
+    at = midseason_app.run()
+    _leagues_entry(at).set_value(1).run()
+    assert not at.exception
+    tables = [d.value for d in at.dataframe if "month_points" in d.value.columns]
+    assert not tables, "the month should be off until asked for"
+
+
+def test_the_month_adds_points_and_a_rank_within_the_league(midseason_app, monkeypatch):
+    """The month is pinned rather than read off the clock. Which gameweeks fall
+    in a month is `Season.gameweeks_in_month`'s job and is tested there; this is
+    about the table getting the columns."""
+    from fpl_manager.data import Season
+
+    monkeypatch.setattr(Season, "gameweeks_in_month", lambda self, when=None: [1, 2])
+
+    at = midseason_app.run()
+    _leagues_entry(at).set_value(1).run()
+    _month_box(at).set_value(True).run()
+    assert not at.exception
+
+    table = next(d.value for d in at.dataframe if "month_points" in d.value.columns)
+    assert table["month_points"].notna().any(), "somebody should have scored"
+    assert table["month_rank"].min() == 1, "a rank inside the league starts at one"
+    # the month is its own ordering, not a copy of the season one
+    by_month = table.sort_values("month_rank")["entry_id"].tolist()
+    assert by_month == table.sort_values("month_points", ascending=False)["entry_id"].tolist()
+
+
 def test_a_manager_id_shows_their_record(midseason_app):
     at = midseason_app.run()
     _leagues_entry(at).set_value(1).run()
@@ -215,6 +274,42 @@ def test_a_manager_id_shows_their_record(midseason_app):
     labels = [m.label for m in at.metric]
     assert "Overall points" in labels
     assert "Overall rank" in labels
+
+
+def test_the_leagues_tab_follows_the_loaded_squad(app_with_squad):
+    """One id, entered once. A widget's default only applies the first time it
+    renders, so this box used to keep whoever it saw first and go on reporting
+    on them after a different squad was loaded."""
+    at = _load_the_squad(app_with_squad.run())
+    assert not at.exception
+    assert _leagues_entry(at).value == 123, "should be the id loaded in the sidebar"
+
+
+def test_the_leagues_tab_follows_a_change_of_squad(app_with_squad):
+    """The regression this exists for. Loading a second id used to leave this
+    tab reporting on the first, because a widget's `value` is only its default
+    on the render that creates it."""
+    at = _load_the_squad(app_with_squad.run())
+    assert _leagues_entry(at).value == 123
+
+    next(t for t in at.sidebar.text_input if t.key == "sidebar_entry").set_value("456").run()
+    assert not at.exception
+    assert _leagues_entry(at).value == 456, "should follow the squad now loaded"
+
+
+def test_looking_up_another_manager_survives_a_rerun(app_with_squad):
+    """The tab is for any public manager, not only for you, so an id typed in
+    here has to stick rather than snap back to the loaded squad on the next
+    rerun."""
+    at = _load_the_squad(app_with_squad.run())
+    _leagues_entry(at).set_value(1).run()
+    assert not at.exception
+    assert _leagues_entry(at).value == 1
+
+    # a rerun that does not change the loaded squad must leave the override be
+    next(s for s in at.sidebar.slider if s.label == "Gameweeks to project over").set_value(4).run()
+    assert not at.exception
+    assert _leagues_entry(at).value == 1
 
 
 def test_an_unranked_manager_reads_as_unranked_not_as_first(app):
@@ -394,7 +489,7 @@ def test_the_keeper_wears_a_different_kit_from_the_outfielders(app):
 def test_the_drill_down_shows_the_player_s_face(midseason_app):
     at = _select_row(midseason_app.run())
     assert not at.exception
-    head = next(m.value for m in at.get("dialog")[0].markdown if 'class="pd-head"' in m.value)
+    head = next(m.value for m in at.markdown if 'class="pd-head"' in m.value)
     assert "photos/players" in head
     assert "shirts/standard" in head, "the kit has to back the face here too"
 
@@ -495,26 +590,48 @@ def test_the_pool_says_how_much_it_is_hiding(app):
     assert any("Showing" in c.value and "players" in c.value for c in at.caption)
 
 
-def _select_row(at, row=0):
-    """Pick a row in the pool table.
+def _select_rows(at, rows):
+    """Tick rows in the pool table.
 
     A dataframe selection is a click on a canvas, which AppTest cannot do, so
     this writes the widget state Streamlit would have written. It has to be a
     fresh dict rather than a mutation, since widget state is read only.
     """
-    at.session_state["pool"] = {"selection": {"rows": [row], "columns": []}}
+    at.session_state["pool"] = {"selection": {"rows": list(rows), "columns": []}}
     return at.run()
 
 
-def test_selecting_a_player_shows_the_working_behind_his_projection(midseason_app):
+def _select_row(at, row=0):
+    return _select_rows(at, [row])
+
+
+def _rows_for_clubs(at, *clubs):
+    """A row position in the pool for one player from each club named.
+
+    Picking by club rather than by position so a test can say who it wants
+    without depending on which synthetic player happens to sort to the top.
+    """
+    listed = list(_pool(at)["club"])
+    return [listed.index(club) for club in clubs]
+
+
+def test_ticking_a_player_shows_the_working_behind_his_projection(midseason_app):
     """A total says nothing about which of the three terms produced it, which
     is the whole reason the drill-down exists."""
     at = _select_row(midseason_app.run())
     assert not at.exception
-    labels = [m.label for m in at.get("dialog")[0].metric]
+    labels = [m.label for m in at.metric]
     assert "Points per 90" in labels
     assert "Expected minutes" in labels
     assert any(label.startswith("Projected") for label in labels)
+
+
+def test_the_working_renders_in_the_page_rather_than_a_dialog(midseason_app):
+    """Ticks are how a comparison is built, so a modal on the first tick would
+    have to be dismissed before the second could be reached."""
+    at = _select_row(midseason_app.run())
+    assert not at.exception
+    assert not at.get("dialog"), "the drill-down should be inline"
 
 
 def test_the_drill_down_says_so_when_there_is_no_current_sample(app):
@@ -522,17 +639,69 @@ def test_the_drill_down_says_so_when_there_is_no_current_sample(app):
     rate would print nan at the reader instead of saying there is no sample."""
     at = _select_row(app.run())
     assert not at.exception
-    assert any("no sample yet" in c.value for c in at.get("dialog")[0].caption)
+    assert any("no sample yet" in c.value for c in at.caption)
 
 
-def test_clearing_the_selection_allows_the_drill_down_to_reopen(midseason_app):
-    """The guard that stops the dialog reopening on every rerun has to reset,
-    or a player can only ever be inspected once."""
+def test_streamlit_drops_the_ticks_when_the_table_changes(midseason_app):
+    """The reason the picks are held by id rather than read off the table.
+
+    A selection is row positions, not players, and Streamlit drops it whenever
+    the data underneath changes. Pinned because everything else here depends on
+    it: if this ever stopped being true, position 35 could resolve to a
+    different player, or index past the end of a table that now has twenty
+    rows.
+    """
+    at = _select_rows(midseason_app.run(), [35])
+    assert "Points per 90" in [m.label for m in at.metric], "row 35 should tick"
+
+    at = at.text_input[0].set_value("C01").run()
+    assert not at.exception
+    assert len(_pool(at)) < 35, "the filter has to leave fewer rows than the tick"
+    assert at.session_state["pool"]["selection"]["rows"] == [], "Streamlit clears it"
+
+
+def test_a_comparison_survives_the_horizon_moving(midseason_app):
+    """Reading two players over three gameweeks and then over six is the whole
+    point of the slider, and the slider changes every number in the table, which
+    is enough for Streamlit to drop the ticks. Losing the comparison there would
+    wipe it halfway through the thought it exists to support."""
+    at = _compare(midseason_app.run(), "C01", "C02")
+    assert len(_compare_table(at)) == 2
+
+    at = next(s for s in at.slider if s.label == "Gameweeks to project over").set_value(3).run()
+    assert not at.exception
+    assert at.session_state["pool"]["selection"]["rows"] == [], "the ticks are gone"
+    assert len(_compare_table(at)) == 2, "the comparison is not"
+    assert any("Still reading" in c.value for c in at.caption), "and it says why the boxes emptied"
+
+
+def test_a_filtered_out_player_leaves_the_comparison(midseason_app):
+    """Held picks are still held by a filter, so a player the pool can no longer
+    reach has to drop rather than linger as a row nobody can untick."""
+    at = _compare(midseason_app.run(), "C01", "C02")
+    at = at.text_input[0].set_value("C01").run()
+    assert not at.exception
+    assert not [d for d in at.dataframe if "ep_next" in d.value.columns], "one left is no pair"
+
+
+def test_clearing_held_picks_empties_the_comparison(midseason_app):
+    """The ticks are gone, so the button is the only way back out."""
+    at = _compare(midseason_app.run(), "C01", "C02")
+    at = next(s for s in at.slider if s.label == "Gameweeks to project over").set_value(3).run()
+    next(b for b in at.button if b.key == "clear_compared").click().run()
+    assert not at.exception
+    assert not [d for d in at.dataframe if "ep_next" in d.value.columns]
+
+
+def test_clearing_the_ticks_leaves_the_tab_clean(midseason_app):
+    """Unticking has to take the working and the comparison away with it."""
     at = _select_row(midseason_app.run())
-    assert at.session_state["inspected"] is not None
-    at.session_state["pool"] = {"selection": {"rows": [], "columns": []}}
-    at.run()
-    assert at.session_state["inspected"] is None
+    assert "Points per 90" in [m.label for m in at.metric]
+
+    at = _select_rows(at, [])
+    assert not at.exception
+    assert "Points per 90" not in [m.label for m in at.metric]
+    assert any("Nothing ticked" in c.value for c in at.caption)
 
 
 def _chart_specs(at):
@@ -573,19 +742,13 @@ def test_turning_zoom_on_gives_the_chart_back_its_wheel(app):
     assert any(_has_scale_binding(spec) for spec in _chart_specs(at))
 
 
-def _compare(at, names):
-    """Pick players by their multiselect labels and rerun."""
-    return at.multiselect(key="compare").set_value(list(names)).run()
-
-
-def _options(at, *clubs):
-    """One option label per club named, so a test can say which club it wants."""
-    options = at.multiselect(key="compare").options
-    return [next(o for o in options if f"({club}," in o) for club in clubs]
+def _compare(at, *clubs):
+    """Tick one player from each club named, which is how a comparison starts."""
+    return _select_rows(at, _rows_for_clubs(at, *clubs))
 
 
 def _compare_table(at):
-    """The head to head table, found by FPL's own projection only it carries."""
+    """The comparison table, found by FPL's own projection only it carries."""
     return next(d.value for d in at.dataframe if "ep_next" in d.value.columns)
 
 
@@ -622,38 +785,24 @@ def test_every_compared_player_gets_a_row(midseason_app):
     """The point of the section: several players read against each other,
     rather than the same list read several times over."""
     at = midseason_app.run()
-    picked = _options(at, "C01", "C02", "C03")
-    at = _compare(at, picked)
+    at = _compare(at, "C01", "C02", "C03")
     assert not at.exception
 
     table = _compare_table(at)
     assert len(table) == 3
-    assert [f"{n} ({c}," for n, c in zip(table["name"], table["club"], strict=True)] == [
-        p[: p.index(",") + 1] for p in picked
-    ]
+    assert list(table["club"]) == ["C01", "C02", "C03"], "in the order the table lists them"
 
 
 def test_the_comparison_carries_fpls_own_projection_beside_ours(midseason_app):
     """`ep_next` is FPL's number and is deliberately not an input to ours, so
     the one honest place for it is next to ours where it can disagree."""
     at = midseason_app.run()
-    at = _compare(at, _options(at, "C01", "C02"))
+    at = _compare(at, "C01", "C02")
     assert not at.exception
 
     table = _compare_table(at)
     assert table["ep_next"].gt(0).all(), "their projection should be populated"
     assert not table["ep_next"].equals(table["xpts_next"]), "it is theirs, not a copy of ours"
-
-
-def test_the_comparison_ignores_the_filters_above_it(midseason_app):
-    """It reads the whole pool on purpose. A search that matches nobody empties
-    the table above and must not take the comparison down with it."""
-    at = midseason_app.run()
-    picked = _options(at, "C01", "C02")
-    at = _compare(at, picked)
-    at = at.text_input[0].set_value("no such player anywhere").run()
-    assert not at.exception
-    assert len(_compare_table(at)) == 2
 
 
 def test_a_blank_gameweek_is_a_zero_rather_than_a_missing_bar(monkeypatch, tmp_path):
@@ -672,7 +821,7 @@ def test_a_blank_gameweek_is_a_zero_rather_than_a_missing_bar(monkeypatch, tmp_p
     monkeypatch.setattr(Season, "team_fixtures", blanked)
 
     at = _app(monkeypatch, tmp_path, played=12).run()
-    at = _compare(at, _options(at, "C01", "C02"))
+    at = _compare(at, "C01", "C02")
     assert not at.exception
 
     runs = _compare_runs(at)
@@ -701,7 +850,7 @@ def test_the_compared_player_keeps_his_colour_across_every_chart(midseason_app):
     import json
 
     at = midseason_app.run()
-    at = _compare(at, _options(at, "C01", "C02"))
+    at = _compare(at, "C01", "C02")
     assert not at.exception
 
     scales = [
@@ -718,7 +867,7 @@ def test_the_comparison_follows_the_horizon(midseason_app):
     still drawing six gameweeks after it was moved to three would be arguing
     against the numbers on the same screen."""
     at = midseason_app.run()
-    at = _compare(at, _options(at, "C01", "C02"))
+    at = _compare(at, "C01", "C02")
     at = next(s for s in at.slider if s.label == "Gameweeks to project over").set_value(3).run()
     assert not at.exception
 
@@ -728,9 +877,16 @@ def test_the_comparison_follows_the_horizon(midseason_app):
 
 def test_the_comparison_is_capped(midseason_app):
     """Past about four the grouped bars stop being readable and the table
-    starts scrolling sideways on anything smaller than a laptop."""
-    at = midseason_app.run()
-    assert at.multiselect(key="compare").proto.max_selections == 4
+    starts scrolling sideways on anything smaller than a laptop.
+
+    A dataframe has no `max_selections`, so unlike the multiselect this
+    replaced, the cap has to be enforced in the app and said out loud rather
+    than being enforced by the widget refusing the fifth tick.
+    """
+    at = _select_rows(midseason_app.run(), [0, 1, 2, 3, 4])
+    assert not at.exception
+    assert len(_compare_table(at)) == 4
+    assert any("Reading the first 4" in i.value for i in at.info)
 
 
 def test_the_radar_says_nothing_is_coming_rather_than_showing_a_blank_table(app):
@@ -1213,6 +1369,34 @@ def test_the_live_tab_scores_a_loaded_squad(app_with_squad, monkeypatch):
     at = _load_the_squad(app_with_squad.run())
     assert not at.exception
     assert any(m.label == "Points" for m in at.metric)
+
+
+def test_the_live_gameweek_is_drawn_on_a_pitch(app_with_squad, monkeypatch):
+    """A live gameweek is read as a formation, the way the points page on the
+    FPL site lays it out, rather than as two tables of numbers."""
+    from fpl_manager import api
+
+    from .conftest import FakeApi
+
+    fake = FakeApi(played=12)
+    monkeypatch.setattr(api.FplApi, "live", lambda self, gw: fake.live(gw))
+    monkeypatch.setattr(
+        api.FplApi, "fixtures_for_event", lambda self, gw: fake.fixtures_for_event(gw)
+    )
+
+    at = _load_the_squad(app_with_squad.run())
+    assert not at.exception
+
+    pitches = [m.value for m in at.markdown if 'class="pitch"' in m.value]
+    live = [p for p in pitches if ">Pts<" in p]
+    assert live, "the live gameweek should be on a pitch"
+    assert ">Mins<" in live[0], "points alone cannot say whether he played"
+    assert 'class="badge c"' in live[0], "the armband has to be on the shirt"
+    assert 'class="badge v"' in live[0], "and the vice, who is who it falls to"
+    assert "bench-strip" in live[0], "and the bench in the order it would come on"
+
+    # whole points, since a settled score printed as 6.0 reads as an estimate
+    assert not re.search(r'class="v next">\d+\.\d<', live[0])
 
 
 def test_app_holds_no_model_logic():

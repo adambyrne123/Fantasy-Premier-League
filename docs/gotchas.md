@@ -67,6 +67,17 @@ fragment exists to avoid.
 seconds against the 60 `api.live` holds on disk. A memory cache that outlives
 the disk cache behind it serves stale data twice over.
 
+**A month is ours, not FPL's, and it costs a request per manager.** There is no
+monthly endpoint and no monthly field anywhere in the API.
+`Season.gameweeks_in_month` defines a month by **deadline**, so a gameweek
+belongs whole to one month rather than being split by kickoff, and
+`leagues.month_totals` adds one up per manager out of `entry/{id}/history/`.
+It takes the difference of two running totals rather than summing the per
+gameweek `points`, because the payload carries `points` and
+`event_transfers_cost` side by side and never says whether the first is already
+net of the second. A difference of totals cannot be wrong about it. Being one
+request per league member, it sits behind a checkbox like The field does.
+
 **Never call `st.stop()` inside a tab.** Tab bodies are one script, so it stops
 every tab after the one you are in, not the tab you are in. Worse, it hides
 whatever the later tabs would have done with the same bad input: an illegal

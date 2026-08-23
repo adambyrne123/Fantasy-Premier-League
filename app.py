@@ -35,8 +35,8 @@ from fpl_manager.elite import (
     field_shares,
     template_xi,
 )
-from fpl_manager.leagues import leagues_of, load_manager, past_seasons, standings
-from fpl_manager.live import LiveGameweek, load_live, player_view, score_squad
+from fpl_manager.leagues import leagues_of, load_manager, past_seasons, standings, with_month
+from fpl_manager.live import Lineup, LiveGameweek, load_live, player_view, score_squad
 from fpl_manager.optimiser import (
     MAX_PLAN_WEEKS,
     POOL_SIZE,
@@ -192,6 +192,11 @@ POSITION_COLOURS = {"GKP": "#FFB020", "DEF": "#00C2FF", "MID": "#00E87B", "FWD":
 # values, since a second set of greens and blues would invite reading position
 # into a chart that is not about position.
 COMPARE_COLOURS = ("#00E87B", "#00C2FF", "#FFB020", "#FF4D6D")
+# How many can be read against each other at once. It is the number of colours
+# above rather than a taste, since every chart in the comparison gives each
+# player one and they have to stay distinguishable. Raising it means adding
+# colours that are neither green nor blue, for the reason in the comment above.
+COMPARE_MAX = len(COMPARE_COLOURS)
 # At most four rows, so the comparison can carry the whole projection at once
 # rather than making you switch views to see the rest of it. The stat views
 # above exist because the pool is hundreds of rows long, which this is not.
@@ -490,6 +495,19 @@ def load_captaincy(
     stamp: str,
 ) -> pd.DataFrame:
     return haul_frame(_season, projections, by_gameweek, event=event)
+
+
+@st.cache_data(show_spinner=False)
+def cached_month(
+    _season: Season, table: pd.DataFrame, events: tuple[int, ...], stamp: str
+) -> pd.DataFrame:
+    """A league table with the month added, cached on the table it was given.
+
+    One request per manager in the league, so this is cached hard and only
+    reached from a checkbox. The events tuple is in the key because a league
+    read in August and the same league read in September are different answers.
+    """
+    return with_month(_season, table, list(events))
 
 
 @st.cache_data(show_spinner="Reading the top managers' squads")
@@ -858,11 +876,18 @@ def pool_table(
     horizon: int,
     key: str,
     images: pd.DataFrame | None = None,
-) -> int | None:
+    multi: bool = False,
+) -> list[int]:
     """The pool, with each player's fixture run beside his numbers.
 
     Reading a projection without the run that produced it means holding two
-    tabs in your head at once. Returns the id of the selected player, or None.
+    tabs in your head at once. Returns the ids of the ticked players, in the
+    order the table lists them.
+
+    `multi` puts a tick box on every row, which is how the Players tab asks for
+    a comparison: the players you want to weigh against each other are the ones
+    you have just read, so naming them again in a separate widget is a step
+    that does not need to exist.
     """
     table, colours, gw_cols = pool_frame(view, labels, difficulty, columns, images)
 
@@ -872,15 +897,15 @@ def pool_table(
         width="stretch",
         column_config=pool_column_config(horizon, gw_cols, float(max(view["xpts_total"].max(), 1))),
         on_select="rerun",
-        selection_mode="single-row",
+        selection_mode="multi-row" if multi else "single-row",
         key=key,
     )
-    rows = selection["selection"]["rows"]
-    return int(table.index[rows[0]]) if rows else None
+    # a selection comes back as row positions, so it is resolved against the
+    # table that produced it and never held on to as positions
+    return [int(table.index[r]) for r in selection["selection"]["rows"]]
 
 
-@st.dialog("Player detail", width="large")
-def player_detail(
+def player_working(
     row: pd.Series, weeks: pd.DataFrame, horizon: int, images: pd.DataFrame | None = None
 ) -> None:
     """Why this player is ranked where he is.
@@ -890,6 +915,10 @@ def player_detail(
     scoring rate and a thin minutes share is a completely different
     proposition from one the other way round, and a column of totals cannot
     tell you which you are looking at.
+
+    Renders in the page rather than in a dialog. Ticking rows is how a
+    comparison is built now, so a modal on the first tick would have to be
+    dismissed before the second could be reached.
     """
     severity, note = availability(row)
     st.markdown(
@@ -1011,6 +1040,7 @@ def _shirt(
     highlight: str = "",
     images: pd.DataFrame | None = None,
     labels: tuple[str, str] = ("Next", "Span"),
+    value_format: str = ".1f",
 ) -> str:
     """One player's card, carrying both projections rather than one.
 
@@ -1021,6 +1051,10 @@ def _shirt(
 
     `labels` names the two spans, so the card says GW1 and 6 GW rather than
     leaving the reader to work out which is which.
+
+    `value_format` exists because not every caller is showing a projection. A
+    live score is a whole number of points, and printing it as 6.0 makes a
+    settled fact look like an estimate.
     """
     mark = f'<span class="badge {badge.lower()}">{badge}</span>' if badge else ""
     severity, note = availability(row)
@@ -1038,7 +1072,7 @@ def _shirt(
         spans.append((span_label, row["xpts_total"], "span"))
     cells = "".join(
         f'<span class="box"><span class="k">{escape(label)}</span>'
-        f'<span class="v {tone}">{value:.1f}</span></span>'
+        f'<span class="v {tone}">{value:{value_format}}</span></span>'
         for label, value, tone in spans
     )
 
@@ -1062,6 +1096,7 @@ def formation_view(
     images: pd.DataFrame | None = None,
     labels: tuple[str, str] = ("Next", "Span"),
     cost: float | None = None,
+    value_format: str = ".1f",
 ) -> None:
     """Lay the XI out on a pitch, in formation, the way the FPL site does.
 
@@ -1092,6 +1127,7 @@ def formation_view(
                 highlight.get(pid, ""),
                 images,
                 labels,
+                value_format,
             )
             for pid, row in line.iterrows()
         )
@@ -1112,7 +1148,8 @@ def formation_view(
 
     if bench is not None and not bench.empty:
         strip = "".join(
-            _shirt(row, "", highlight.get(pid, ""), images, labels) for pid, row in bench.iterrows()
+            _shirt(row, "", highlight.get(pid, ""), images, labels, value_format)
+            for pid, row in bench.iterrows()
         )
         markup += (
             f'<div class="bench-strip{size}"><div class="bench-cap">Bench, in order</div>'
@@ -1120,6 +1157,58 @@ def formation_view(
         )
 
     st.markdown(markup, unsafe_allow_html=True)
+
+
+def live_pitch(
+    state: LiveGameweek,
+    season: Season,
+    lineup: Lineup,
+    projections: pd.DataFrame,
+    images: pd.DataFrame | None = None,
+    vice_id: int | None = None,
+) -> bool:
+    """The live gameweek on a pitch, the way the points page on the FPL site is.
+
+    False if none of the squad could be drawn, which happens only when every
+    player has left the game.
+
+    The shirts want a projections row for the name, club, price and fitness
+    flag, and the live numbers ride on top of the two projection columns
+    `formation_view` already reads. That is the same borrowing the elite
+    template does, and it is what keeps one pitch renderer rather than three.
+
+    Points rather than minutes on the left, because the left number is the one
+    the eye lands on and this page is called live scoring. Minutes are the
+    honest second number: nine points off twenty minutes and nine off ninety are
+    different weeks, and the pitch would otherwise not say which you had.
+    """
+    seen = [i for i in (*lineup.starters, *lineup.bench) if i in projections.index]
+    if not seen:
+        return False
+
+    numbers = player_view(state, season, seen)
+    pitch = projections.loc[seen].assign(
+        xpts_next=numbers["points"].astype(float),
+        xpts_total=numbers["minutes"].astype(float),
+    )
+    # the captain's shirt carries what he actually counted for, since a doubled
+    # haul is the difference between a good week and a bad one and a shirt
+    # showing the undoubled figure would not add up to the total above it
+    if lineup.captain in pitch.index:
+        pitch.loc[lineup.captain, "xpts_next"] *= lineup.captain_multiplier
+
+    xi = pitch.loc[[i for i in lineup.starters if i in pitch.index]]
+    bench = pitch.loc[[i for i in lineup.bench if i in pitch.index]]
+    formation_view(
+        xi,
+        bench,
+        lineup.captain,
+        vice_id,
+        images=images,
+        labels=("Pts", "Mins"),
+        value_format=".0f",
+    )
+    return True
 
 
 def your_lineup(squad: MySquad, current: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame] | None:
@@ -1903,7 +1992,15 @@ with players_tab:
         "That separation is the point. A high projection because someone scores "
         "freely is a different bet from a high projection because he plays every "
         "minute against weak opposition, and a single total cannot tell you "
-        "which. Select any row to see the working behind it.\n\n"
+        "which.\n\n"
+        "**Tick a row** to see the working behind that player. **Tick two to "
+        "four** and they are read against each other instead: their numbers, "
+        "their fixture runs and the three terms side by side, each player the "
+        "same colour in every chart. Three players who all look plausible is "
+        "the ordinary transfer question, and a ranked list can only answer it "
+        "by being read several times over.\n\n"
+        "Ticks reach the rows listed below, so a comparison across positions "
+        "or price brackets needs the filters wide enough to show both players.\n\n"
         "**xPts next** and **xPts over the horizon** are both projected points "
         "and are not comparable with each other."
     )
@@ -1979,18 +2076,55 @@ with players_tab:
 
         st.caption(
             f"Showing {len(shown)} of {len(view)} players, ranked by "
-            f"{sort_by.replace('_', ' ')}. Click a row for the working behind the projection."
+            f"{sort_by.replace('_', ' ')}. Tick a row for the working behind the projection, "
+            "or tick two or more to read them against each other."
         )
-        chosen = pool_table(shown, labels, difficulty, columns, horizon, key="pool", images=images)
+        ticked = pool_table(
+            shown, labels, difficulty, columns, horizon, key="pool", images=images, multi=True
+        )
 
-        # only open on a change, or closing the dialog would reopen it at once
-        if chosen is not None and st.session_state.get("inspected") != chosen:
-            st.session_state.inspected = chosen
-            player_detail(
-                view.loc[chosen], player_weeks(by_gameweek, chosen), horizon, images=images
+        # Streamlit drops a dataframe selection whenever the data under it
+        # changes, and the horizon slider changes every projection in the table.
+        # Left alone that wipes a comparison halfway through the thought it
+        # exists to support, since reading two players over three gameweeks and
+        # then over six is the point of the slider. So the picks are held here
+        # by id, and the table only gets to speak when it is showing the same
+        # rows it was showing last run.
+        listed = tuple(shown.index)
+        if st.session_state.get("pool_rows") != listed:
+            # the rows moved, so an empty selection is Streamlit clearing up
+            # rather than anyone unticking anything
+            st.session_state["pool_rows"] = listed
+            picked = [i for i in st.session_state.get("compared", []) if i in view.index]
+        else:
+            picked = ticked
+        st.session_state["compared"] = picked
+
+        if picked and not ticked:
+            held = ", ".join(str(view.loc[i, "name"]) for i in picked)
+            st.caption(f"Still reading {held}. The ticks cleared when the table changed.")
+            spare, _ = st.columns([1, 4])
+            if spare.button("Clear", key="clear_compared", width="stretch"):
+                st.session_state["compared"] = []
+                st.rerun()
+
+        if len(picked) > COMPARE_MAX:
+            st.info(
+                f"Reading the first {COMPARE_MAX}. Past that the grouped bars below stop being "
+                "separable and the table scrolls sideways on anything smaller than a laptop."
             )
-        elif chosen is None:
-            st.session_state.inspected = None
+            picked = picked[:COMPARE_MAX]
+
+        if not picked:
+            st.caption("Nothing ticked.")
+        elif len(picked) == 1:
+            player_working(
+                view.loc[picked[0]], player_weeks(by_gameweek, picked[0]), horizon, images=images
+            )
+        else:
+            # `pool` rather than `view`, so a compared player carries his whole
+            # row even when the filters above are hiding most of the columns
+            compare_panel(pool, picked, by_gameweek, labels, difficulty, horizon, images=images)
 
         st.divider()
         scatter, leaders = st.columns([3, 2])
@@ -2043,35 +2177,6 @@ with players_tab:
                 )
                 .properties(height=430)
             )
-
-    st.divider()
-    st.subheader("Head to head")
-    st.caption(
-        "Three players who all look plausible is the ordinary transfer question, and a ranked "
-        "list can only answer it by being read several times over. Pick up to four to put "
-        "their numbers, their runs and the terms behind them beside each other. This list is "
-        "the whole pool, so the filters above do not narrow it."
-    )
-    compared = st.multiselect(
-        "Compare players",
-        sorted(lookup),
-        max_selections=4,
-        key="compare",
-        label_visibility="collapsed",
-        placeholder="Search for a player",
-    )
-    if not compared:
-        st.caption("Nobody picked yet.")
-    else:
-        compare_panel(
-            pool,
-            [lookup[n] for n in compared],
-            by_gameweek,
-            labels,
-            difficulty,
-            horizon,
-            images=images,
-        )
 
     st.divider()
     st.subheader("Price pressure")
@@ -2863,15 +2968,31 @@ with leagues_tab:
         "been scored, which is how the API behaves rather than a fault here."
     )
 
-    # the sidebar box holds text now, and an empty one is the common case, so
-    # this cannot go straight into int()
-    sidebar_id = str(st.session_state.get("sidebar_entry") or "").strip()
+    # This box follows the squad loaded in the sidebar, and a widget's `value`
+    # is only its default on the first render, so following has to be done by
+    # writing the key. Without it, loading one id and then another leaves this
+    # tab reporting on the first, which reads as the app being wrong about who
+    # you are rather than as a stale default.
+    #
+    # It follows `entry_id` off the loaded squad rather than the sidebar text,
+    # so a half typed or wrong id does not drag this tab along with it. Typing
+    # someone else in here still sticks, since only a change of loaded squad
+    # writes the key, and that is the point of the box: the tab is for any
+    # public manager, not only for you.
+    loaded_entry = my_squad.entry_id if my_squad is not None else None
+    if st.session_state.get("league_follows") != loaded_entry:
+        st.session_state["league_follows"] = loaded_entry
+        if loaded_entry:
+            st.session_state["league_entry"] = int(loaded_entry)
+
     entry = st.number_input(
         "Manager entry id",
         min_value=0,
         step=1,
-        value=int(sidebar_id) if sidebar_id.isdigit() else 0,
+        value=0,
         key="league_entry",
+        help="Starts as whoever is loaded in the sidebar. Change it to read any other "
+        "manager, and it stays changed until you load a different squad.",
     )
 
     manager, history, joined = None, None, None
@@ -2909,6 +3030,114 @@ with leagues_tab:
         )
 
         st.divider()
+        st.caption("Where they sit in each of their leagues")
+        if joined.empty:
+            st.info("No classic leagues on this entry.")
+        else:
+            ranks = joined.assign(
+                kind=joined["system"].map({True: "Automatic", False: "Joined"}),
+            )
+            st.dataframe(
+                ranks[["name", "kind", "rank"]],
+                hide_index=True,
+                width="stretch",
+                column_config={
+                    "name": "League",
+                    "kind": st.column_config.TextColumn("Kind", width="small"),
+                    "rank": st.column_config.NumberColumn(
+                        "Their rank",
+                        format="%d",
+                        help="Where they stand in that league. Empty until the first "
+                        "gameweek has been scored, since nobody has a rank before then.",
+                    ),
+                },
+            )
+
+        st.divider()
+        st.caption("Their classic leagues, the ones they joined listed first")
+        if joined.empty:
+            st.info("No classic leagues on this entry.")
+        else:
+            names = {
+                f"{row['name']}{' (automatic)' if row['system'] else ''}": int(row["id"])
+                for _, row in joined.iterrows()
+            }
+            picked = st.selectbox("League table", options=list(names), key="league_pick")
+            table, info = standings(season, names[picked])
+
+            if table.empty:
+                empty_state(
+                    f"{info['name']} has no table yet",
+                    "Nobody has a rank before anyone has scored, so the FPL API returns an "
+                    "empty league until the first gameweek is settled. The league itself is "
+                    "real and this fills in then.",
+                )
+            else:
+                month_events = season.gameweeks_in_month()
+                month_name = f"{pd.Timestamp.now(tz='UTC'):%B}"
+                # One request per manager in the league, so it is asked for
+                # rather than assumed, the same bargain The field makes.
+                show_month = st.checkbox(
+                    f"Add {month_name} points and rank",
+                    key="league_month",
+                    disabled=not month_events,
+                    help="Reads every manager's history to add up the month, which is one "
+                    "request each and the slowest thing on this tab."
+                    if month_events
+                    else "No gameweek deadlines fall in this month, so there is no month "
+                    "to add up.",
+                )
+                if show_month and month_events:
+                    with st.spinner(f"Adding up {month_name}"):
+                        table = cached_month(season, table, tuple(month_events), stamp)
+
+                st.caption(f"{info['name']}, page {info['page']}")
+                if show_month and month_events:
+                    span = (
+                        f"GW{month_events[0]}"
+                        if len(month_events) == 1
+                        else f"GW{month_events[0]} to GW{month_events[-1]}"
+                    )
+                    st.caption(
+                        f"{month_name} is {span}, placed by deadline, so a gameweek is "
+                        "whole to one month. The month rank is inside this league only."
+                    )
+                st.dataframe(
+                    table,
+                    hide_index=True,
+                    width="stretch",
+                    column_config={
+                        "rank": st.column_config.NumberColumn("Rank", format="%d"),
+                        "movement": st.column_config.NumberColumn(
+                            "Moved",
+                            format="%+d",
+                            help="Places climbed since the last gameweek. Empty for a new entry.",
+                        ),
+                        "team": "Team",
+                        "manager": "Manager",
+                        "gameweek": st.column_config.NumberColumn("GW", format="%d"),
+                        "total": st.column_config.NumberColumn("Total", format="%d"),
+                        "month_points": st.column_config.NumberColumn(
+                            f"{month_name} pts",
+                            format="%d",
+                            help="Points scored across every gameweek whose deadline falls "
+                            "in this month, hits included. Empty for anyone whose history "
+                            "could not be read.",
+                        ),
+                        "month_rank": st.column_config.NumberColumn(
+                            f"{month_name} rank",
+                            format="%d",
+                            help="Their place in this league over the month alone, worked "
+                            "out here since FPL publishes no monthly rank.",
+                        ),
+                        "entry_id": st.column_config.NumberColumn("Entry", format="%d"),
+                        "last_rank": None,
+                    },
+                )
+                if info["has_next"]:
+                    st.caption("Showing the first fifty. Later pages are not loaded.")
+
+        st.divider()
         st.caption("Previous seasons")
         if history.empty:
             st.info("No previous seasons. This is their first.")
@@ -2937,49 +3166,6 @@ with leagues_tab:
                     "rank": st.column_config.NumberColumn("Final rank", format="%d"),
                 },
             )
-
-        st.divider()
-        st.caption("Their classic leagues, the ones they joined listed first")
-        if joined.empty:
-            st.info("No classic leagues on this entry.")
-        else:
-            names = {
-                f"{row['name']}{' (automatic)' if row['system'] else ''}": int(row["id"])
-                for _, row in joined.iterrows()
-            }
-            picked = st.selectbox("League table", options=list(names), key="league_pick")
-            table, info = standings(season, names[picked])
-
-            if table.empty:
-                empty_state(
-                    f"{info['name']} has no table yet",
-                    "Nobody has a rank before anyone has scored, so the FPL API returns an "
-                    "empty league until the first gameweek is settled. The league itself is "
-                    "real and this fills in then.",
-                )
-            else:
-                st.caption(f"{info['name']}, page {info['page']}")
-                st.dataframe(
-                    table,
-                    hide_index=True,
-                    width="stretch",
-                    column_config={
-                        "rank": st.column_config.NumberColumn("Rank", format="%d"),
-                        "movement": st.column_config.NumberColumn(
-                            "Moved",
-                            format="%+d",
-                            help="Places climbed since the last gameweek. Empty for a new entry.",
-                        ),
-                        "team": "Team",
-                        "manager": "Manager",
-                        "gameweek": st.column_config.NumberColumn("GW", format="%d"),
-                        "total": st.column_config.NumberColumn("Total", format="%d"),
-                        "entry_id": st.column_config.NumberColumn("Entry", format="%d"),
-                        "last_rank": None,
-                    },
-                )
-                if info["has_next"]:
-                    st.caption("Showing the first fifty. Later pages are not loaded.")
 
     st.divider()
     st.caption("The elite template")
@@ -3196,40 +3382,57 @@ with live_tab:
                 names = season.players["name"]
                 st.caption(f"Auto sub: {names.get(out, out)} off, {names.get(came_in, came_in)} on")
 
-            for label, ids in (
-                ("Starting XI", score.lineup.starters),
-                ("Bench", score.lineup.bench),
-            ):
-                st.markdown(f"**{label}**")
-                st.dataframe(
-                    player_view(state, season, ids),
-                    hide_index=True,
-                    width="stretch",
-                    column_config={
-                        "name": "Player",
-                        "position": "Pos",
-                        "club": "Club",
-                        "minutes": st.column_config.NumberColumn("Mins", format="%d"),
-                        "points": st.column_config.NumberColumn("Pts", format="%d"),
-                        "provisional_bonus": st.column_config.NumberColumn(
-                            "Prov bonus", format="%d"
-                        ),
-                        "bps": st.column_config.NumberColumn("BPS", format="%d"),
-                        "goals_scored": st.column_config.NumberColumn("G", format="%d"),
-                        "assists": st.column_config.NumberColumn("A", format="%d"),
-                    },
-                    column_order=[
-                        "name",
-                        "position",
-                        "club",
-                        "minutes",
-                        "goals_scored",
-                        "assists",
-                        "bps",
-                        "provisional_bonus",
-                        "points",
-                    ],
-                )
+            # The pitch first, because a lineup is a spatial thing and the
+            # points page on the FPL site is the shape everyone already reads a
+            # live gameweek in. The numbers behind each shirt are the same ones
+            # the tables below carry, so the tables stay for anyone who wants to
+            # sort by BPS rather than look at a formation.
+            drawn = live_pitch(
+                state,
+                season,
+                score.lineup,
+                projections,
+                images,
+                vice_id=my_squad.vice_captain_id,
+            )
+            if not drawn:
+                st.warning("None of this squad is in the current player list, so no pitch.")
+
+            with st.expander("Every number behind those shirts"):
+                for label, ids in (
+                    ("Starting XI", score.lineup.starters),
+                    ("Bench", score.lineup.bench),
+                ):
+                    st.markdown(f"**{label}**")
+                    st.dataframe(
+                        player_view(state, season, ids),
+                        hide_index=True,
+                        width="stretch",
+                        column_config={
+                            "name": "Player",
+                            "position": "Pos",
+                            "club": "Club",
+                            "minutes": st.column_config.NumberColumn("Mins", format="%d"),
+                            "points": st.column_config.NumberColumn("Pts", format="%d"),
+                            "provisional_bonus": st.column_config.NumberColumn(
+                                "Prov bonus", format="%d"
+                            ),
+                            "bps": st.column_config.NumberColumn("BPS", format="%d"),
+                            "goals_scored": st.column_config.NumberColumn("G", format="%d"),
+                            "assists": st.column_config.NumberColumn("A", format="%d"),
+                        },
+                        column_order=[
+                            "name",
+                            "position",
+                            "club",
+                            "minutes",
+                            "goals_scored",
+                            "assists",
+                            "bps",
+                            "provisional_bonus",
+                            "points",
+                        ],
+                    )
 
         live_panel()
         st.caption(
