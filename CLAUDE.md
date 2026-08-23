@@ -76,6 +76,7 @@ api.py  ──▶  data.py  ──▶  projections.py  ──▶  optimiser.py  
 | `captaincy.py` | Haul and return chances for the armband. Distributions, not point estimates. | Anything the optimiser reads. It is a leaf on purpose |
 | `squad.py` | Loading the user's 15, bank, selling prices. | Projections or optimisation |
 | `leagues.py` | Public manager profiles and classic league tables. | Anything that scores or ranks players |
+| `elite.py` | What the top managers own and captain, counted off their squads. | Anything forward looking. It counts squads that already exist |
 | `cli.py` | Argument parsing and printing. | Model logic of any kind |
 | `app.py` | Streamlit view: widgets, layout, caching. | Model logic of any kind |
 
@@ -89,8 +90,20 @@ squad may import it. The objective is a mean, and a variance term in it was
 argued out once already and turned down as precision theatre on a model this
 rough. A haul chance read beside the projection is the useful version of caring
 about variance, and one folded into the objective is a squad the user cannot
-argue with. Both leaf rules now have tests in `tests/test_pipeline.py` that
-parse the imports, so neither can be undone by accident.
+argue with.
+
+**`elite.py` is a leaf for a third reason.** It reads the top of the overall
+league and counts what those managers own and captain. Nothing that projects or
+picks may import it, and `captaincy.py` in particular may not, even though
+knowing what the field captains is exactly what the rank question needs: it is
+held to `data` and `projections`, so when that arithmetic gets built the shares
+go in as an argument rather than as an import. It is dormant until a gameweek
+has been scored, since picks are not published before then, and it is the most
+expensive thing the app does at one request per manager, which is why a sidebar
+toggle gates it.
+
+All three leaf rules have tests in `tests/test_pipeline.py` that parse the
+imports, so none of them can be undone by accident.
 
 `Season` (in `data.py`) is the single object holding a loaded season. Pass it
 around rather than re-instantiating, since construction does two API calls.
@@ -101,6 +114,23 @@ over the same library, which is what stops them disagreeing about what the best
 squad is. If a function prints or calls `st.`, it belongs in a front end and
 nowhere else. `tests/test_app.py` asserts that model logic has not leaked into
 `app.py`, so adding a solve there will fail the suite.
+
+**Each tab answers one question, and the single week answer lives in exactly one
+of them.** My squad is what you own plus this week's move, Wildcard is what you
+would buy starting over, Planner is the route across several gameweeks. Two tabs
+solving the same week is two tabs that can disagree about the best move, and
+there is a test asserting neither the one week controls nor the planner slider
+appear twice. My squad also sits ahead of Players, so **its table must not have
+`GW`-prefixed columns**: `tests/test_app.py` finds the player pool by taking the
+first dataframe that has one, and a second would shadow it.
+
+**The entry id is remembered in the URL and nowhere else.** `st.query_params`
+holds it, seeded into `st.session_state["sidebar_entry"]` before the widget is
+built, which is the only point a widget's own key may be assigned. The deploy is
+public and multi-tenant so there is nowhere per user to write, a cookie library
+would cost packages the deploy is deliberately without, and an entry id is
+public anyway. It is a text box rather than a number because an id is not a
+quantity, so anything reading `sidebar_entry` gets a string that may be empty.
 
 ## Domain rules that must never be violated
 

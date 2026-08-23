@@ -28,6 +28,13 @@ from fpl_manager.data import (
     format_formation,
     parse_formation,
 )
+from fpl_manager.elite import (
+    DEFAULT_SAMPLE,
+    elite_entries,
+    elite_picks,
+    field_shares,
+    template_xi,
+)
 from fpl_manager.leagues import leagues_of, load_manager, past_seasons, standings
 from fpl_manager.live import LiveGameweek, load_live, player_view, score_squad
 from fpl_manager.optimiser import (
@@ -120,6 +127,20 @@ GLOSSARY = {
     "what you would get for selling one you already own.",
     "roi": "Points already scored this season per million of today's price. "
     "Backward looking, unlike everything on the Players tab.",
+    "elite_ownership": "Share of the top managers sampled who own him, against "
+    "the ownership beside it, which is the whole game. The gap between the two "
+    "is the interesting part: a player the field owns and the top of the table "
+    "does not is a trap, and the other way round is a shortlist.",
+    "elite_start_share": "Share of the sampled managers he actually counted "
+    "for. Read off what he scored them rather than off the lineup they named, "
+    "so an automatic substitution is already in it.",
+    "captain_share": "Share of the sampled managers who gave him the armband. "
+    "Measured from their squads rather than guessed from ownership, and it is "
+    "the thing that decides whether captaining him moves your rank at all.",
+    "effective_ownership": "Ownership counting the armband: a captain counts "
+    "twice and a triple captain three times. At 1.5 his points land in every "
+    "rival total one and a half times over, so a haul from him moves you far "
+    "less than the score suggests.",
 }
 
 CACHE_TTL = 6 * 3600
@@ -471,6 +492,26 @@ def load_captaincy(
     return haul_frame(_season, projections, by_gameweek, event=event)
 
 
+@st.cache_data(show_spinner="Reading the top managers' squads")
+def load_field(
+    _season: Season, gameweek: int, sample: int, stamp: str
+) -> tuple[pd.DataFrame, int, int]:
+    """What the top managers own and captain, plus how many of them answered.
+
+    The two counts are returned rather than worked out on screen because
+    they are the honest caption for the shares: a manager whose picks could
+    not be read is out of the sample entirely, and a table that says a
+    hundred when it read ninety four is wrong about every number on it.
+
+    Much the most expensive thing this app does, at one request a manager,
+    which is why nothing calls it until the sidebar toggle is on.
+    """
+    entries = elite_entries(_season, sample=sample)
+    picks = elite_picks(_season, entries, gameweek)
+    resolved = 0 if picks.empty else int(picks["entry_id"].nunique())
+    return field_shares(picks), len(entries), resolved
+
+
 @st.cache_data(show_spinner="Projecting")
 def load_projections(
     _season: Season, horizon: int, use_prior: bool, stamp: str
@@ -548,6 +589,11 @@ def load_gameweek_shape(_season: Season, horizon: int) -> pd.DataFrame:
 @st.cache_data(show_spinner=False)
 def load_swings(_season: Season, window: int) -> pd.DataFrame:
     return _season.fixture_swings(window)
+
+
+@st.cache_data(show_spinner=False)
+def load_club_form(_season: Season, window: int, stamp: str) -> pd.DataFrame:
+    return _season.club_form(window)
 
 
 @st.cache_data(show_spinner="Pricing chips")
@@ -640,13 +686,16 @@ def status_bar(season: Season, players: int) -> None:
     """
     now = pd.Timestamp.now(tz="UTC")
     played = season.gameweeks_played
-    cells = [
-        _cell(
-            "Gameweek",
-            f"GW{season.next_gameweek} next"
-            + (f" · {played} played" if played else " · pre-season"),
-        )
-    ]
+    # a gameweek under way is neither played nor pre-season, and calling the
+    # opening weekend of the season pre-season is how this read on the first
+    # Saturday: GW1 kicked off, nothing finished, so the count was still zero
+    if season.current_gameweek > played:
+        state = f"GW{season.current_gameweek} under way"
+    elif played:
+        state = f"{played} played"
+    else:
+        state = "pre-season"
+    cells = [_cell("Gameweek", f"GW{season.next_gameweek} next · {state}")]
 
     deadline = season.next_deadline
     if deadline is None:
@@ -741,6 +790,18 @@ def pool_column_config(horizon: int, gw_cols: list[str], max_xpts: float) -> dic
             "Chance %", format="%.0f", **g("chance_of_playing")
         ),
         "fitness": st.column_config.TextColumn("Fitness", width="medium"),
+        "elite_ownership": st.column_config.NumberColumn(
+            "Top 100 %", format="percent", **g("elite_ownership")
+        ),
+        "elite_start_share": st.column_config.NumberColumn(
+            "Top 100 start %", format="percent", **g("elite_start_share")
+        ),
+        "captain_share": st.column_config.NumberColumn(
+            "Captained by", format="percent", **g("captain_share")
+        ),
+        "effective_ownership": st.column_config.NumberColumn(
+            "Effective own.", format="%.2f", **g("effective_ownership")
+        ),
     }
     for col in gw_cols:
         config[col] = st.column_config.TextColumn(
@@ -1061,6 +1122,26 @@ def formation_view(
     st.markdown(markup, unsafe_allow_html=True)
 
 
+def your_lineup(squad: MySquad, current: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame] | None:
+    """Your eleven and your bench, in your order, or None if that is not known.
+
+    Only an entry publishes pick order and the armband. A squad file carries
+    fifteen ids and says nothing about how they were arranged, so there is
+    nothing to show and the caller falls back to the solved lineup.
+
+    A squad with a player who has left the game cannot be split either. The
+    first eleven ids are the eleven only while all fifteen are still there, and
+    guessing which of the fourteen was benched would show a lineup that was
+    never picked.
+    """
+    if squad.captain_id is None:
+        return None
+    held = [i for i in squad.player_ids if i in current.index]
+    if len(held) != len(squad.player_ids):
+        return None
+    return current.loc[held[:11]], current.loc[held[11:]]
+
+
 def empty_state(title: str, body: str) -> None:
     """Say what is missing, why, and when it will fill.
 
@@ -1263,6 +1344,17 @@ def compare_panel(
     )
 
 
+def forget_entry() -> None:
+    """Drop the remembered entry id, from the box and from the URL.
+
+    A callback rather than an inline branch, because a widget's own key cannot
+    be assigned once the widget has been drawn this run, and the button that
+    calls this sits below the box it clears.
+    """
+    st.session_state["sidebar_entry"] = ""
+    st.query_params.clear()
+
+
 def name_lookup(projections: pd.DataFrame) -> dict[str, int]:
     return {
         f"{row['name']} ({row['club']}, {row['price']:.1f})": int(pid)
@@ -1287,6 +1379,7 @@ if st.sidebar.button("Refresh FPL data", width="stretch"):
     load_prices.clear()
     load_roi.clear()
     load_captaincy.clear()
+    load_field.clear()
     cached_prior.clear()
 st.sidebar.caption("Prices change daily. Refreshing refetches for everyone on the app.")
 
@@ -1330,10 +1423,18 @@ st.sidebar.divider()
 if not use_prior and season.gameweeks_played == 0:
     st.sidebar.warning("No prior data and no gameweeks played. Projections are guesswork.")
 
+# The entry id is remembered in the URL rather than anywhere on the server. The
+# deploy is multi tenant and public, so there is nowhere per user to write, and a
+# query parameter costs no dependency and makes the loaded app bookmarkable. An
+# entry id is public anyway: it is the number in your own points page URL on the
+# FPL site.
+remembered = st.query_params.get("entry", "")
+
 my_squad = None
 with st.sidebar.expander("Your squad", expanded=True):
-    st.caption("Loaded once here, used by both Transfers and Chips.")
-    source = st.radio("Load from", ["Nothing loaded", "squad.json", "FPL entry id"])
+    st.caption("Loaded once here, and read by My squad, Planner, Chips and Live.")
+    sources = ["Nothing loaded", "squad.json", "FPL entry id"]
+    source = st.radio("Load from", sources, index=2 if remembered else 0, key="squad_source")
 
     if source == "squad.json":
         upload = st.file_uploader("squad.json", type="json")
@@ -1343,8 +1444,24 @@ with st.sidebar.expander("Your squad", expanded=True):
             except (ValueError, KeyError, json.JSONDecodeError) as exc:
                 st.error(f"Could not read that file: {exc}")
     elif source == "FPL entry id":
-        entry_id = st.number_input("Entry id", min_value=0, step=1, value=0, key="sidebar_entry")
+        # Seeded before the widget exists, which is the only point a widget's own
+        # key may be assigned. A text box rather than a number, because an id is
+        # not a quantity: steppers imply it can be nudged, and a box reading 0
+        # implies something is already loaded.
+        if "sidebar_entry" not in st.session_state:
+            st.session_state["sidebar_entry"] = remembered
+        typed = st.text_input(
+            "Entry id",
+            key="sidebar_entry",
+            placeholder="e.g. 3921945",
+            help="The number in the URL of your points page on the FPL site.",
+        )
         st.caption("Only works once a deadline has passed.")
+
+        entry_id = int(typed) if typed.strip().isdigit() else None
+        if typed.strip() and entry_id is None:
+            st.error("An entry id is just digits, the number in your points page URL.")
+
         paid = st.file_uploader(
             "Optional: squad.json, for what you paid",
             type="json",
@@ -1353,7 +1470,7 @@ with st.sidebar.expander("Your squad", expanded=True):
         )
         if entry_id:
             try:
-                my_squad = load_from_entry(season, int(entry_id))
+                my_squad = load_from_entry(season, entry_id)
                 if paid:
                     merge_prices(my_squad, parse_squad(json.loads(paid.getvalue())), season)
                 else:
@@ -1362,10 +1479,45 @@ with st.sidebar.expander("Your squad", expanded=True):
                 st.error(f"Could not load that entry: {exc}")
                 my_squad = None
 
+        # Only an id that actually loaded is worth putting in a URL, so this
+        # sits after the load rather than beside the box.
+        if my_squad is not None:
+            st.query_params["entry"] = str(entry_id)
+            st.caption("Bookmark this page and the id comes back with it.")
+            st.button("Forget this id", on_click=forget_entry, width="stretch")
+
     if my_squad is not None:
         missing = my_squad.missing_from(projections)
         if missing:
             st.warning(f"{len(missing)} owned players are no longer in the game.")
+
+# Off by default and read here rather than inside a tab, because both the
+# Captain and the Leagues tab want it and the tab bodies run in source order:
+# a toggle living in Leagues would not reach Captain until the rerun after it
+# was clicked.
+with st.sidebar.expander("The field", expanded=False):
+    st.caption(
+        "What the best managers own and captain. One request per manager, so it is off "
+        "until asked for and cached hard once loaded."
+    )
+    field_on = st.toggle(
+        "Read the top managers",
+        value=False,
+        help="Samples the overall league and counts their squads. Empty until the first "
+        "deadline has passed, since picks are not published before then.",
+    )
+    field_sample = st.slider(
+        "Managers to sample", 20, DEFAULT_SAMPLE, DEFAULT_SAMPLE, 20, disabled=not field_on
+    )
+
+field, field_asked, field_resolved = pd.DataFrame(), 0, 0
+# `current_gameweek` rather than the finished count, because picks are published
+# from the deadline. Gating on finished gameweeks leaves this empty for the whole
+# of a live gameweek, which is exactly when it is worth reading.
+if field_on and season.current_gameweek:
+    field, field_asked, field_resolved = load_field(
+        season, season.current_gameweek, field_sample, stamp
+    )
 
 
 # ----------------------------------------------------------------------
@@ -1374,29 +1526,263 @@ with st.sidebar.expander("Your squad", expanded=True):
 status_bar(season, len(projections))
 
 (
+    my_squad_tab,
     build_tab,
     players_tab,
     captain_tab,
     roi_tab,
     fixtures_tab,
-    transfers_tab,
+    planner_tab,
     chips_tab,
     leagues_tab,
     live_tab,
 ) = st.tabs(
+    # Each tab answers one question. My squad is what you own and the one move
+    # this week, Wildcard is what you would buy starting over, Planner is the
+    # route across several gameweeks. The single week answer lives on My squad
+    # and nowhere else, so the two pages cannot disagree about the best move.
+    #
     # Anything rendering a fixture run goes after Players, and Live goes last.
     # `tests/test_app.py` finds the player pool by looking for a dataframe with
     # a GW column, so a tab putting one ahead of Players would shadow the pool
-    # and fail several tests confusingly. Captain renders a run too, which is
-    # why it sits where it does rather than beside the Squad it is about.
-    ["Squad", "Players", "Captain", "ROI", "Fixtures", "Transfers", "Chips", "Leagues", "Live"]
+    # and fail several tests confusingly. My squad sits ahead of Players and so
+    # must keep GW columns off its table. Captain renders a run too, which is
+    # why it sits where it does rather than beside the squad it is about.
+    [
+        "My squad",
+        "Wildcard",
+        "Players",
+        "Captain",
+        "ROI",
+        "Fixtures",
+        "Planner",
+        "Chips",
+        "Leagues",
+        "Live",
+    ]
 )
 
+with my_squad_tab:
+    st.subheader("My squad")
+    how_to_read(
+        "The fifteen you actually own, laid out the way you have them set up, "
+        "and the one move worth making this week.\n\n"
+        "- **The pitch is your lineup, not the model's.** Where the two disagree "
+        "the caption says what the difference is worth. Read that as an opinion "
+        "rather than a correction: nothing here has seen a press conference or "
+        "knows who you have a feeling about.\n"
+        "- **Every gain is net of the four point hit** for going beyond your free "
+        "transfers, so a positive number already pays for itself.\n"
+        "- **Selling prices are not public.** FPL gives you back what you paid "
+        "plus half of any rise, so a player who has gone up 0.4 sells for 0.2 "
+        "more than you paid. The entry publishes who you own and your bank but "
+        "never what you paid, so load a squad.json alongside it or the money "
+        "here is optimistic.\n\n"
+        "This answers the coming gameweek only. Several gameweeks solved as one "
+        "problem, so a transfer can be held this week to afford someone next "
+        "week, is the **Planner** tab."
+    )
+
+    if my_squad is None:
+        empty_state(
+            "No squad loaded",
+            "Open the Your squad panel in the sidebar and give it your FPL entry id, "
+            "which is the number in the URL of your points page on the FPL site. The id "
+            "is kept in this page's address, so bookmarking the page saves typing it "
+            "again.",
+        )
+    else:
+        unpriced = my_squad.unpriced()
+        if unpriced:
+            st.warning(
+                f"No purchase price for {len(unpriced)} of {len(my_squad.player_ids)} players, "
+                "so they are valued at today's price. FPL pays back what you paid plus half "
+                "of any rise, so this overstates what you can raise by selling them and the "
+                "move below may not be affordable. Load a squad.json to fix it."
+            )
+
+        # squad.frame drops ids the projections no longer know about, which a
+        # plain .loc would raise on once a player leaves the game mid-season
+        current = my_squad.frame(projections)
+        mine = your_lineup(my_squad, current)
+
+        s1, s2, s3 = st.columns(3)
+        s1.metric(
+            "In the bank",
+            f"{my_squad.bank:.1f}m",
+            help="Straight off the entry. What is left over after the fifteen you own.",
+        )
+        s2.metric(
+            "Team value",
+            f"{my_squad.value_tenths(season) / 10:.1f}m",
+            help="What the squad would raise if you sold it all, plus the bank. Selling "
+            "prices are not public, so this is only exact with a squad.json loaded.",
+        )
+        s3.metric(
+            "Free transfers",
+            my_squad.free_transfers,
+            help="Worked out from your transfer history, so it is an estimate rather than "
+            "a reading. Correct it below if it is wrong.",
+        )
+
+        # the armband goes in the caption rather than a fourth metric, because a
+        # metric is a box of a fixed width and most players are named too long
+        # for it. The rest of the app already says "· captain X" this way.
+        armband = ""
+        if my_squad.captain_id is not None and my_squad.captain_id in current.index:
+            title = "triple captain" if my_squad.captain_multiplier == 3 else "captain"
+            armband = f" · {title} {current.loc[my_squad.captain_id, 'name']}"
+
+        st.divider()
+        st.caption(f"As you have it{armband}")
+        # Filled in after the move below has been solved, because the shirts ring
+        # whoever is leaving and that is not known until then. A slot rather than
+        # putting the controls above the pitch, so the page still reads in the
+        # order you want to think in: what you have, then what to do about it.
+        lineup_slot = st.container()
+
+        st.divider()
+        st.caption("This week's move")
+        t1, t2, t3 = st.columns(3)
+        bank = t1.number_input("Bank (m)", 0.0, 20.0, my_squad.bank_tenths / 10, 0.1)
+        free = t2.number_input("Free transfers", 0, 5, my_squad.free_transfers)
+        max_moves = t3.number_input("Max transfers to consider", 1, 5, 2)
+
+        plan_args = dict(
+            current_ids=my_squad.player_ids,
+            selling_prices=my_squad.selling_prices,
+            bank_tenths=round(bank * 10),
+            free_transfers=int(free),
+            max_transfers=int(max_moves),
+            bench_weight=bench_weight,
+        )
+        # Two rules here, both learned the hard way. No st.stop(), because this
+        # is the first tab and stopping the script would blank every other one,
+        # and an uploaded file nobody can plan out of is an ordinary thing to
+        # hold. And `plan` is assigned last, because a squad with no legal
+        # eleven in it gets past the transfer solve and falls over in `pick_xi`,
+        # so binding the plan first leaves everything below reading half solved
+        # state through an except branch that thought it had handled the failure.
+        plan = best_xi = best_bench = best_captain = after_cost = None
+        try:
+            solved = suggest_transfers(projections, formation=formation, **plan_args)
+            best_xi, best_bench, best_captain = pick_xi(current, formation=formation)
+            after_cost = solved.projected - suggest_transfers(projections, **plan_args).projected
+            plan = solved
+        except RuntimeError as exc:
+            # an illegal squad has no legal plan to reach, and anyone can upload
+            # a hand-edited file, so this must not be a traceback
+            st.error(
+                f"{exc}. Check the squad is fifteen players, with no more than "
+                f"{MAX_PER_CLUB} from any one club."
+            )
+
+        # Back to the top of the page, now that the move is known. Only one
+        # "before" pitch, and it is your own lineup rather than a solved one, so
+        # the players leaving are ringed on the eleven you actually picked.
+        leaving = {} if plan is None else dict.fromkeys(plan.transfers_out.index, "out")
+        with lineup_slot:
+            if mine is None:
+                st.info(
+                    "No lineup to show, so the model's best eleven is here instead. A squad "
+                    "file records who you own and nothing about how you lined them up, and a "
+                    "squad with someone who has since left the game cannot be split into "
+                    "eleven and four either. An entry id and a full fifteen gives you the "
+                    "team you actually picked."
+                )
+                if best_xi is not None:
+                    formation_view(
+                        best_xi,
+                        best_bench,
+                        best_captain.name,
+                        None,
+                        highlight=leaving,
+                        images=images,
+                        labels=span_labels,
+                    )
+            else:
+                your_xi, your_bench = mine
+                formation_view(
+                    your_xi,
+                    your_bench,
+                    my_squad.captain_id,
+                    my_squad.vice_captain_id,
+                    highlight=leaving,
+                    images=images,
+                    labels=span_labels,
+                )
+                # what your own selection gives up against the solved one. An
+                # opinion worth one line, and only when there is a difference to
+                # have an opinion about
+                behind = (
+                    0.0
+                    if best_xi is None
+                    else best_xi["xpts_total"].sum() - your_xi["xpts_total"].sum()
+                )
+                if behind > 0.05:
+                    st.caption(
+                        f"The model would start a different eleven, worth {behind:+.1f} pts "
+                        f"more over {horizon} gameweeks. It cannot see a press conference, "
+                        "so read that as an argument rather than an instruction."
+                    )
+            flag_legend()
+
+        if plan is None:
+            pass  # the error above already said why there is no move to show
+        elif plan.transfers_in.empty:
+            st.success("No move clears the cost of making it. Roll the transfer.")
+        else:
+            # solved against solved, so the gain is what the transfer is worth
+            # rather than what the transfer plus a lineup change is worth
+            gain = plan.xi["xpts_total"].sum() - best_xi["xpts_total"].sum() - 4 * plan.hits
+            summary, moves = st.columns([1, 2])
+            summary.metric(
+                f"Net gain over {horizon} gameweeks",
+                f"{gain:+.1f} pts",
+                f"{plan.hits * 4} point hit" if plan.hits else "No hit",
+                delta_color="off",
+                help="What the move is worth after the cost of making it. Already net "
+                "of any four point hit, so anything positive is worth doing on the "
+                "model's numbers alone.",
+            )
+            with moves:
+                st.caption("Moves")
+                for (_, going), (_, coming) in zip(
+                    plan.transfers_out.iterrows(), plan.transfers_in.iterrows(), strict=False
+                ):
+                    st.markdown(
+                        f"**{escape(str(going['name']))}** ({going['club']}, {going['price']:.1f}m)"
+                        f" → **{escape(str(coming['name']))}** "
+                        f"({coming['club']}, {coming['price']:.1f}m), "
+                        f"{coming['xpts_total'] - going['xpts_total']:+.1f} pts over the horizon"
+                    )
+
+            # One pitch, not a pair. The before is the lineup at the top of the
+            # page with the outgoing players already ringed, and drawing a
+            # solved "now" beside this would put three near identical pitches on
+            # one page for the sake of a comparison the metric above already
+            # makes.
+            st.caption(f"After the move · captain {plan.captain['name']}")
+            formation_view(
+                plan.xi,
+                plan.bench,
+                plan.captain.name,
+                plan.vice_captain.name,
+                highlight={i: "in" for i in plan.transfers_in.index},
+                images=images,
+                labels=span_labels,
+                cost=after_cost if formation else None,
+            )
+
 with build_tab:
-    st.subheader("Build a squad")
+    st.subheader("Build a squad from scratch")
     how_to_read(
         "The best fifteen the model can buy under the budget, the three per club "
-        "cap and the position quotas. It is a solved answer, not a sorted list: "
+        "cap and the position quotas, ignoring whatever you currently own. That "
+        "makes it the wildcard page: a free hit or a fresh season is the only "
+        "time you can act on it wholesale. To improve the squad you have, use "
+        "**My squad**.\n\n"
+        "It is a solved answer, not a sorted list: "
         "picking the best points per million one at a time is reliably a few "
         "points worse, because what binds is having enough cheap players to "
         "afford the expensive ones.\n\n"
@@ -1422,6 +1808,7 @@ with build_tab:
     locked = left.multiselect("Must include", options=sorted(lookup), key="locks")
     banned = right.multiselect("Rule out", options=sorted(lookup), key="bans")
 
+    result = shape_cost = None
     try:
         result = build_squad(
             projections,
@@ -1447,60 +1834,63 @@ with build_tab:
             else None
         )
     except RuntimeError as exc:
+        # no st.stop(): this is the second of ten tabs, and locking six players
+        # into a 90m budget would take the other eight down with it
         st.error(f"{exc}. Try relaxing the locks, raising the budget or freeing the formation.")
-        st.stop()
+        result = shape_cost = None
 
-    a, b, c = st.columns(3)
-    a.metric(
-        "Squad cost",
-        f"{result.cost:.1f}m",
-        f"{budget - result.cost:+.1f}m in bank",
-        help="What the fifteen cost at today's prices, against the budget set "
-        "in the sidebar. A fresh squad starts with 100.0m.",
-    )
-    b.metric(
-        f"Projected over {horizon} GW",
-        f"{result.projected:.0f} pts",
-        help="The starting eleven added up across the horizon, plus the "
-        "captain's next gameweek once more. The armband is a weekly decision, "
-        "so it is worth one gameweek here rather than six. The four on the "
-        "bench are not counted at all, since they only score if someone ahead "
-        "of them does not play.",
-    )
-    c.metric(
-        "Captain",
-        result.captain["name"],
-        help="Whoever the solver expects most from over the horizon. His "
-        "points double, so this is a bigger decision than any single transfer.",
-    )
+    if result is not None:
+        a, b, c = st.columns(3)
+        a.metric(
+            "Squad cost",
+            f"{result.cost:.1f}m",
+            f"{budget - result.cost:+.1f}m in bank",
+            help="What the fifteen cost at today's prices, against the budget set "
+            "in the sidebar. A fresh squad starts with 100.0m.",
+        )
+        b.metric(
+            f"Projected over {horizon} GW",
+            f"{result.projected:.0f} pts",
+            help="The starting eleven added up across the horizon, plus the "
+            "captain's next gameweek once more. The armband is a weekly decision, "
+            "so it is worth one gameweek here rather than six. The four on the "
+            "bench are not counted at all, since they only score if someone ahead "
+            "of them does not play.",
+        )
+        c.metric(
+            "Captain",
+            result.captain["name"],
+            help="Whoever the solver expects most from over the horizon. His "
+            "points double, so this is a bigger decision than any single transfer.",
+        )
 
-    formation_view(
-        result.xi,
-        result.bench,
-        result.captain.name,
-        result.vice_captain.name,
-        images=images,
-        labels=span_labels,
-        cost=shape_cost,
-    )
-    st.caption(
-        f"Each card carries both projections. **{span_labels[0]}** is the next "
-        f"gameweek on its own, which is what a lineup or captain decision turns on. "
-        f"**{span_labels[1]}** is the whole horizon added up, which is what decides "
-        f"whether he is worth owning at all. The headline above is the eleven "
-        f"**{span_labels[1]}** figures added together, plus the captain's "
-        f"**{span_labels[0]}** once more for the armband, and no bench."
-    )
-    flag_legend()
+        formation_view(
+            result.xi,
+            result.bench,
+            result.captain.name,
+            result.vice_captain.name,
+            images=images,
+            labels=span_labels,
+            cost=shape_cost,
+        )
+        st.caption(
+            f"Each card carries both projections. **{span_labels[0]}** is the next "
+            f"gameweek on its own, which is what a lineup or captain decision turns on. "
+            f"**{span_labels[1]}** is the whole horizon added up, which is what decides "
+            f"whether he is worth owning at all. The headline above is the eleven "
+            f"**{span_labels[1]}** figures added together, plus the captain's "
+            f"**{span_labels[0]}** once more for the armband, and no bench."
+        )
+        flag_legend()
 
-    st.download_button(
-        "Download as squad.json",
-        data=json.dumps(squad_payload(MySquad.from_frame(result.squad), season), indent=2),
-        file_name="squad.json",
-        mime="application/json",
-        help="Carries what each player costs today, which is what you paid if you buy "
-        "them now. Upload it back to plan transfers with the right selling prices.",
-    )
+        st.download_button(
+            "Download as squad.json",
+            data=json.dumps(squad_payload(MySquad.from_frame(result.squad), season), indent=2),
+            file_name="squad.json",
+            mime="application/json",
+            help="Carries what each player costs today, which is what you paid if you buy "
+            "them now. Upload it back to plan transfers with the right selling prices.",
+        )
 
 with players_tab:
     st.subheader("Player pool")
@@ -1567,7 +1957,7 @@ with players_tab:
     labels, difficulty = fixture_runs(season, horizon, stamp)
 
     # an empty filter result is an ordinary thing to do, not an error, so it
-    # must not reach st.stop() and take the other four tabs down with it
+    # must not reach st.stop() and take every tab below this one down with it
     if view.empty:
         empty_state(
             "No players match",
@@ -1820,16 +2210,37 @@ with captain_tab:
             shown = projections.loc[view.index].join(
                 view[["xpts_gw", "haul_chance", "return_chance"]]
             )
+            captain_columns = [
+                "price",
+                "xpts_gw",
+                "haul_chance",
+                "return_chance",
+                "credibility",
+                "ownership",
+            ]
+            field_note = ""
+            if not field.empty:
+                # a player nobody in the sample owns was captained by nobody in
+                # it either, which is a zero rather than a blank
+                shown = shown.join(field[["captain_share", "effective_ownership"]]).fillna(
+                    {"captain_share": 0.0, "effective_ownership": 0.0}
+                )
+                captain_columns += ["captain_share", "effective_ownership"]
+                field_note = (
+                    f" The last two columns are what {field_resolved} of the best managers "
+                    "did with the armband last gameweek, not what they will do with it "
+                    "next."
+                )
             st.caption(
                 f"Top {min(len(shown), 40)} of {len(shown)} by projected points for "
                 f"GW{picked_gw}, which is the captaincy answer if you are after points. "
-                "Both chances are goals and assists only."
+                f"Both chances are goals and assists only.{field_note}"
             )
             pool_table(
                 shown.head(40),
                 labels,
                 difficulty,
-                ["price", "xpts_gw", "haul_chance", "return_chance", "credibility", "ownership"],
+                captain_columns,
                 horizon,
                 key="captain_pool",
                 images=images,
@@ -2114,6 +2525,44 @@ with fixtures_tab:
     )
 
     st.divider()
+    st.divider()
+    st.caption("Club form, last five played")
+    st.caption(
+        "What each club has actually scored and conceded, with the scorelines behind it. "
+        "It is a record and it feeds nothing: the difficulty above already blends FPL's "
+        "attack and defence ratings, which move during the season off these same results, "
+        "so putting them into the projection as well would mostly count them twice."
+    )
+    form_window = st.slider("Matches to look back over", 3, 10, 5, key="form_window")
+    club_form = load_club_form(season, form_window, stamp)
+
+    if club_form.empty:
+        empty_state(
+            "Nothing played yet",
+            "Club form is built from finished matches, and none have been played. This "
+            "fills in from the first gameweek.",
+        )
+    else:
+        st.dataframe(
+            with_badges(club_form, badges),
+            hide_index=True,
+            width="stretch",
+            column_config={
+                "badge": st.column_config.ImageColumn("", width="small"),
+                "club": st.column_config.TextColumn("Club", pinned=True),
+                "games": st.column_config.NumberColumn("Played", format="%d"),
+                "scored": st.column_config.NumberColumn("For", format="%d"),
+                "conceded": st.column_config.NumberColumn("Against", format="%d"),
+                "scored_per_game": st.column_config.NumberColumn("For per game", format="%.2f"),
+                "conceded_per_game": st.column_config.NumberColumn(
+                    "Against per game", format="%.2f"
+                ),
+                "goal_difference": st.column_config.NumberColumn("GD", format="%+d"),
+                "results": st.column_config.ListColumn("Matches", width="large"),
+            },
+        )
+
+    st.divider()
     st.subheader("Blanks and doubles")
     st.caption(
         "Which clubs play twice in a gameweek, and which do not play at all. This is when "
@@ -2188,208 +2637,135 @@ with fixtures_tab:
             "the difference."
         )
 
-with transfers_tab:
-    st.subheader("Transfer planner")
+with planner_tab:
+    st.subheader("Multi week planner")
     how_to_read(
-        "What to do with the squad you already own. Every gain here is **net of "
-        "the four point hit** for going beyond your free transfers, so a positive "
-        "number already pays for itself.\n\n"
-        "The multi week planner solves all the weeks as one problem rather than "
-        "one week at a time, which is what lets it hold a transfer this week to "
-        "afford someone next week. Solving each week alone can never do that.\n\n"
+        "The route across the next few gameweeks, solved as one problem rather "
+        "than one week at a time. That is what lets it hold a transfer this week "
+        "to afford someone next week, and solving each week on its own can never "
+        "do it.\n\n"
+        "Every gain here is **net of the four point hit** for going beyond your "
+        "free transfers, so a positive number already pays for itself.\n\n"
         "**Selling prices matter and are not public.** FPL gives you back what "
         "you paid plus half of any rise, so a player who has gone up 0.4 sells "
         "for 0.2 more than you paid. Load a squad.json with your purchase prices "
-        "or the planner will think you have more money than you do."
+        "or the planner will think you have more money than you do, and the "
+        "further ahead it plans the worse that gets.\n\n"
+        "The single move for the coming gameweek is on **My squad**. This tab is "
+        "for the route rather than the next step."
     )
-    squad = my_squad
 
-    if squad is None:
-        st.info("Load your squad in the sidebar to see suggested moves.")
+    if my_squad is None:
+        empty_state(
+            "No squad loaded",
+            "A route has to start from somewhere. Open the Your squad panel in the "
+            "sidebar and give it your FPL entry id, then come back.",
+        )
     else:
-        unpriced = squad.unpriced()
+        unpriced = my_squad.unpriced()
         if unpriced:
             st.warning(
-                f"No purchase price for {len(unpriced)} of {len(squad.player_ids)} players, "
-                "so they are valued at today's price. FPL pays back what you paid plus half "
-                "of any rise, so this overstates what you can raise by selling them and the "
-                "plan below may not be affordable. Load a squad.json to fix it."
+                f"No purchase price for {len(unpriced)} of {len(my_squad.player_ids)} players, "
+                "so they are valued at today's price. That overstates what you can raise by "
+                "selling them, and a route spends that money several times over. Load a "
+                "squad.json to fix it."
             )
 
-        t1, t2, t3 = st.columns(3)
-        bank = t1.number_input("Bank (m)", 0.0, 20.0, squad.bank_tenths / 10, 0.1)
-        free = t2.number_input("Free transfers", 0, 5, squad.free_transfers)
-        max_moves = t3.number_input("Max transfers to consider", 1, 5, 2)
-
-        plan_args = dict(
-            current_ids=squad.player_ids,
-            selling_prices=squad.selling_prices,
-            bank_tenths=round(bank * 10),
-            free_transfers=int(free),
-            max_transfers=int(max_moves),
-            bench_weight=bench_weight,
-        )
-        # squad.frame drops ids the projections no longer know about, which a
-        # plain .loc would raise on once a player leaves the game mid-season
-        current = squad.frame(projections)
-        try:
-            plan = suggest_transfers(projections, formation=formation, **plan_args)
-            current_xi, current_bench, current_captain = pick_xi(current, formation=formation)
-            # both pitches are solved twice under a pinned shape, so the two
-            # captions are measuring the same thing from the same baseline
-            after_cost = now_cost = None
-            if formation:
-                after_cost = plan.projected - suggest_transfers(projections, **plan_args).projected
-                free_xi = pick_xi(current)[0]
-                now_cost = current_xi["xpts_total"].sum() - free_xi["xpts_total"].sum()
-        except RuntimeError as exc:
-            # an illegal squad has no legal plan to reach, and anyone can upload
-            # a hand-edited file, so this must not be a traceback
-            st.error(
-                f"{exc}. Check the squad is fifteen players, with no more than "
-                f"{MAX_PER_CLUB} from any one club."
+        max_weeks = min(MAX_PLAN_WEEKS, horizon)
+        if max_weeks < 2:
+            st.info(
+                "Widen the projection horizon in the sidebar. There is no route to plan "
+                "across a single gameweek, and My squad already answers that one."
             )
-            st.stop()
-
-        gain = plan.xi["xpts_total"].sum() - current_xi["xpts_total"].sum() - 4 * plan.hits
-
-        if plan.transfers_in.empty:
-            st.success("No move clears the cost of making it. Roll the transfer.")
         else:
-            summary, moves = st.columns([1, 2])
-            summary.metric(
-                f"Net gain over {horizon} gameweeks",
-                f"{gain:+.1f} pts",
-                f"{plan.hits * 4} point hit" if plan.hits else "No hit",
-                delta_color="off",
-                help="What the move is worth after the cost of making it. Already net "
-                "of any four point hit, so anything positive is worth doing on the "
-                "model's numbers alone.",
-            )
-            with moves:
-                st.caption("Moves")
-                for (_, going), (_, coming) in zip(
-                    plan.transfers_out.iterrows(), plan.transfers_in.iterrows(), strict=False
-                ):
-                    st.markdown(
-                        f"**{escape(str(going['name']))}** ({going['club']}, {going['price']:.1f}m)"
-                        f" → **{escape(str(coming['name']))}** "
-                        f"({coming['club']}, {coming['price']:.1f}m), "
-                        f"{coming['xpts_total'] - going['xpts_total']:+.1f} pts over the horizon"
-                    )
-
-        st.divider()
-        if st.toggle(
-            "Plan across several gameweeks",
-            help="Solves the weeks as one problem instead of one week at a time, so it can "
-            "roll a free transfer or take a small loss now to reach a player later. Takes a "
-            "second or two.",
-        ):
             p1, p2 = st.columns(2)
-            plan_weeks = p1.slider("Gameweeks to plan", 2, min(MAX_PLAN_WEEKS, horizon), 3)
+            plan_weeks = p1.slider("Gameweeks to plan", 2, max_weeks, min(3, max_weeks))
             per_week = p2.slider("Transfers per week at most", 1, 2, 1)
+            p3, p4 = st.columns(2)
+            plan_bank = p3.number_input(
+                "Bank (m)", 0.0, 20.0, my_squad.bank_tenths / 10, 0.1, key="planner_bank"
+            )
+            plan_free = p4.number_input(
+                "Free transfers", 0, 5, my_squad.free_transfers, key="planner_free"
+            )
 
+            route = None
             try:
                 with st.spinner("Planning"):
                     route = plan_transfers(
                         projections,
                         by_gameweek,
-                        current_ids=squad.player_ids,
-                        selling_prices=squad.selling_prices,
-                        bank_tenths=round(bank * 10),
-                        free_transfers=int(free),
+                        current_ids=my_squad.player_ids,
+                        selling_prices=my_squad.selling_prices,
+                        bank_tenths=round(plan_bank * 10),
+                        free_transfers=int(plan_free),
                         weeks=int(plan_weeks),
                         max_transfers_per_week=int(per_week),
                         bench_weight=bench_weight,
                         formation=formation,
                     )
             except (RuntimeError, ValueError) as exc:
+                # no st.stop(), which would take Chips, Leagues and Live down
+                # with it. An unplannable squad is an ordinary thing to hold.
                 st.error(f"Could not plan those gameweeks: {exc}")
-                st.stop()
 
-            m1, m2, m3 = st.columns(3)
-            m1.metric(
-                f"Projected over {plan_weeks} GW",
-                f"{route.projected:.0f} pts",
-                help="What the whole route scores, the starting eleven each week with "
-                "the captain doubled, already net of any hits.",
-            )
-            m2.metric(
-                "Transfers",
-                route.transfers,
-                help="Moves across the whole route, not per week. The weeks are solved "
-                "together, so it can sit still now to afford someone later.",
-            )
-            m3.metric(
-                "Hits",
-                f"{route.hits * 4} pts",
-                delta_color="off",
-                help="Points given up for going beyond your free transfers, four each. "
-                "Already subtracted from the projection beside it.",
-            )
-
-            for week in route.weeks:
-                with st.container(border=True):
-                    head, money = st.columns([3, 1])
-                    hit = f" · {week.hits * 4} point hit" if week.hits else ""
-                    head.markdown(
-                        f"**GW{week.event}** · captain {escape(str(week.captain['name']))}{hit}"
-                    )
-                    money.caption(f"{week.bank:.1f}m in bank · {week.free_transfers} free")
-                    if week.transfers_in.empty:
-                        st.caption("No move. Roll the transfer.")
-                        continue
-                    for (_, going), (_, coming) in zip(
-                        week.transfers_out.iterrows(), week.transfers_in.iterrows(), strict=False
-                    ):
-                        st.markdown(
-                            f"**{escape(str(going['name']))}** ({going['club']}) → "
-                            f"**{escape(str(coming['name']))}** ({coming['club']}, "
-                            f"{coming['price']:.1f}m)"
-                        )
-
-            st.caption(
-                f"Chosen from the best {POOL_SIZE} or so players by projection plus everyone "
-                "you own, not the whole game, because every extra week multiplies the solve. "
-                "Prices are held at today's, so the bank shown for the last week is a rougher "
-                "number than the one shown for the first."
-                + (
-                    " Some of your selling prices are unknown, which makes that worse the "
-                    "further ahead it plans."
-                    if route.approximate_money
-                    else ""
+            if route is not None:
+                m1, m2, m3 = st.columns(3)
+                m1.metric(
+                    f"Projected over {plan_weeks} GW",
+                    f"{route.projected:.0f} pts",
+                    help="What the whole route scores, the starting eleven each week with "
+                    "the captain doubled, already net of any hits.",
                 )
-            )
+                m2.metric(
+                    "Transfers",
+                    route.transfers,
+                    help="Moves across the whole route, not per week. The weeks are solved "
+                    "together, so it can sit still now to afford someone later.",
+                )
+                m3.metric(
+                    "Hits",
+                    f"{route.hits * 4} pts",
+                    delta_color="off",
+                    help="Points given up for going beyond your free transfers, four each. "
+                    "Already subtracted from the projection beside it.",
+                )
 
-        st.divider()
-        before, after = st.columns(2)
-        with before:
-            st.caption(f"Now · captain {current_captain['name']}")
-            formation_view(
-                current_xi,
-                current_bench,
-                current_captain.name,
-                None,
-                compact=True,
-                highlight={i: "out" for i in plan.transfers_out.index},
-                images=images,
-                labels=span_labels,
-                cost=now_cost,
-            )
-        with after:
-            st.caption(f"After · captain {plan.captain['name']}")
-            formation_view(
-                plan.xi,
-                plan.bench,
-                plan.captain.name,
-                plan.vice_captain.name,
-                compact=True,
-                highlight={i: "in" for i in plan.transfers_in.index},
-                images=images,
-                labels=span_labels,
-                cost=after_cost,
-            )
-        flag_legend()
+                for week in route.weeks:
+                    with st.container(border=True):
+                        head, money = st.columns([3, 1])
+                        hit = f" · {week.hits * 4} point hit" if week.hits else ""
+                        head.markdown(
+                            f"**GW{week.event}** · captain {escape(str(week.captain['name']))}{hit}"
+                        )
+                        money.caption(f"{week.bank:.1f}m in bank · {week.free_transfers} free")
+                        if week.transfers_in.empty:
+                            st.caption("No move. Roll the transfer.")
+                            continue
+                        for (_, going), (_, coming) in zip(
+                            week.transfers_out.iterrows(),
+                            week.transfers_in.iterrows(),
+                            strict=False,
+                        ):
+                            st.markdown(
+                                f"**{escape(str(going['name']))}** ({going['club']}) → "
+                                f"**{escape(str(coming['name']))}** ({coming['club']}, "
+                                f"{coming['price']:.1f}m)"
+                            )
+
+                st.caption(
+                    f"Chosen from the best {POOL_SIZE} or so players by projection plus everyone "
+                    "you own, not the whole game, because every extra week multiplies the solve. "
+                    "Prices are held at today's, so the bank shown for the last week is a rougher "
+                    "number than the one shown for the first."
+                    + (
+                        " Some of your selling prices are unknown, which makes that worse the "
+                        "further ahead it plans."
+                        if route.approximate_money
+                        else ""
+                    )
+                )
+
 
 with chips_tab:
     st.subheader("Chip timing")
@@ -2414,9 +2790,19 @@ with chips_tab:
         st.info("Load your squad in the sidebar to price your chips.")
     else:
         team_value = my_squad.value_tenths(season)
-        table = cached_chips(projections, by_gameweek, tuple(my_squad.player_ids), team_value)
+        # A chip is priced against what the squad scores anyway, and a squad
+        # with no legal eleven in it has no anyway. Anyone can upload one, and
+        # until My squad stopped calling st.stop() on the same squad this tab
+        # was never reached to find out.
+        try:
+            table = cached_chips(projections, by_gameweek, tuple(my_squad.player_ids), team_value)
+        except RuntimeError as exc:
+            st.error(f"{exc}. There is nothing to price a chip against.")
+            table = None
 
-        if table.empty:
+        if table is None:
+            pass  # the error above is the whole story
+        elif table.empty:
             st.warning("Not enough of the squad is known to price a chip.")
         else:
             best = best_per_chip(table)
@@ -2477,11 +2863,14 @@ with leagues_tab:
         "been scored, which is how the API behaves rather than a fault here."
     )
 
+    # the sidebar box holds text now, and an empty one is the common case, so
+    # this cannot go straight into int()
+    sidebar_id = str(st.session_state.get("sidebar_entry") or "").strip()
     entry = st.number_input(
         "Manager entry id",
         min_value=0,
         step=1,
-        value=int(st.session_state.get("sidebar_entry") or 0),
+        value=int(sidebar_id) if sidebar_id.isdigit() else 0,
         key="league_entry",
     )
 
@@ -2591,6 +2980,118 @@ with leagues_tab:
                 )
                 if info["has_next"]:
                     st.caption("Showing the first fifty. Later pages are not loaded.")
+
+    st.divider()
+    st.caption("The elite template")
+
+    if not field_on:
+        st.info(
+            "Turn on **The field** in the sidebar to read what the best managers own "
+            "and captain. It is off by default because it is one request per manager."
+        )
+    elif season.current_gameweek == 0:
+        empty_state(
+            "No squads to read yet",
+            "Picks are published once a deadline has passed, so before the first one the "
+            "overall league has no table and every squad is a 404. This fills in as soon "
+            "as the season starts.",
+        )
+    elif field.empty:
+        empty_state(
+            "Nobody's picks came back",
+            f"The overall league was asked for {field_asked or field_sample} managers and "
+            "none of their squads could be read. That is usually the API rather than the "
+            "ids, so it is worth trying again.",
+        )
+    else:
+        st.caption(
+            f"{field_resolved} of the top {field_asked} managers overall, as they lined up "
+            f"in GW{season.current_gameweek}. That is a small sample, they are the top of a "
+            "table that rewards having been right rather than being right next week, and "
+            "this is the gameweek under way rather than the one being planned. Read it to "
+            "know what you are up against, not to copy it."
+        )
+
+        template, template_bench = template_xi(field, season)
+        # `formation_view` labels two numbers per shirt and takes them from the
+        # two projection columns, so the template borrows those names to show
+        # ownership instead. The labels are what the reader actually sees.
+        pitch = projections.loc[template.index].assign(
+            xpts_next=template["elite_start_share"] * 100,
+            xpts_total=template["elite_ownership"] * 100,
+        )
+        pitch_bench = projections.loc[template_bench.index].assign(
+            xpts_next=template_bench["elite_start_share"] * 100,
+            xpts_total=template_bench["elite_ownership"] * 100,
+        )
+        armband = field["captain_share"].idxmax()
+        formation_view(
+            pitch,
+            pitch_bench,
+            armband,
+            None,
+            images=images,
+            labels=("Start %", "Own %"),
+        )
+        st.caption(
+            "The armband marks whoever the sample captained most. The bench here is the "
+            "four they own and start least, not an order anybody chose."
+        )
+
+        st.divider()
+        st.caption("Where the top of the table disagrees with everyone else")
+        divergence = (
+            projections[["name", "position", "club", "price", "ownership", "xpts_total"]]
+            .join(field, how="inner")
+            .assign(elite_gap=lambda f: f["elite_ownership"] * 100 - f["ownership"])
+        )
+        biggest = pd.concat(
+            [
+                divergence.nlargest(10, "elite_gap"),
+                divergence.nsmallest(10, "elite_gap"),
+            ]
+        ).sort_values("elite_gap", ascending=False)
+        st.dataframe(
+            with_badges(biggest.reset_index(), badges),
+            hide_index=True,
+            width="stretch",
+            column_config={
+                "badge": st.column_config.ImageColumn("", width="small"),
+                "name": st.column_config.TextColumn("Player", pinned=True),
+                "position": st.column_config.TextColumn("Pos", width="small"),
+                "club": st.column_config.TextColumn("Club", width="small"),
+                "price": st.column_config.NumberColumn("Price", format="%.1f"),
+                "ownership": st.column_config.NumberColumn(
+                    "Everyone %", format="%.1f", help=GLOSSARY["ownership"]
+                ),
+                "elite_ownership": st.column_config.NumberColumn(
+                    "Top 100 %", format="percent", help=GLOSSARY["elite_ownership"]
+                ),
+                "elite_gap": st.column_config.NumberColumn(
+                    "Gap",
+                    format="%+.1f",
+                    help="Top managers' ownership minus everyone's, in percentage points. "
+                    "Positive is a player the best are on and the field is not.",
+                ),
+                "captain_share": st.column_config.NumberColumn(
+                    "Captained by", format="percent", help=GLOSSARY["captain_share"]
+                ),
+                "effective_ownership": st.column_config.NumberColumn(
+                    "Effective own.", format="%.2f", help=GLOSSARY["effective_ownership"]
+                ),
+                "xpts_total": st.column_config.NumberColumn(
+                    f"xPts {horizon} GW", format="%.1f", help=GLOSSARY["xpts_total"]
+                ),
+                "id": None,
+                "elite_start_share": None,
+            },
+        )
+        st.caption(
+            "Ten each way. A positive gap is somebody the best managers are on and the "
+            "rest of the game is not, which is a shortlist and not a verdict: they bought "
+            "him at some point in the past and our own projection for him is in the last "
+            "column to argue with."
+        )
 
 
 with live_tab:

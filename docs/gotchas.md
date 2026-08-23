@@ -14,6 +14,18 @@ prefer `.get()` over `[]` on optional fields.
 season.** Anything reading a live squad must handle that and fall back to the
 local squad file.
 
+**Picks are published from the deadline, not from the final whistle, and
+`gameweeks_played` counts neither.** It counts `finished` events, so from a
+Saturday deadline until the last match of that gameweek is scored it reads one
+behind, and in GW1 it reads zero while every squad in the game is public. Ask
+`Season.current_gameweek` for anything reading a squad that exists now: your
+own, the top managers', the live score. That is what `next_gameweek` is not,
+either, since it points at the week open for transfers, which during GW1 is GW2.
+Three properties that differ by one for a whole weekend, and picking the wrong
+one fails only while a gameweek is under way, which is the only time anyone
+looks. This shipped once: the live app told the user their squad did not exist
+on the opening weekend of the season.
+
 **Selling price is not current price.** FPL returns purchase price plus half of
 any rise, rounded down to 0.1. The API does not expose it without auth, so it
 comes from `squad.json`. If missing, the planner assumes current price and
@@ -54,6 +66,15 @@ fragment exists to avoid.
 **Two-level cache TTLs must nest the right way round.** `LIVE_MEMORY_TTL` is 30
 seconds against the 60 `api.live` holds on disk. A memory cache that outlives
 the disk cache behind it serves stale data twice over.
+
+**Never call `st.stop()` inside a tab.** Tab bodies are one script, so it stops
+every tab after the one you are in, not the tab you are in. Worse, it hides
+whatever the later tabs would have done with the same bad input: an illegal
+uploaded squad used to be caught by a `st.stop()` on the transfer tab, which
+meant Chips was never reached to discover it could not price a chip against a
+squad with no legal eleven. Handle the failure locally and let the script carry
+on. `tests/test_app.py::test_an_illegal_squad_is_an_error_not_a_traceback` is
+the regression test, and it only earns its keep because every tab renders.
 
 ## Live scoring
 
@@ -104,6 +125,20 @@ still has a double, and dropping played fixtures halfway through a gameweek
 would report every club that had already kicked off as blanking. It skips
 gameweeks with no fixtures at all, or the far end of the horizon reads as twenty
 clubs blanking at once.
+
+**`finished` on a fixture does not mean the match has been played.** FPL sets it
+only once the whole gameweek's bonus has been confirmed, which is a day or more
+after the final whistle, and `finished_provisional` is what flips when the
+referee does. Checked against the live payload during GW1 on 2026-08-23: six
+matches had final scorelines and `finished_provisional` true with `finished`
+still false, one of them played two days earlier.
+
+That is a trap for anything reading results rather than scheduling. It is why
+`Season.club_form` counts a match by having both scores rather than by the flag,
+and there is a test holding it to that. `team_fixtures` and `gameweek_shape` are
+unaffected: they use the flag to decide what is still to come, which is what it
+is good for, and being a day late in dropping a played fixture costs them
+nothing. `live.py` already knew, which is why it carries both flags.
 
 ## The solver
 
