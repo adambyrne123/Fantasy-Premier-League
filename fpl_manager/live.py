@@ -172,6 +172,22 @@ class LiveGameweek:
     fetched_at: datetime | None = None
 
     @property
+    def played_out(self) -> pd.Series:
+        """Whether each fixture is over, by the whistle rather than by the audit.
+
+        `finished_provisional` goes true at full time. `finished` waits for FPL
+        to confirm the gameweek's data, which is a day or more later, so
+        anything asking whether a match is over during the weekend has to read
+        the first. Reading `finished` is why automatic substitutions used to sit
+        unresolved all weekend and the fixture counter read zero of ten with
+        eight of them played out.
+
+        `finished` still counts, for the case where a payload carries it without
+        the provisional flag.
+        """
+        return self.fixtures["finished_provisional"] | self.fixtures["finished"]
+
+    @property
     def in_play(self) -> bool:
         """Whether a match is being played, which is what decides polling.
 
@@ -181,11 +197,22 @@ class LiveGameweek:
         """
         if self.fixtures.empty:
             return False
-        return bool((self.fixtures["started"] & ~self.fixtures["finished"]).any())
+        return bool((self.fixtures["started"] & ~self.played_out).any())
 
     @property
     def all_settled(self) -> bool:
         """Every match played out, so autosubs are final rather than a guess."""
+        if self.fixtures.empty:
+            return False
+        return bool(self.played_out.all())
+
+    @property
+    def all_confirmed(self) -> bool:
+        """Every match audited by FPL, so bonus is the real thing and not ours.
+
+        A separate question from `all_settled` and a later one. Bonus really is
+        applied at audit time, so this is the one the bonus caption reads.
+        """
         if self.fixtures.empty:
             return False
         return bool(self.fixtures["finished"].all())
@@ -207,7 +234,7 @@ class LiveGameweek:
         if self.fixtures.empty:
             return pd.Series(True, index=elements.index)
 
-        unfinished = self.fixtures[~self.fixtures["finished"]]
+        unfinished = self.fixtures[~self.played_out]
         busy = set(unfinished["team_h"]).union(unfinished["team_a"])
         return ~elements.isin(busy)
 

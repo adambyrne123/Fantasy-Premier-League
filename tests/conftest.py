@@ -271,9 +271,18 @@ class FakeApi:
         """One gameweek's fixtures, with in-play stats on the live ones.
 
         The first fixture of the gameweek is finished and has had its bonus
-        applied, the second is under way with bonus still to be decided, and
-        the rest have not kicked off. That is the mix a live view has to render
-        correctly on a Saturday afternoon.
+        applied, the second is under way with bonus still to be decided, the
+        third has played out but not been audited, and the rest have not kicked
+        off. That is the mix a live view has to render correctly on a Saturday
+        afternoon.
+
+        The third one is the case that matters and the one this used to be
+        missing. FPL sets `finished` only once it has confirmed the gameweek's
+        data, a day or more after the whistle, so for most of a live weekend a
+        match that is plainly over reads `finished_provisional` true and
+        `finished` false. Anything asking whether a match is over has to cope
+        with it, and without a fixture in that state nothing here could tell a
+        working answer from one that just waits.
         """
         rows = [dict(f) for f in self._fixtures if f["event"] == gameweek]
         for i, fixture in enumerate(rows):
@@ -298,6 +307,13 @@ class FakeApi:
                 fixture["started"] = True
                 fixture["finished"] = False
                 fixture["finished_provisional"] = False
+                fixture["stats"] = [{"identifier": "bps", "h": bps_h, "a": bps_a}]
+            elif i == 2:
+                # over, but not yet audited: no bonus block, so the bonus for it
+                # is still ours to work out while the substitutions are not
+                fixture["started"] = True
+                fixture["finished"] = False
+                fixture["finished_provisional"] = True
                 fixture["stats"] = [{"identifier": "bps", "h": bps_h, "a": bps_a}]
             else:
                 fixture["started"] = False
@@ -359,13 +375,23 @@ class FakeApi:
             "years_active": list(range(3)),
             "leagues": {
                 "classic": [
+                    # `rank_count` is how many are in the league, which is what
+                    # turns a rank into a standing. It rides along in this
+                    # payload, so reading it costs nothing extra.
                     {
                         "id": 900 + entry_id,
                         "name": f"Private {entry_id}",
                         "league_type": "x",
                         "entry_rank": 4,
+                        "rank_count": 12,
                     },
-                    {"id": 314, "name": "Overall", "league_type": "s", "entry_rank": 123456},
+                    {
+                        "id": 314,
+                        "name": "Overall",
+                        "league_type": "s",
+                        "entry_rank": 123456,
+                        "rank_count": 9_000_000,
+                    },
                 ]
             },
         }

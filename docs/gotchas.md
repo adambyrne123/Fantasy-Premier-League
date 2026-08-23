@@ -67,6 +67,19 @@ fragment exists to avoid.
 seconds against the 60 `api.live` holds on disk. A memory cache that outlives
 the disk cache behind it serves stale data twice over.
 
+**`finished` is not the whistle, it is the audit.** FPL sets it only once it has
+confirmed a gameweek's data, a day or more after the last match ends, so for
+most of a live weekend a match that is plainly over reads
+`finished_provisional: true` and `finished: false`. Verified against the live
+payload during GW1 on 2026-08-23: eight of ten fixtures had `minutes: 90` and
+`finished_provisional` true with `finished` still false, one played two days
+earlier. Reading `finished` is why the fixture counter said zero of ten and why
+automatic substitutions never resolved during a weekend, which is the one time
+anybody is watching. `LiveGameweek.played_out` is the property to ask, and
+`settled` goes through it. `all_confirmed` is the separate, later question and
+is the one bonus reads, because bonus really is applied at audit time.
+`Season.club_form` documents the same trap from the fixtures side.
+
 **A month is ours, not FPL's, and it costs a request per manager.** There is no
 monthly endpoint and no monthly field anywhere in the API.
 `Season.gameweeks_in_month` defines a month by **deadline**, so a gameweek

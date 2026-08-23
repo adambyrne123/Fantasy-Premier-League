@@ -122,7 +122,7 @@ def leagues_of(season: Season, entry_id: int) -> pd.DataFrame:
     payload = _fetch(lambda: season.api.entry(int(entry_id)), "the manager", entry_id)
     rows = (payload.get("leagues") or {}).get("classic") or []
     if not rows:
-        return pd.DataFrame(columns=["id", "name", "league_type", "rank", "system"])
+        return pd.DataFrame(columns=["id", "name", "league_type", "rank", "size", "system"])
 
     frame = pd.DataFrame(rows)
     frame["system"] = frame.get("league_type", pd.Series(index=frame.index)).eq(SYSTEM_LEAGUE)
@@ -131,7 +131,17 @@ def leagues_of(season: Season, entry_id: int) -> pd.DataFrame:
     else:
         frame["rank"] = pd.NA
 
-    keep = [c for c in ("id", "name", "league_type", "rank", "system") if c in frame.columns]
+    # how many are in the league, which is what makes a rank mean anything:
+    # fortieth is a bad week in a league of fifty and a good one in a league of
+    # ten thousand. It rides along in this payload, so it costs no request
+    if "rank_count" in frame.columns:
+        frame["size"] = pd.to_numeric(frame["rank_count"], errors="coerce")
+    else:
+        frame["size"] = pd.NA
+
+    keep = [
+        c for c in ("id", "name", "league_type", "rank", "size", "system") if c in frame.columns
+    ]
     return frame[keep].sort_values(["system", "name"]).reset_index(drop=True)
 
 

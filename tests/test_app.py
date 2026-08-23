@@ -158,7 +158,18 @@ def test_the_field_waits_to_be_asked(app):
     """A hundred requests should never fire because somebody opened a tab."""
     at = app.run()
     assert not at.exception
-    assert any("Turn on" in info.value for info in at.info)
+    assert any("one request per" in info.value for info in at.info)
+
+
+def test_the_field_can_be_switched_on_from_where_it_is_missing(app):
+    """The sidebar panel holding the toggle is collapsed by default, so a
+    message saying to turn it on there points at something invisible."""
+    at = app.run()
+    button = next(b for b in at.button if b.key == "field_from_leagues")
+    button.click().run()
+    assert not at.exception
+    assert at.session_state["field_on"] is True
+    assert not [b for b in at.button if b.key == "field_from_leagues"], "asked and answered"
 
 
 def test_the_field_says_why_it_is_empty_before_a_gameweek_is_scored(app):
@@ -229,7 +240,23 @@ def test_every_league_they_are_in_carries_their_rank(midseason_app):
     assert not at.exception
     tables = [d.value for d in at.dataframe if "kind" in d.value.columns]
     assert tables, "no standing-per-league table"
-    assert {"name", "rank"} <= set(tables[0].columns)
+    assert {"name", "rank", "standing"} <= set(tables[0].columns)
+
+
+def test_a_rank_says_what_it_is_out_of(midseason_app):
+    """Fortieth is a bad week in a league of fifty and a very good one in a
+    league of ten thousand, so the rank alone says nothing. The size rides
+    along in the entry payload, so it costs no extra request."""
+    at = midseason_app.run()
+    _leagues_entry(at).set_value(1).run()
+    assert not at.exception
+
+    table = next(d.value for d in at.dataframe if "standing" in d.value.columns)
+    assert table["standing"].str.contains(" / ").any(), "a rank on its own is not a standing"
+    for _, row in table.iterrows():
+        if " / " in row["standing"]:
+            place, size = (int(part.replace(",", "")) for part in row["standing"].split(" / "))
+            assert place <= size, "nobody places below the size of their league"
 
 
 def _month_box(at):
@@ -612,6 +639,12 @@ def _rows_for_clubs(at, *clubs):
     without depending on which synthetic player happens to sort to the top.
     """
     listed = list(_pool(at)["club"])
+    missing = [club for club in clubs if club not in listed]
+    if missing:
+        raise AssertionError(
+            f"{missing} are not in the {len(listed)} rows the pool is listing, and a tick "
+            "cannot reach a row that is not there. Widen the pool or filter to them first."
+        )
     return [listed.index(club) for club in clubs]
 
 
@@ -821,6 +854,10 @@ def test_a_blank_gameweek_is_a_zero_rather_than_a_missing_bar(monkeypatch, tmp_p
     monkeypatch.setattr(Season, "team_fixtures", blanked)
 
     at = _app(monkeypatch, tmp_path, played=12).run()
+    # losing a gameweek drops every C01 player out of the top forty, and ticks
+    # only reach the rows the pool is listing, so the pool has to be widened
+    # before one of them can be picked at all
+    at = next(t for t in at.toggle if t.label == "Show more rows").set_value(True).run()
     at = _compare(at, "C01", "C02")
     assert not at.exception
 

@@ -1204,6 +1204,11 @@ def live_pitch(
         bench,
         lineup.captain,
         vice_id,
+        # whoever came on off the bench, ringed. A substitution changes who is
+        # scoring for you and the pitch is where you would look for it, rather
+        # than in a line of text above the pitch that says a name you then have
+        # to go and find
+        highlight=dict.fromkeys((came_in for _, came_in in lineup.subs), "in"),
         images=images,
         labels=("Pts", "Mins"),
         value_format=".0f",
@@ -1433,6 +1438,16 @@ def compare_panel(
     )
 
 
+def read_the_field() -> None:
+    """Switch The field on from wherever it is being asked for.
+
+    A callback rather than an assignment plus a rerun, because a widget's own
+    key cannot be written once the widget has been drawn this run, and the
+    sidebar toggle is drawn long before the tabs that want it.
+    """
+    st.session_state["field_on"] = True
+
+
 def forget_entry() -> None:
     """Drop the remembered entry id, from the box and from the URL.
 
@@ -1592,6 +1607,7 @@ with st.sidebar.expander("The field", expanded=False):
     field_on = st.toggle(
         "Read the top managers",
         value=False,
+        key="field_on",
         help="Samples the overall league and counts their squads. Empty until the first "
         "deadline has passed, since picks are not published before then.",
     )
@@ -3034,22 +3050,34 @@ with leagues_tab:
         if joined.empty:
             st.info("No classic leagues on this entry.")
         else:
+            # "41 / 51" rather than "41", because a rank on its own says
+            # nothing: fortieth is a bad week in a league of fifty and a very
+            # good one in a league of ten thousand
             ranks = joined.assign(
                 kind=joined["system"].map({True: "Automatic", False: "Joined"}),
+                standing=[
+                    "Not ranked yet"
+                    if pd.isna(row["rank"])
+                    else f"{int(row['rank']):,} / {int(row['size']):,}"
+                    if pd.notna(row.get("size"))
+                    else f"{int(row['rank']):,}"
+                    for _, row in joined.iterrows()
+                ],
             )
             st.dataframe(
-                ranks[["name", "kind", "rank"]],
+                ranks[["name", "kind", "standing", "rank"]],
                 hide_index=True,
                 width="stretch",
                 column_config={
                     "name": "League",
                     "kind": st.column_config.TextColumn("Kind", width="small"),
-                    "rank": st.column_config.NumberColumn(
+                    "standing": st.column_config.TextColumn(
                         "Their rank",
-                        format="%d",
-                        help="Where they stand in that league. Empty until the first "
-                        "gameweek has been scored, since nobody has a rank before then.",
+                        help="Where they stand, out of how many are in that league. "
+                        "Nobody has a rank until the first gameweek has been scored.",
                     ),
+                    # sortable, since the text above cannot be ordered on
+                    "rank": st.column_config.NumberColumn("Place", format="%d"),
                 },
             )
 
@@ -3171,10 +3199,15 @@ with leagues_tab:
     st.caption("The elite template")
 
     if not field_on:
+        # the button is here as well as in the sidebar because the sidebar
+        # panel holding the toggle is collapsed by default, so telling someone
+        # to turn it on there was pointing at something they could not see
         st.info(
-            "Turn on **The field** in the sidebar to read what the best managers own "
-            "and captain. It is off by default because it is one request per manager."
+            "This reads the squads of the top managers overall and counts what they own "
+            "and captain. It is off until asked for because it is one request per "
+            "manager, and it takes a few seconds."
         )
+        st.button("Read the top managers", on_click=read_the_field, key="field_from_leagues")
     elif season.current_gameweek == 0:
         empty_state(
             "No squads to read yet",
@@ -3322,7 +3355,9 @@ with live_tab:
                 st.info(f"GW{live_gw} has no fixtures published yet.")
                 return
 
-            finished = int(state.fixtures["finished"].sum())
+            # played out, not audited by FPL, or this reads zero of ten all
+            # weekend while eight of them have long since ended
+            finished = int(state.played_out.sum())
             total = len(state.fixtures)
             fetched = state.fetched_at
             age = _relative(pd.Timestamp(fetched) - pd.Timestamp.now(tz="UTC")) if fetched else "-"
@@ -3334,7 +3369,7 @@ with live_tab:
                     f"{finished} of {total} finished",
                     "soon" if state.in_play else "",
                 ),
-                _cell("Bonus", "Final" if state.all_settled else "Provisional"),
+                _cell("Bonus", "Final" if state.all_confirmed else "Provisional"),
                 _cell("Updated", age if polling else "Not polling"),
             ]
             st.markdown(f'<div class="statusbar">{"".join(cells)}</div>', unsafe_allow_html=True)
