@@ -18,7 +18,7 @@ import pandas as pd
 import streamlit as st
 
 from fpl_manager.api import FplApi
-from fpl_manager.captaincy import HAUL_POINTS, haul_frame, points_pmf
+from fpl_manager.captaincy import HAUL_POINTS, field_gain, haul_frame, points_pmf
 from fpl_manager.chips import best_per_chip
 from fpl_manager.chips import evaluate as evaluate_chips
 from fpl_manager.data import (
@@ -141,6 +141,14 @@ GLOSSARY = {
     "twice and a triple captain three times. At 1.5 his points land in every "
     "rival total one and a half times over, so a haul from him moves you far "
     "less than the score suggests.",
+    "beat_chance": "Chance he outscores whoever the field captained, on goals "
+    "and assists. The field's own favourite sits below half rather than at it, "
+    "because a tie is neither of you gaining and ties are common on a "
+    "distribution this lumpy.",
+    "expected_gain": "Points the armband is worth against the field, counting "
+    "one copy of the difference rather than two: a captain is one extra copy "
+    "of a player you already own, so between two managers with the same "
+    "fifteen that is the whole of what the choice changes.",
 }
 
 CACHE_TTL = 6 * 3600
@@ -497,6 +505,26 @@ def load_captaincy(
     return haul_frame(_season, projections, by_gameweek, event=event)
 
 
+@st.cache_data(show_spinner="Weighing the armband against the field")
+def load_field_gain(
+    _season: Season,
+    projections: pd.DataFrame,
+    by_gameweek: pd.DataFrame,
+    shares: pd.DataFrame,
+    event: int,
+    stamp: str,
+) -> pd.DataFrame:
+    """What each captain is worth against what the field captained.
+
+    The join `captaincy.py` is not allowed to make for itself: it may import
+    `data` and `projections` and nothing else, so the shares travel in as an
+    argument and this is where the two halves meet.
+    """
+    if shares.empty or "captain_share" not in shares.columns:
+        return pd.DataFrame()
+    return field_gain(_season, projections, by_gameweek, shares["captain_share"], event=event)
+
+
 @st.cache_data(show_spinner=False)
 def cached_month(
     _season: Season, table: pd.DataFrame, events: tuple[int, ...], stamp: str
@@ -819,6 +847,12 @@ def pool_column_config(horizon: int, gw_cols: list[str], max_xpts: float) -> dic
         ),
         "effective_ownership": st.column_config.NumberColumn(
             "Effective own.", format="%.2f", **g("effective_ownership")
+        ),
+        "beat_chance": st.column_config.NumberColumn(
+            "Beats field", format="percent", **g("beat_chance")
+        ),
+        "expected_gain": st.column_config.NumberColumn(
+            "Gain vs field", format="%+.2f", **g("expected_gain")
         ),
     }
     for col in gw_cols:
@@ -2347,10 +2381,15 @@ with captain_tab:
                     {"captain_share": 0.0, "effective_ownership": 0.0}
                 )
                 captain_columns += ["captain_share", "effective_ownership"]
+                gain = load_field_gain(season, projections, by_gameweek, field, picked_gw, stamp)
+                if not gain.empty:
+                    shown = shown.join(gain[["beat_chance", "expected_gain"]])
+                    captain_columns += ["beat_chance", "expected_gain"]
                 field_note = (
-                    f" The last two columns are what {field_resolved} of the best managers "
+                    f" The field columns are what {field_resolved} of the best managers "
                     "did with the armband last gameweek, not what they will do with it "
-                    "next."
+                    "next, and the two against them are worked out on that same week's "
+                    "shares."
                 )
             st.caption(
                 f"Top {min(len(shown), 40)} of {len(shown)} by projected points for "
