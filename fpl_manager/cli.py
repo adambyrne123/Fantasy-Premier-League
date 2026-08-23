@@ -305,11 +305,23 @@ def cmd_live(args, season, projections, by_gw):
         print(f"\nGW{gameweek} has no fixtures published yet.")
         return
 
-    played = int(state.fixtures["finished"].sum())
-    status = "in play" if state.in_play else ("all played" if state.all_settled else "not started")
-    print(f"\nGW{gameweek}, {status}. {played} of {len(state.fixtures)} fixtures finished.")
-    if not state.all_settled:
-        print("Bonus on unfinished matches is provisional and can still move.")
+    # played out rather than audited, or this reads zero of ten all weekend
+    # with eight of them long since over
+    played = int(state.played_out.sum())
+    # four states, not three: a gameweek spread over a weekend spends hours
+    # between matches, with nothing in play and plenty already played, and a
+    # ladder without that rung calls a Sunday evening "not started"
+    if state.in_play:
+        status = "in play"
+    elif state.all_settled:
+        status = "all played"
+    elif state.fixtures["started"].any():
+        status = "under way"
+    else:
+        status = "not started"
+    print(f"\nGW{gameweek}, {status}. {played} of {len(state.fixtures)} fixtures played out.")
+    if not state.bonus_is_final:
+        print("Bonus on matches still waiting for it is ours to work out and can move.")
 
     try:
         squad = load_squad(season, args.squad, args.entry)

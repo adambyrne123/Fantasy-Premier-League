@@ -149,12 +149,49 @@ def test_a_match_is_over_at_the_whistle_not_at_the_audit(season: Season):
     assert live.settled(done).all(), "his matches are done, so a blank is a blank"
 
 
-def test_bonus_stays_ours_until_the_audit(season: Season):
-    """Being over is not the same question as being confirmed, and bonus is the
-    later one: FPL applies the real figure at audit time, so a gameweek that has
-    played out in full still shows our own arithmetic until then."""
+def test_bonus_is_final_when_no_started_match_is_still_waiting_for_it(season: Season):
+    """Bonus lands at the whistle, not at the audit, and this used to read the
+    audit.
+
+    Checked against GW1 2026/27 with nine of ten matches played out: every one
+    carried its real bonus with `finished` still false, so a caption gated on
+    `finished` called FPL's own award provisional for the whole weekend. The
+    question is whether any started match is still waiting on its bonus, which
+    is exactly when `provisional_bonus` has something to say.
+    """
     live = load_live(season, season.next_gameweek)
-    assert not live.all_confirmed, "the fake leaves matches unaudited"
+
+    fixtures = live.fixtures
+    applied = fixtures["started"] & fixtures["bonus_added"]
+    assert (applied & ~fixtures["finished"]).any(), (
+        "the fake needs a match that is over with its bonus applied and no audit yet"
+    )
+
+    assert not live.bonus_is_final, "the fake still has a match waiting on its bonus"
+    assert not live.fixtures["finished"].all(), "and it is not the audit doing the work"
+
+    # once nothing started is waiting, the caption is entitled to say final,
+    # even though a later kick off will award more
+    settled = fixtures.copy()
+    settled["bonus_added"] = settled["started"]
+    assert LiveGameweek(
+        gameweek=live.gameweek,
+        elements=live.elements,
+        fixtures=settled,
+        provisional=live.provisional,
+    ).bonus_is_final
+
+
+def test_a_match_awaiting_bonus_is_the_one_that_keeps_it_ours(season: Season):
+    """The two flags answer different questions and must not be swapped: a
+    gameweek can be played out in full while a match is still waiting on its
+    bonus, and can have every bonus applied with matches still to kick off."""
+    live = load_live(season, season.next_gameweek)
+    waiting = live.fixtures["started"] & ~live.fixtures["bonus_added"]
+
+    assert waiting.any(), "the fake needs a started match with no bonus yet"
+    assert not live.bonus_is_final
+    assert set(live.provisional.index) <= set(live.elements.index)
 
 
 def test_a_blank_club_counts_as_settled(season: Season):

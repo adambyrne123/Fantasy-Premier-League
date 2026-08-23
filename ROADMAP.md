@@ -30,18 +30,49 @@ ends, `app.py` and `cli.py`, are thin views over the same library.
 Roughly in priority order. The first item is the only one with a deadline
 attached to it.
 
-### Verify the live code against a real gameweek
+### Finish verifying the live code against a real gameweek
 
-**The highest priority item here.** None of `live.py` has ever met a real match.
-It was written pre-season, when `event/{gw}/live/` returns zero elements and no
-fixture carries a stats array, so every test behind it runs on synthetic payloads
-shaped like the documented one. The empty case is handled and has been checked
-against the real API. The bonus ranking and the substitution rule have not.
+Mostly done. `tests/test_live_against_the_api.py` checks what `live.py` works
+out against what FPL published, using the API as its own oracle rather than the
+site by eye: the fixture's `bonus` block, `automatic_subs` on the entry picks,
+the `multiplier` FPL rewrites onto each pick, and the gameweek total in the
+entry history. It is `network` marked, so `pytest -m network` is the way in and
+CI never runs it. Nothing in it hardcodes a gameweek, so it keeps working every
+week.
 
-Check a scored gameweek against the FPL site before trusting a number on it. The
-two things most likely to be wrong are bonus in a double gameweek, where the
-per-fixture and summed figures diverge, and a substitution in a match that
-finished late.
+Checked against GW1 2026/27 with nine of ten matches played out:
+
+- The bonus ranking is right, across nine fixtures, including two real tie
+  cases. Two players sharing a 3 with the next man taking 1, and three sharing
+  a 2 with nothing below them, both came out of standard competition ranking
+  with no special casing.
+- Dropping non-positive bonus points system scores never cost a winner. Real
+  scores reach -14 and the lowest winning score was 27.
+- The substitutions, the eleven and the armband agreed for a real entry, but
+  under a gate that had not opened yet, so they are checked rather than proven.
+
+What is left:
+
+- **Run it once GW1 is audited.** The four tests that read the entry payload
+  skip until `finished` is true across the gameweek, so they have never run
+  green under their own gate. `uv run pytest -m network` is the whole job.
+- **A gameweek with a real automatic substitution in it.** GW1 needed none, so
+  the substitution comparison has so far only agreed that nothing happened.
+- **A double gameweek.** The case most likely to be wrong, where the
+  per-fixture and summed bonus figures diverge, and the one thing GW1 could not
+  prove. The check finds its own gameweek, so it starts covering this the first
+  time one is played.
+
+Two things found while checking, both now fixed. `all_confirmed` read
+`finished` and is now `bonus_is_final`: bonus lands at the whistle, not at the
+audit, so the app called FPL's own award provisional all weekend. And
+`cmd_live` still counted `finished` fixtures, which is the bug that was fixed in
+`app.py` and never carried across to the CLI.
+
+The one to keep in mind when reading any of this: the fixture payload moves at
+the whistle and the entry payload moves at the audit. GW1 measured the gap at
+about a day, with the entry history reporting 29 while its own live figures
+summed to 35.
 
 While checking, note that a squad *file* carries no pick order, so `score_squad`
 reads its first eleven as the XI and its list order as the bench. Only an entry
