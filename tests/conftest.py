@@ -8,11 +8,24 @@ from frame building through to solving.
 from __future__ import annotations
 
 import random
+from datetime import UTC, datetime, timedelta
 
 import pandas as pd
 import pytest
 
 from fpl_manager.data import Season
+
+# A gameweek a week from a real opening Friday, so the synthetic season lands in
+# real months. It used to pin all 38 deadlines inside August, which made every
+# gameweek belong to the same month and left anything monthly untestable.
+SEASON_START = datetime(2026, 8, 21, 17, 30, tzinfo=UTC)
+
+
+def _gameweek_time(gameweek: int, hours: int = 0) -> str:
+    """The deadline for a gameweek, or a kickoff some hours after it."""
+    when = SEASON_START + timedelta(days=7 * (gameweek - 1), hours=hours)
+    return when.strftime("%Y-%m-%dT%H:%M:%SZ")
+
 
 LAST_SEASON = "2025/26"
 POS_COUNTS = {1: 3, 2: 7, 3: 8, 4: 4}
@@ -36,7 +49,7 @@ class FakeApi:
             {
                 "id": gw,
                 "name": f"Gameweek {gw}",
-                "deadline_time": f"2026-08-{min(28, 21 + gw):02d}T17:30:00Z",
+                "deadline_time": _gameweek_time(gw),
                 "finished": gw <= played,
                 "is_current": gw == played,
                 "is_next": gw == played + 1,
@@ -231,7 +244,7 @@ class FakeApi:
                         "team_h_difficulty": self.rng.randint(2, 5),
                         "team_a_difficulty": self.rng.randint(2, 5),
                         "finished": gw <= self.played,
-                        "kickoff_time": f"2026-08-{min(28, 21 + gw):02d}T14:00:00Z",
+                        "kickoff_time": _gameweek_time(gw, hours=20),
                         # null until a match is played, the way the real payload
                         # is. Derived from the ids rather than drawn, so adding
                         # them does not move the random stream every other
@@ -357,12 +370,40 @@ class FakeApi:
             },
         }
 
+    def _season_so_far(self, entry_id: int) -> list[dict]:
+        """One row per finished gameweek, the way `entry/{id}/history/` gives it.
+
+        Scores vary by entry and by week so a monthly total is not the same
+        number for everyone, which is the only way a rank over it can be told
+        from a constant. `total_points` is the running total, since that is what
+        `month_totals` differences rather than trusting `points` to be net of a
+        hit.
+
+        The most recent week makes a transfer, which keeps
+        `_estimate_free_transfers` at the one free transfer it returned when
+        this list was empty. Nothing here is about transfers and a squad test
+        should not move because a league feature needed a history.
+        """
+        rows, running = [], 0
+        for event in range(1, self.played + 1):
+            running += 30 + (entry_id + event) % 40
+            rows.append(
+                {
+                    "event": event,
+                    "points": 30 + (entry_id + event) % 40,
+                    "total_points": running,
+                    "event_transfers": 1 if event == self.played else 0,
+                    "event_transfers_cost": 0,
+                }
+            )
+        return rows
+
     def entry_history(self, entry_id: int) -> dict:
         """Past seasons, deliberately out of order so a sort is exercised."""
         if entry_id == 2:
             return {"current": [], "past": [], "chips": []}
         return {
-            "current": [],
+            "current": self._season_so_far(entry_id),
             "chips": [],
             "past": [
                 {"season_name": "2024/25", "total_points": 2100, "rank": 400_000},

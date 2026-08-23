@@ -75,7 +75,7 @@ api.py  ──▶  data.py  ──▶  projections.py  ──▶  optimiser.py  
 | `roi.py` | Points already returned per million. | Projections, which look forward |
 | `captaincy.py` | Haul and return chances for the armband. Distributions, not point estimates. | Anything the optimiser reads. It is a leaf on purpose |
 | `squad.py` | Loading the user's 15, bank, selling prices. | Projections or optimisation |
-| `leagues.py` | Public manager profiles and classic league tables. | Anything that scores or ranks players |
+| `leagues.py` | Public manager profiles, classic league tables, and monthly totals. | Anything that scores or ranks players |
 | `elite.py` | What the top managers own and captain, counted off their squads. | Anything forward looking. It counts squads that already exist |
 | `cli.py` | Argument parsing and printing. | Model logic of any kind |
 | `app.py` | Streamlit view: widgets, layout, caching. | Model logic of any kind |
@@ -329,9 +329,11 @@ considered and rejected, so those do not get re-proposed.
 - Hardcode gameweek numbers or the current season. Use `Season.next_gameweek`
   and `Season.gameweeks_played`.
 - Read `ep_next` from anywhere but the front end. It is FPL's own projection,
-  displayed in the head to head section of the Players tab so it can disagree
-  with ours. Consuming it would make our projection partly a copy of theirs and
-  take away the ability to say why a number is what it is.
+  displayed in the comparison on the Players tab, the one that appears when you
+  tick two or more rows, so it can disagree with ours. Consuming it would make
+  our projection partly a copy of theirs and take away the ability to say why a
+  number is what it is. It is deliberately absent from `STAT_VIEWS`, so the
+  comparison stays the only place it renders.
 - Overstate what the model does. It produces a ranked shortlist to argue with.
   Rotation risk, press conference hints and minutes management are not in the
   API and the output should not imply otherwise.

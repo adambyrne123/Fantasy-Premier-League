@@ -260,8 +260,8 @@ decided rather than needing to be re-argued.
 **`ep_next` as a model input.** Consuming FPL's own expected points makes the
 projection partly a copy of theirs and destroys the ability to explain why a
 number is what it is. A comparison column is its only honest use, and it now has
-one in the head to head section of the Players tab, where it sits beside ours and
-is read by nothing else.
+one on the Players tab, in the comparison that appears when you tick two or more
+rows, where it sits beside ours and is read by nothing else.
 
 **ICT index, influence, creativity, threat.** Composites built from the same
 underlying events as expected goals and assists, on an uninterpretable scale, and

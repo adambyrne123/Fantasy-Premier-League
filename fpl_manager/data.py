@@ -297,6 +297,27 @@ class Season:
         deadline = self.events["deadline_time"].get(self.next_gameweek)
         return None if deadline is None or pd.isna(deadline) else deadline
 
+    def gameweeks_in_month(self, when: pd.Timestamp | None = None) -> list[int]:
+        """The gameweeks belonging to a calendar month, this one by default.
+
+        FPL has no monthly anything in its data, so a month has to be defined
+        somewhere and this is it. A gameweek is placed by its **deadline**
+        rather than by its kickoffs, because a deadline is the one instant every
+        fixture in a gameweek shares and it is the moment the team that scores
+        those points was chosen. A gameweek deadlining on the 31st and playing
+        on the 1st therefore belongs to the earlier month, whole.
+
+        The alternative, splitting a gameweek across two months by kickoff, was
+        not taken: it would cut one team selection's points in half and there is
+        no sense in which a manager scored part of a gameweek in July.
+
+        Empty for a month with no deadlines in it, which is most of the summer.
+        """
+        when = pd.Timestamp.now(tz="UTC") if when is None else pd.Timestamp(when)
+        deadlines = self.events["deadline_time"]
+        same = (deadlines.dt.year == when.year) & (deadlines.dt.month == when.month)
+        return [int(event) for event in self.events.index[same.fillna(False)]]
+
     def team_fixtures(self, horizon: int, start_gw: int | None = None) -> pd.DataFrame:
         """One row per club per fixture across the horizon.
 

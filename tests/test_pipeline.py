@@ -204,6 +204,49 @@ def test_club_form_counts_a_match_that_has_been_played_but_not_settled():
     assert (form["games"] == 1).all()
 
 
+def test_a_month_is_the_gameweeks_that_deadline_in_it(season: Season):
+    """FPL has no monthly anything, so the rule is ours and worth pinning.
+
+    The synthetic season runs a gameweek a week from a real opening Friday, so
+    the split across months is a real split rather than an artefact.
+    """
+    august = season.gameweeks_in_month(pd.Timestamp("2026-08-15", tz="UTC"))
+    september = season.gameweeks_in_month(pd.Timestamp("2026-09-15", tz="UTC"))
+
+    assert august == [1, 2]
+    assert september == [3, 4, 5, 6]
+    assert not set(august) & set(september), "a gameweek belongs to one month, whole"
+    assert season.gameweeks_in_month(pd.Timestamp("2026-07-15", tz="UTC")) == [], "no deadlines"
+
+    every = [gw for month in range(8, 13) for gw in _month(season, 2026, month)]
+    every += [gw for month in range(1, 8) for gw in _month(season, 2027, month)]
+    assert sorted(every) == list(range(1, 39)), "every gameweek lands in exactly one month"
+
+
+def _month(season: Season, year: int, month: int) -> list[int]:
+    return season.gameweeks_in_month(pd.Timestamp(year=year, month=month, day=15, tz="UTC"))
+
+
+def test_a_month_total_is_what_the_running_total_moved_by(season: Season):
+    """Taken as a difference of running totals rather than by adding up
+    `points`, since the payload does not say whether that is already net of a
+    hit. A manager with no history is left out rather than scored zero."""
+    from fpl_manager.leagues import month_totals
+
+    scored = month_totals(season, [1, 3, 2], [2, 3])
+
+    assert 2 not in scored.index, "entry 2 has no history and must not read as zero"
+    assert month_totals(season, [1], []).empty, "no gameweeks is no month"
+
+    if not season.gameweeks_played:
+        assert scored.empty, "nothing played yet, so nobody has a month"
+        return
+
+    for entry_id in (1, 3):
+        rows = {r["event"]: r for r in season.api.entry_history(entry_id)["current"]}
+        assert scored[entry_id] == rows[3]["total_points"] - rows[1]["total_points"]
+
+
 def test_next_deadline_belongs_to_the_next_gameweek(season: Season):
     """The status bar puts the two side by side, so a deadline lifted from a
     different event than the gameweek shown next would be worse than none."""

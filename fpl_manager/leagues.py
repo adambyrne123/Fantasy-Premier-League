@@ -1,9 +1,14 @@
 """Public manager and league data, turned into frames.
 
 Read-only and unauthenticated, the same endpoints the FPL site uses for its own
-manager and league pages. Nothing here is opinionated: it reshapes three
-payloads and works out a rank movement, and that is all. Anything that ranks or
-scores players belongs in `projections.py`.
+manager and league pages. Mostly it reshapes payloads. The two things it works
+out for itself are a rank movement and a month, both of which FPL publishes no
+figure for, and both of which are about managers rather than players. Anything
+that ranks or scores players belongs in `projections.py`.
+
+The month is the expensive one. FPL has no monthly endpoint, so a month has to
+be added up from each manager's own history, one request each, and nothing here
+calls it unless asked.
 
 Three of the four shapes this parses were read off the live API. The fourth,
 the rows inside a league table, could not be: no league has a single row in it
@@ -169,3 +174,68 @@ def standings(season: Season, league_id: int, page: int = 1) -> tuple[pd.DataFra
         frame["movement"] = pd.NA
 
     return frame.reset_index(drop=True), info
+
+
+def month_totals(season: Season, entry_ids, events: list[int]) -> pd.Series:
+    """What each manager scored across a set of gameweeks, hits included.
+
+    Taken as the difference between their running total after the last of those
+    gameweeks and their running total before the first, rather than by adding
+    up the per gameweek `points`. The payload carries both `points` and
+    `event_transfers_cost` and does not say whether the first is already net of
+    the second, so adding them up means guessing. A difference of two totals
+    cannot be wrong about it: it is how much the number next to their name
+    actually moved over the month.
+
+    One request per manager, which is why nothing calls this without being
+    asked. A manager whose history cannot be read is left out rather than
+    counted as zero, since a zero would rank them last on a fact nobody knows.
+    """
+    wanted = {int(event) for event in events}
+    scored: dict[int, int] = {}
+    if not wanted:
+        return pd.Series(scored, dtype="Int64", name="month_points")
+
+    for entry_id in entry_ids:
+        try:
+            payload = season.api.entry_history(int(entry_id))
+        except Exception:
+            # a mid-sample failure should cost one manager rather than the table
+            continue
+
+        rows = payload.get("current") or []
+        played = sorted(
+            (row for row in rows if int(row.get("event") or 0) in wanted),
+            key=lambda row: int(row["event"]),
+        )
+        if not played:
+            continue
+
+        first = int(played[0]["event"])
+        earlier = [row for row in rows if int(row.get("event") or 0) < first]
+        before = int(earlier[-1].get("total_points") or 0) if earlier else 0
+        scored[int(entry_id)] = int(played[-1].get("total_points") or 0) - before
+
+    return pd.Series(scored, dtype="Int64", name="month_points")
+
+
+def with_month(season: Season, table: pd.DataFrame, events: list[int]) -> pd.DataFrame:
+    """A league table with each manager's month, and their rank within it.
+
+    The rank is worked out here rather than read off anything, because FPL
+    publishes no monthly rank. It is a rank inside this league only, so a
+    manager sitting fourth overall can be top of the month, which is the whole
+    reason for showing it beside the season rank rather than instead of it.
+
+    Ties share the better rank, matching how the season table above it reads.
+    """
+    out = table.copy()
+    if "entry_id" not in out.columns or out.empty:
+        out["month_points"] = pd.Series(dtype="Int64")
+        out["month_rank"] = pd.Series(dtype="Int64")
+        return out
+
+    scored = month_totals(season, [int(e) for e in out["entry_id"]], events)
+    out["month_points"] = out["entry_id"].map(scored).astype("Int64")
+    out["month_rank"] = out["month_points"].rank(ascending=False, method="min").astype("Int64")
+    return out
