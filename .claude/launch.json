@@ -3,8 +3,8 @@
   "configurations": [
     {
       "name": "fpl-app",
-      "runtimeExecutable": ".venv/Scripts/streamlit.exe",
-      "runtimeArgs": ["run", "app.py"],
+      "runtimeExecutable": "uv",
+      "runtimeArgs": ["run", "python", "-m", "streamlit", "run", "app.py"],
       "port": 8501,
       "autoPort": true
     }

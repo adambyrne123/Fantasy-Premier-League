@@ -509,6 +509,84 @@ def test_the_component_rate_is_not_what_protects_august(season: Season):
     pd.testing.assert_series_equal(before, build_rates(season, fitted)["points_per_90"])
 
 
+def test_a_club_defence_off_one_match_is_shrunk_towards_the_league(season: Season):
+    """The club rate is the one term whose error does not diversify away.
+
+    Every defender at a club reads the same number, so a defence overstated off
+    ninety minutes moves five players the same way at once. It used to be
+    unreachable because `component_rate` was barred below 270 player minutes,
+    and that gate is a ramp now. Measured on the real payload one match into
+    2026/27: eighteen clubs between 0.20 and 3.87 per 90, all off one match.
+    """
+    from fpl_manager.projections import TEAM_DEFENCE_MINUTES, team_defence_rate
+
+    players = season.players.copy()
+    keepers = players[players["position"] == "GKP"]
+    if keepers.empty or "expected_goals_conceded" not in players.columns:
+        pytest.skip("needs keepers carrying a conceding rate")
+
+    def one_match(frame, club, conceded):
+        """Give a club exactly one match of keeper football, however many
+        keepers it carries: the club total is what the rate divides by."""
+        index = keepers.index[keepers["team"] == club]
+        frame.loc[index, ["minutes", "expected_goals_conceded"]] = 0.0
+        frame.loc[index[0], ["minutes", "expected_goals_conceded"]] = (90.0, conceded)
+
+    # one club ships four in its only match, another keeps its only clean sheet
+    leaky, tight = keepers["team"].unique()[:2]
+    one_match(players, leaky, 4.0)
+    one_match(players, tight, 0.0)
+
+    rate = team_defence_rate(players)
+
+    assert rate[leaky] < 4.0, "a rate off one match must not be trusted whole"
+    assert rate[tight] > 0.0, "nor may a single clean sheet buy a shut out defence"
+    assert rate[leaky] > rate[tight], "and the ordering has to survive the shrinkage"
+
+    # a club with the full sample behind it is left exactly where it was
+    full = players.copy()
+    index = keepers.index[keepers["team"] == leaky]
+    full.loc[index, ["minutes", "expected_goals_conceded"]] = 0.0
+    full.loc[index[0], "minutes"] = float(TEAM_DEFENCE_MINUTES)
+    full.loc[index[0], "expected_goals_conceded"] = 4.0
+    assert team_defence_rate(full)[leaky] == pytest.approx(4.0 / (TEAM_DEFENCE_MINUTES / 90))
+
+
+def test_shrinking_the_club_defence_leaves_the_league_where_it_was(season: Season):
+    """Shrinking towards the mean must not move the mean, or every defender in
+    the game gets quietly cheaper or dearer to project."""
+    from fpl_manager.projections import team_defence_rate
+
+    rate = team_defence_rate(season.players)
+    if rate.empty:
+        pytest.skip("pre-season, where there is no club rate to shrink")
+
+    raw = season.players[season.players["position"] == "GKP"]
+    conceded = pd.to_numeric(raw["expected_goals_conceded"], errors="coerce").fillna(0.0)
+    minutes = pd.to_numeric(raw["minutes"], errors="coerce").fillna(0.0)
+    totals = pd.DataFrame({"team": raw["team"], "xgc": conceded, "minutes": minutes})
+    totals = totals.groupby("team")[["xgc", "minutes"]].sum()
+    unshrunk = (
+        (totals["xgc"] / (totals["minutes"] / 90)).replace([np.inf, -np.inf], np.nan).dropna()
+    )
+
+    assert rate.mean() == pytest.approx(unshrunk.mean())
+    assert rate.std() <= unshrunk.std(), "shrinkage pulls in, it does not spread out"
+
+
+def test_the_club_defence_stays_empty_before_anybody_has_played(season: Season):
+    """Callers read an empty series as unknown. A league of clubs conceding the
+    mean of nothing would be a confident answer to a question with no data."""
+    from fpl_manager.projections import team_defence_rate
+
+    players = season.players.copy()
+    players["minutes"] = 0.0
+    players["expected_goals_conceded"] = 0.0
+    assert team_defence_rate(players).empty
+
+    assert team_defence_rate(players.drop(columns=["expected_goals_conceded"])).empty
+
+
 def test_a_penalty_taker_outprojects_an_identical_team_mate(season: Season):
     """Spot kicks are a claim on chances still to come, so they cannot be read
     off the expected goals a player has already accumulated."""
@@ -639,6 +717,7 @@ def test_the_new_scoring_terms_are_inert_before_the_first_deadline(season: Seaso
     stale["yellow_cards"] = 9
     stale["red_cards"] = 2
     stale["expected_goals_conceded"] = 45.0
+    stale["bonus"] = 30
 
     after = build_rates(season, prior)["points_per_90"]
     pd.testing.assert_series_equal(before, after)
@@ -1151,6 +1230,7 @@ COUNTS_THAT_SCALE = (
     "defensive_contribution",
     "yellow_cards",
     "red_cards",
+    "bonus",
 )
 
 
@@ -1178,6 +1258,7 @@ BASE_COUNTS = {
     "defensive_contribution": 30.0,
     "yellow_cards": 1.0,
     "red_cards": 0.0,
+    "bonus": 3.0,
 }
 
 
@@ -2038,6 +2119,16 @@ def test_live_stays_a_leaf():
         assert "live" not in _imports_of(module), f"{module}.py imported live scoring"
 
 
+def test_the_backtest_stays_a_consumer():
+    """It reads realised points to score the projection, which makes it an
+    outcome rather than evidence, the same way `live.py` is. Nothing that
+    projects or picks may import it, or the model would be reading its own
+    marks."""
+    for module in ("projections", "optimiser", "chips", "captaincy", "data", "live"):
+        assert "backtest" not in _imports_of(module), f"{module}.py imported the backtest"
+    assert _imports_of("backtest") <= {"api", "data", "projections"}
+
+
 def test_the_field_stays_a_leaf():
     """`elite.py` counts squads that already exist. Nothing that projects or
     picks may read it.
@@ -2055,3 +2146,181 @@ def test_the_field_stays_a_leaf():
 def test_the_field_reads_only_what_it_is_allowed_to():
     """It reshapes a league table and some picks, and that is all it does."""
     assert _imports_of("elite") <= {"data", "leagues"}
+
+
+# ----------------------------------------------------------------------
+# what the season's first weeks taught the model
+# ----------------------------------------------------------------------
+def test_bonus_is_paid_in_the_rebuilt_rate():
+    """Bonus is points FPL pays that no category above it can rebuild, so it
+    is read at the rate it was earned. Measured three gameweeks into 2026/27
+    the component sat half a point per 90 under the observed rate and bonus
+    was about half of that gap, growing with the blend weight."""
+    from fpl_manager.projections import component_rate
+
+    players = pd.DataFrame(
+        {
+            "minutes": [900.0, 900.0],
+            "expected_goals": [3.0, 3.0],
+            "expected_assists": [2.0, 2.0],
+            "bonus": [10.0, 0.0],
+            "position": ["MID", "MID"],
+            "now_cost": [80, 80],
+        },
+        index=[1, 2],
+    )
+    rate = component_rate(players, None)
+    assert rate[1] - rate[2] == pytest.approx(10.0 / 10, abs=1e-9)
+
+
+def test_the_role_is_trusted_faster_than_the_rate(prior: pd.DataFrame):
+    """A start is a decision a manager has already made and it persists. A
+    scoring rate off the same matches is a sample. So this season's starts
+    blend in on `ROLE_SHRINKAGE_GAMES` and this season's points on
+    `SHRINKAGE_GAMES`, and the first is the smaller. Measured on GW1 to GW3
+    of 2026/27: moving the role alone took the rank correlation with what
+    was scored from 0.48 to 0.53, moving the rate alone moved nothing."""
+    from fpl_manager import projections as pj
+    from fpl_manager.projections import build_rates
+
+    from .conftest import FakeApi
+
+    assert pj.ROLE_SHRINKAGE_GAMES < pj.SHRINKAGE_GAMES
+
+    season = Season(FakeApi(played=3))
+    prior = prior.reindex(season.players.index)
+    players = season.players
+    # two players who are the same in every respect but this season's starts
+    a, b = players.index[:2]
+    players.loc[b] = players.loc[a]
+    prior.loc[b] = prior.loc[a]
+    players.loc[a, ["starts", "minutes"]] = [3, 270]
+    players.loc[b, ["starts", "minutes"]] = [0, 0]
+
+    def gap(role_games: float) -> float:
+        before = pj.ROLE_SHRINKAGE_GAMES
+        pj.ROLE_SHRINKAGE_GAMES = role_games
+        try:
+            rates = build_rates(season, prior)
+        finally:
+            pj.ROLE_SHRINKAGE_GAMES = before
+        return float(rates.loc[a, "minutes_share"] - rates.loc[b, "minutes_share"])
+
+    fast, slow = gap(pj.ROLE_SHRINKAGE_GAMES), gap(pj.SHRINKAGE_GAMES)
+    assert fast > slow > 0
+
+    # and the rate blend does not read the role constant at all
+    before = pj.ROLE_SHRINKAGE_GAMES
+    pj.ROLE_SHRINKAGE_GAMES = 100.0
+    try:
+        moved = build_rates(season, prior)["points_per_90"]
+    finally:
+        pj.ROLE_SHRINKAGE_GAMES = before
+    pd.testing.assert_series_equal(moved, build_rates(season, prior)["points_per_90"])
+
+
+def test_club_strength_is_empty_before_anybody_has_played(season: Season):
+    from fpl_manager.projections import club_strength
+
+    strength = club_strength(season.players)
+    if season.gameweeks_played:
+        assert not strength.empty
+        assert list(strength.columns) == ["attack", "defence"]
+    else:
+        assert strength.empty
+
+
+def test_club_attack_is_the_sum_of_its_shots(season: Season):
+    """Expected goals are charged to one player per shot, so a club's attack
+    is the sum over its players, where its conceded rate had to come off the
+    keeper. Shrunk towards the league mean by the club's own minutes, the
+    same way the defence is."""
+    from fpl_manager.projections import CLUB_STRENGTH_MINUTES, club_strength, credibility
+
+    if not season.gameweeks_played:
+        pytest.skip("the pre-season half of the fixture")
+
+    players = season.players
+    strength = club_strength(players)
+    keepers = players[players["position"] == "GKP"]
+    minutes = keepers.groupby("team")["minutes"].sum()
+    raw = players.groupby("team")["expected_goals"].sum() / (minutes / 90)
+    raw = raw.replace([np.inf, -np.inf], np.nan).dropna()
+    league = raw.mean()
+    cred = credibility(minutes.reindex(raw.index), CLUB_STRENGTH_MINUTES)
+    expected = cred * raw + (1 - cred) * league
+    pd.testing.assert_series_equal(
+        strength["attack"], expected.reindex(strength.index), check_names=False
+    )
+    assert (strength["defence"] > 0).all()
+
+
+def test_the_rebuilt_ratings_fill_only_an_unrated_frame(season: Season):
+    """FPL's ratings and ours are on different scales, so the fill is all or
+    nothing: a frame with any published rating is left exactly alone, and a
+    frame with none gets ours on every fixture."""
+    from fpl_manager.projections import STRENGTH_COLUMNS, club_strength, fill_strength
+
+    if not season.gameweeks_played:
+        pytest.skip("the pre-season half of the fixture")
+
+    clubs = club_strength(season.players)
+    rated = season.team_fixtures(horizon=3)
+    pd.testing.assert_frame_equal(fill_strength(rated, clubs), rated)
+
+    unrated = rated.copy()
+    for column in STRENGTH_COLUMNS:
+        unrated[column] = 0.0
+    filled = fill_strength(unrated, clubs)
+    for column in STRENGTH_COLUMNS:
+        assert (filled[column] > 0).all(), column
+    assert filled["attack_for"].equals(filled["team"].map(clubs["attack"]).astype("float64"))
+    # a conceding rate goes in inverted, since FPL's defence rating is
+    # higher-is-better and the multiplier divides by the opponent's
+    assert np.allclose(filled["defence_against"], 1.0 / filled["opponent"].map(clubs["defence"]))
+
+
+def test_the_rebuilt_ratings_keep_the_average_fixture_at_one():
+    from fpl_manager.projections import club_strength, fill_strength, strength_multiplier
+
+    from .conftest import FakeApi
+
+    season = Season(FakeApi(played=12, strengths=False))
+    # the fake draws a keeper's minutes and an outfielder's minutes from the
+    # same list independently, so a club can carry three thousand outfield
+    # minutes against three hundred in goal and read as scoring seven a match.
+    # A real club banks the same ninety in goal as it does everywhere else,
+    # and the property under test is about a payload shaped like that
+    players = season.players
+    keepers = players["position"] == "GKP"
+    played_most = players.groupby("team")["minutes"].max()
+    players.loc[keepers, "minutes"] = (players.loc[keepers, "team"].map(played_most) / 3).round()
+    # and what they concede moves with the minutes, the way the fake builds it
+    players.loc[keepers, "expected_goals_conceded"] = players.loc[keepers, "minutes"] / 90 * 1.35
+    fixtures = fill_strength(season.team_fixtures(horizon=6), club_strength(players))
+    strength = strength_multiplier(fixtures)
+    assert strength.notna().all()
+    assert 0.9 < strength.mean() < 1.1
+
+
+def test_an_unrated_season_projects_on_the_rebuilt_ratings_once_played():
+    """Pre-season an unrated payload projects on the difficulty rating alone,
+    exactly as it always did. Once matches have been played the rebuilt club
+    ratings step in, so two fixtures FPL rates the same can differ."""
+    from fpl_manager.projections import project
+
+    from .conftest import FakeApi, make_prior
+
+    def multipliers_by_rating(season: Season) -> pd.Series:
+        _, by_gw = project(season, horizon=3, prior=make_prior(season))
+        fixtures = season.team_fixtures(3)
+        fixtures = fixtures.assign(club=fixtures["team"].map(season.teams["short_name"]))
+        joined = by_gw.drop_duplicates(["club", "event"]).merge(
+            fixtures, on=["club", "event", "is_home"]
+        )
+        return joined.groupby(["difficulty", "is_home"])["multiplier"].nunique()
+
+    # with nothing to rebuild from, the multiplier is a function of the
+    # difficulty rating and the venue and nothing else
+    assert (multipliers_by_rating(Season(FakeApi(played=0, strengths=False))) == 1).all()
+    assert (multipliers_by_rating(Season(FakeApi(played=12, strengths=False))) > 1).any()

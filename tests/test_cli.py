@@ -23,7 +23,14 @@ from .conftest import FakeApi, make_prior
 def wired(monkeypatch, tmp_path):
     """The CLI pointed at synthetic data, with no network and no disk cache."""
     fake = FakeApi(played=12)
-    for name in ("bootstrap", "fixtures", "live", "fixtures_for_event", "element_summary"):
+    for name in (
+        "bootstrap",
+        "fixtures",
+        "live",
+        "live_settled",
+        "fixtures_for_event",
+        "element_summary",
+    ):
         monkeypatch.setattr(api.FplApi, name, _delegate(fake, name))
     monkeypatch.setattr(api.FplApi, "_get", lambda self, *a, **kw: {})
 
@@ -70,6 +77,9 @@ def squad_file(tmp_path, wired):
         ["--horizon", "3", "prices"],
         ["--horizon", "3", "captains", "--top", "5"],
         ["--horizon", "3", "captains", "--position", "MID"],
+        ["--horizon", "3", "backtest"],
+        ["--horizon", "3", "backtest", "--through", "2"],
+        ["--horizon", "3", "backtest", "--sweep", "SHRINKAGE_GAMES=3,6"],
     ],
 )
 def test_a_subcommand_that_needs_no_squad_runs(wired, capsys, argv):

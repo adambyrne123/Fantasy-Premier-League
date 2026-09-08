@@ -22,6 +22,7 @@ from fpl_manager.captaincy import (
     _gameweek_pmf,
     _poisson_head,
     _return_chance,
+    field_gain,
     haul_frame,
     points_pmf,
 )
@@ -346,3 +347,130 @@ def test_the_solved_distribution_is_a_distribution(season: Season, projections: 
     _, pmf, _ = _distribution(season, projections, by_gw, None)
     assert (pmf >= 0).all()
     assert pmf.sum(axis=1) == pytest.approx(1.0, abs=1e-6)
+
+
+# ----------------------------------------------------------------------
+# against the field
+# ----------------------------------------------------------------------
+def _field_setup(season: Season, projections: pd.DataFrame):
+    _, by_gw = project(season, horizon=6)
+    players, _, _ = _distribution(season, projections, by_gw, None)
+    return by_gw, list(players.index)
+
+
+def test_a_captain_the_whole_field_has_gains_you_nothing(season: Season, projections: pd.DataFrame):
+    """The point of the whole thing, and the one case with an exact answer.
+
+    If everybody captains the man you are captaining, your armband and theirs
+    are the same random variable, so the gain is zero and the chance of beating
+    them is whatever is left over the ties, split evenly by symmetry.
+    """
+    if not season.gameweeks_played:
+        pytest.skip("this is the mid-season half of the fixture")
+
+    by_gw, ids = _field_setup(season, projections)
+    everyone = ids[0]
+    shares = pd.Series(0.0, index=ids)
+    shares[everyone] = 1.0
+
+    gain = field_gain(season, projections, by_gw, shares, [everyone])
+    row = gain.loc[everyone]
+
+    assert row["expected_gain"] == pytest.approx(0.0, abs=1e-9)
+    assert 2 * row["beat_chance"] + row["tie_chance"] == pytest.approx(1.0, abs=1e-6)
+
+
+def test_beating_the_field_is_worth_more_when_fewer_of_them_have_him(
+    season: Season, projections: pd.DataFrame
+):
+    """Effective ownership, stated as an assertion. The same player against a
+    field that owns him is worth less than against one that does not."""
+    if not season.gameweeks_played:
+        pytest.skip("this is the mid-season half of the fixture")
+
+    by_gw, ids = _field_setup(season, projections)
+    mine, other = ids[0], ids[1]
+
+    against_himself = pd.Series(0.0, index=ids)
+    against_himself[mine] = 1.0
+    against_other = pd.Series(0.0, index=ids)
+    against_other[other] = 1.0
+
+    crowded = field_gain(season, projections, by_gw, against_himself, [mine]).loc[mine]
+    alone = field_gain(season, projections, by_gw, against_other, [mine]).loc[mine]
+
+    assert crowded["expected_gain"] == pytest.approx(0.0, abs=1e-9)
+    assert alone["beat_chance"] > crowded["beat_chance"] or alone["expected_gain"] != pytest.approx(
+        0.0, abs=1e-9
+    ), "a field that does not own him has to produce a different answer"
+
+
+def test_the_gain_is_one_copy_of_the_difference_not_two(season: Season, projections: pd.DataFrame):
+    """An armband is one extra copy of a player you already own, so between two
+    managers with the same fifteen the choice is worth `yours - theirs`.
+    Doubling it answers a different question, against a rival owning neither."""
+    if not season.gameweeks_played:
+        pytest.skip("this is the mid-season half of the fixture")
+
+    by_gw, ids = _field_setup(season, projections)
+    _, pmf, _ = _distribution(season, projections, by_gw, None)
+    points = np.arange(pmf.shape[1], dtype="float64")
+    means = pd.Series(pmf @ points, index=ids)
+
+    mine, theirs = ids[0], ids[1]
+    shares = pd.Series(0.0, index=ids)
+    shares[theirs] = 1.0
+
+    gain = field_gain(season, projections, by_gw, shares, [mine]).loc[mine, "expected_gain"]
+    assert gain == pytest.approx(means[mine] - means[theirs], abs=1e-9)
+
+
+def test_the_field_is_normalised_rather_than_trusted(season: Season, projections: pd.DataFrame):
+    """`captain_share` comes off a sample of squads and is a share of managers,
+    so it need not sum to one once players with no distribution drop out. Two
+    shares in the same proportion have to give the same answer."""
+    if not season.gameweeks_played:
+        pytest.skip("this is the mid-season half of the fixture")
+
+    by_gw, ids = _field_setup(season, projections)
+    mine = ids[0]
+
+    half = pd.Series(0.0, index=ids)
+    half[ids[1]] = 0.3
+    half[ids[2]] = 0.2
+
+    scaled = half * 7.0
+
+    a = field_gain(season, projections, by_gw, half, [mine])
+    b = field_gain(season, projections, by_gw, scaled, [mine])
+    pd.testing.assert_frame_equal(a, b)
+
+
+def test_a_field_nobody_can_be_placed_in_is_empty_not_wrong(
+    season: Season, projections: pd.DataFrame
+):
+    """An empty sample is what The field looks like before a gameweek is
+    scored. Returning zeros would state that every captain is average."""
+    if not season.gameweeks_played:
+        pytest.skip("this is the mid-season half of the fixture")
+
+    by_gw, ids = _field_setup(season, projections)
+    empty = field_gain(season, projections, by_gw, pd.Series(dtype="float64"), ids[:3])
+    assert empty.empty
+
+    zeros = field_gain(season, projections, by_gw, pd.Series(0.0, index=ids), ids[:3])
+    assert zeros.empty
+
+
+def test_the_chances_are_chances(season: Season, projections: pd.DataFrame):
+    if not season.gameweeks_played:
+        pytest.skip("this is the mid-season half of the fixture")
+
+    by_gw, ids = _field_setup(season, projections)
+    shares = pd.Series(1.0 / len(ids), index=ids)
+    gain = field_gain(season, projections, by_gw, shares)
+
+    assert len(gain) == len(ids), "every player with a distribution gets a row"
+    for column in ("beat_chance", "tie_chance"):
+        assert gain[column].between(0, 1).all()
+    assert (gain["beat_chance"] + gain["tie_chance"] <= 1 + 1e-9).all()

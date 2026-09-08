@@ -20,7 +20,7 @@ from pathlib import Path
 
 import pandas as pd
 
-from .data import SQUAD_SIZE, Season
+from .data import CHIP_NAMES, SQUAD_SIZE, Season
 
 
 def selling_price_tenths(purchase_tenths: int, now_tenths: int) -> int:
@@ -59,6 +59,9 @@ class MySquad:
     captain_id: int | None = None
     vice_captain_id: int | None = None
     captain_multiplier: int = 2
+    # name and gameweek, because chips come in two halves and a wildcard played
+    # in GW5 says nothing about the one that opens at GW20
+    chips_played: tuple[tuple[str, int], ...] = ()
     _selling_prices: dict[int, int] = field(default_factory=dict, repr=False)
 
     def __post_init__(self):
@@ -355,9 +358,15 @@ def load_from_entry(season: Season, entry_id: int, gameweek: int | None = None) 
         except Exception:
             bank = None
 
+    # one fetch, two answers. Both read the same payload and it is a request
+    # per manager, which The field already makes expensive enough
+    history: dict = {}
+    with contextlib.suppress(Exception):
+        history = season.api.entry_history(int(entry_id)) or {}
+
     free = 1
     with contextlib.suppress(Exception):
-        free = _estimate_free_transfers(season.api.entry_history(int(entry_id)), gameweek)
+        free = _estimate_free_transfers(history, gameweek)
 
     return MySquad(
         player_ids=ids,
@@ -368,7 +377,28 @@ def load_from_entry(season: Season, entry_id: int, gameweek: int | None = None) 
         captain_id=captain,
         vice_captain_id=vice,
         captain_multiplier=max(multiplier, 2),
+        chips_played=chips_played(history),
     )
+
+
+def chips_played(history: dict) -> tuple[tuple[str, int], ...]:
+    """Which chips a manager has spent, and in which gameweek.
+
+    The gameweek is half the answer and not decoration. Chips come in two
+    halves, so a wildcard played in GW5 says nothing about the one available
+    from GW20, and anything storing only the names cannot tell those apart.
+
+    Chips the catalogue does not name are dropped rather than passed through,
+    since the only thing that can act on one is a matching window and there
+    would not be one.
+    """
+    played = []
+    for chip in history.get("chips") or []:
+        name = CHIP_NAMES.get(chip.get("name"))
+        event = chip.get("event")
+        if name is not None and event is not None:
+            played.append((name, int(event)))
+    return tuple(sorted(played, key=lambda c: c[1]))
 
 
 def merge_prices(squad: MySquad, saved: MySquad, season: Season | None = None) -> MySquad:

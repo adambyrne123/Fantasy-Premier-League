@@ -19,8 +19,13 @@ implies:
 - **Effective ownership.** If most of the field captains the same player,
   captaining him barely moves your rank whatever he scores.
 
-The first and the third need a rival or the field, which these two numbers do
-not have on their own. `ROADMAP.md` carries what that would take.
+The first and the third need a rival or the field, which the two numbers on
+`haul_frame` do not have on their own. `field_gain` is the answer to the third
+and half of the first: given how much of the field captains each player, it
+returns the chance you outscore their armband and what the choice is worth in
+points. The shares arrive as an argument, since this module may not import the
+thing that measures them. A single named rival is still unbuilt and is the
+easier problem, needing no sample at all; `ROADMAP.md` carries it.
 
 Goals and assists are independent Poissons on the same expected rates
 `component_rate` uses, drawn per fixture, so a double gameweek is a convolution
@@ -105,7 +110,7 @@ COLUMNS = [
     "credibility",
 ]
 
-__all__ = ["CHART_FLOOR", "COLUMNS", "HAUL_POINTS", "haul_frame", "points_pmf"]
+__all__ = ["CHART_FLOOR", "COLUMNS", "HAUL_POINTS", "field_gain", "haul_frame", "points_pmf"]
 
 
 def _poisson_head(rate: np.ndarray, highest: int = MAX_EVENTS) -> np.ndarray:
@@ -395,6 +400,81 @@ def haul_frame(
     # captain worth having is the one expected to score most, and sorting on
     # `haul_chance` would state a decision rule this model does not hold.
     return out.sort_values("xpts_gw", ascending=False)
+
+
+def field_gain(
+    season: Season,
+    projections: pd.DataFrame,
+    by_gameweek: pd.DataFrame,
+    shares: pd.Series,
+    player_ids: list[int] | None = None,
+    event: int | None = None,
+) -> pd.DataFrame:
+    """What each candidate is worth against what the field captains.
+
+    The question the projection cannot answer. Doubling a score means the
+    captain worth having is the one expected to score most, which is what
+    `haul_frame` ranks on, and it is the answer to a points objective rather
+    than to a rank one. Against the field, a captain sixty percent of it
+    already has moves you very little however well he does, and one nobody has
+    moves you a lot for the same score.
+
+    `shares` is how much of the field gave each player the armband, indexed by
+    player id, and it is an argument rather than an import on purpose. This
+    module is held to `data` and `projections` by a test, so the caller joins
+    the two: `elite.field_shares` produces `captain_share` and the front end
+    hands it over.
+
+    **The shares describe a gameweek that has been played.** Picks are not
+    published before a deadline, so this answers "against what the field
+    captained last week", which is a decent guide to next week and is not the
+    same question. Whatever displays it has to say which one it is answering.
+
+    Columns, indexed by `id`:
+
+    - `beat_chance`, the probability he outscores the field's armband
+    - `tie_chance`, the probability they land on the same score, which is large
+      enough to matter on a distribution this lumpy and is why the beat chance
+      of the field's own favourite is below a half rather than at it
+    - `expected_gain`, in points
+
+    `expected_gain` counts **one** copy of the difference, not two. An armband
+    is one extra copy of a player you already own, so between two managers with
+    the same fifteen the whole difference the choice makes is `yours - theirs`.
+    Doubling it would be right only against a rival who owns neither player,
+    which is a different and rarer question than this is answering.
+
+    Empty when the field is empty, or when nothing in it can be given a
+    distribution. The field is renormalised over the players that can be, which
+    are everyone with a minute of football behind them, so the mass lost is
+    players no manager captains anyway.
+    """
+    solved = _distribution(season, projections, by_gameweek, event)
+    if solved is None:
+        return pd.DataFrame(columns=["beat_chance", "tie_chance", "expected_gain"])
+    players, pmf, _ = solved
+
+    weights = pd.to_numeric(shares, errors="coerce").reindex(players.index).fillna(0.0)
+    weights = weights.clip(lower=0.0)
+    total = float(weights.sum())
+    if total <= 0:
+        return pd.DataFrame(columns=["beat_chance", "tie_chance", "expected_gain"])
+
+    field = (weights.to_numpy() / total) @ pmf
+    # everything below the candidate's score, so `beat` is strictly greater and
+    # a tie is counted on its own rather than being split down the middle
+    below = np.concatenate(([0.0], np.cumsum(field)[:-1]))
+
+    wanted = players.index if player_ids is None else [p for p in player_ids if p in players.index]
+    rows = players.index.get_indexer(wanted)
+    block = pmf[rows]
+
+    points = np.arange(pmf.shape[1], dtype="float64")
+    out = pd.DataFrame(index=pd.Index(wanted, name="id"))
+    out["beat_chance"] = block @ below
+    out["tie_chance"] = block @ field
+    out["expected_gain"] = block @ points - float(field @ points)
+    return out
 
 
 def points_pmf(

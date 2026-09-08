@@ -21,7 +21,18 @@ appearance + xG90 * goal points for his position + xA90 * 3
            - E[floor(goals conceded / 2)]              (keepers and defenders)
            + P(defensive contribution) * 2             (outfielders)
            - yellows90 - 3 * reds90
+           + bonus90
 ```
+
+**Bonus is read at the rate it was earned, not rebuilt.** It is paid off the
+bonus points system rather than off any category above, so there is nothing to
+rebuild it from, and leaving it out was a systematic understatement that grew
+with the blend weight. Measured three gameweeks into 2026/27 on players with
+180 minutes or more: the component sat 0.4 to 0.8 per 90 under the observed
+rate by position, and bonus per 90 was 0.22 for keepers, 0.25 for defenders,
+0.42 for midfielders and 0.54 for forwards, about half the gap. It sits behind
+the same weight and `credibility` as every other term, so the minutes cancel
+the same way and pre-season it contributes nothing.
 
 Clean sheet probability is the Poisson zero, `exp(-xGC per 90)`, on the club's
 rate rather than the player's. That is what stops a defender and a forward
@@ -195,6 +206,50 @@ the projection rests on the difficulty rating as it always did. A zero is
 treated as unrated rather than as a club with no attack, so one late-rated
 promoted club cannot divide the rest of the term by zero.
 
+**This season they stayed zero, and the term is rebuilt from expected goals
+when they do.** Checked on 2026-09-08, three gameweeks in: all four ratings
+read 0 for all twenty clubs, and `strength_overall_*` had become a 2 to 5
+scale rather than the 1000 to 1400 one the ratings used to share. So the
+continuous half of the fixture term had been dormant all season and nothing
+had noticed, because the fallback is designed to be silent.
+
+`club_strength` is the stand-in. Attack is the club's summed player
+`expected_goals` per 90 of its keepers' minutes: a shot is charged to one
+player, so summing is right here where it was wrong for conceded. Defence is
+the keepers' `expected_goals_conceded` per 90, the raw rate `team_defence_rate`
+starts from. Both are shrunk towards the unweighted league mean by
+`credibility` on keeper minutes, because an error here is correlated across a
+whole club, and on `CLUB_STRENGTH_MINUTES`, ten matches, rather than the three
+the clean sheet term uses for the same raw numbers.
+
+**The two scales differ because the two uses tolerate different errors.** The
+clean sheet term is bounded by the Poisson it feeds, so a club rate a third out
+costs a defender a fraction of a point. The fixture term multiplies every
+player at both clubs and was built around FPL ratings that sit within a fifth
+of the league mean. Measured on 2026-09-08 with the ratings shrunk on 270: the
+rebuilt attack ran from 0.79 to 2.55 goals per 90 and the defence from 0.31 to
+2.16, the product of the two ratios was clipped on 37% of fixtures and the
+average fixture came out at 1.12 rather than 1.0, which is the normalisation
+the headline number being points depends on. A club's expected goals per match
+after three games has a standard error near half its mean, so trusting it in
+full was the mistake rather than the clip. On 900 the same ratings sit within
+about a fifth of the mean and the average fixture is back near 1.0. `fill_strength` puts
+them into the fixture frame only where FPL's are absent, and all or nothing
+across the frame, because the two are on different scales and a column that
+mixed them would rate a club against a number that means something else. A
+conceding rate goes in inverted, since FPL's defence rating is higher-is-better
+and `strength_multiplier` divides by the opponent's. No home and away split.
+
+`strength_multiplier` is then unchanged: it normalises whichever set it is
+given to a league mean of one, so the headline number stays in points, and
+its clip is what bounds a club that is genuinely a mismatch. Measured on GW1
+to GW3 of 2026/27 with one or two matches behind each club the term was
+neutral to slightly positive, top fifty realised 3.75 to 3.85 and rank
+unchanged, which is what heavy shrinkage on a tiny sample should look like. It is kept because
+the alternative is no continuous signal at all, and `backtest --sweep
+STRENGTH_ALPHA` is the way to find out what it is worth once there is a
+sample.
+
 ## The minutes term
 
 **The minutes term must not be derived from minutes.** This is the trap the
@@ -212,6 +267,8 @@ expected role move independently. There is a test asserting the identity has not
 come back. If it fails, the minutes term has stopped doing anything.
 
 `points_per_90` blends last season and this season by `played / (played + 6)`.
+The minutes term blends by `played / (played + ROLE_SHRINKAGE_GAMES)`, which is
+2, and the difference is the subject of the role section below.
 Players with no Premier League history get a per-position fit of rate against
 price. That fallback is weak and is documented as weak. Do not present it as
 better than it is.
@@ -233,6 +290,33 @@ the starts came from. The published doubt and the availability cut multiply `A`
 and `B` together and leave `B / A` alone, so the identity survives them, and
 what is left over, `1 - start_chance - sub_chance`, is the chance a player does
 not feature at all.
+
+## The role, faster than the rate
+
+**This season's starts replace last season's three times faster than this
+season's points do.** `build_rates` has two blend weights: `weight_now` on
+`SHRINKAGE_GAMES` for the scoring rate and its rebuilt half, and
+`weight_role` on `ROLE_SHRINKAGE_GAMES` for the start mixture. They used to be
+one weight, and the argument for splitting them is that the two things being
+blended are not the same kind of evidence. A start is a decision a manager has
+already made, three times by GW3, and it persists. A scoring rate off the same
+three matches is a sample of something noisy, and leaning on last season for it
+is right.
+
+It was measured rather than argued. Rebuilding the season as of each of GW0 to
+GW2 of 2026/27 and scoring the projection for the following gameweek, with the
+rate weight held at 6: role weight 6 gave a rank correlation with realised
+points of 0.481, role 3 gave 0.511, role 2 gave 0.528 and role 1 gave 0.551,
+with the minutes term's correlation with realised minutes moving from 0.578 to
+0.684 across the same run. Holding the role at 6 and moving the rate weight to
+2 gave 0.474. So the whole of the gain is in the role, and none of it is in
+the rate. Two was chosen over one because one was best by a little on the
+smallest sample there will ever be, and `backtest --sweep ROLE_SHRINKAGE_GAMES`
+is the way to move it when there is more.
+
+Nothing else moves. `start_chance`, `sub_chance` and `starter_minutes` all fall
+out of the same `mix`, so `captaincy.py` sees the split for nothing and the
+mixture identity above still holds exactly.
 
 ## The credibility ramp
 
@@ -295,12 +379,31 @@ bar sits in roughly `[-1, 10]` however few minutes produced it, and the defcon
 term's badness is anti-correlated with its weight, which is a second thing the
 linear ramp buys and the concave form would not.
 
-**A new noise source, named but not fixed.** `team_defence_rate` has no gate of
-its own and never needed one, because its only consumer was gated. A club's
-conceding rate off one keeper's ninety minutes now reaches the projection, and
-that error is correlated across the twenty-odd players at that club rather than
-diversified away. It is bounded by the two club terms above and by the ramp.
-`ROADMAP.md` carries it.
+**The club rate gets the same ramp, for a reason the per-player terms do not
+have.** `team_defence_rate` had no gate of its own and never needed one, because
+its only consumer was gated. Once that gate became a ramp, a club's conceding
+rate off one keeper's ninety minutes could reach the projection, and unlike
+every other term that error is correlated across the twenty-odd players at that
+club rather than diversified away: an overstated defence moves five defenders
+the same way at once.
+
+So it is shrunk towards the league mean by `credibility` on the club's own
+keeper minutes, with `TEAM_DEFENCE_MINUTES` as the scale. Three matters:
+
+- **The scale is a club's minutes, not a player's.** A club banks ninety keeper
+  minutes per match however many players it fields, so 270 is three matches.
+  It is a separate constant from `COMPONENT_MINUTES` at the same value for the
+  same reason `PRIOR_MINUTES` is.
+- **Towards the league mean, not towards nothing.** `component_rate` fills an
+  absent defence with zero, which reads as no clean sheet points *and* no
+  concession charge. The average club is a better answer than that.
+- **The mean is unweighted.** Weighting the target by minutes would let the
+  clubs with the most football behind them set the number the short-sampled
+  clubs are pulled towards, which is the wrong way round.
+
+Measured on the real payload one match into 2026/27: eighteen clubs spread from
+0.20 to 3.87 per 90, all off ninety minutes each, shrinking to a range of 1.07
+to 2.30 with the league mean unmoved.
 
 **Where it can be worse than the old answer.** One case: a player who faced a
 promoted side at home in GW1 has an inflated rate, the ramp reads that as
@@ -386,15 +489,51 @@ reasons, and hearing only the first leaves the rest assumed away:
    `xg90`. So the one narrow claim that does hold, that the distribution's
    expected goals are `xg90 * minutes_share * multiplier` exactly, holds at and
    above the bar and is approximate below it.
-4. Bonus is in neither, which makes both understate, but it bites harder here
-   because the threshold is absolute. A forward's goal and assist is nine
-   points on this scale and twelve on the real one.
+4. Bonus is in the projection, read at the rate it was earned, and not in
+   the distribution, which has no rate to draw it from. So this understates
+   where the projection now does not, and it bites because the threshold is
+   absolute: a forward's goal and assist is nine points on this scale and
+   twelve on the real one.
 
 There is no cheap way to make them agree and the tempting expensive way is
 wrong. Scaling the rates by `w` is not the same claim as a player being `w`
 times as likely to score, and it would drag every haul chance towards zero in
 September, which is when the question is live. What can be said, and is, is the
 narrow true thing in the mixture paragraph above.
+
+## Measuring it
+
+**Every constant above can be scored, and `backtest.py` is how.** The
+bootstrap's season-to-date counters are exactly the sum of the per-gameweek
+figures in `event/{gw}/live/`, and `COUNTING_STATS` in `data.py` names them.
+So `as_of` rewinds a `Season` to how it stood after any played gameweek,
+`evaluate` projects the following one off that and reads it against what was
+scored, and `sweep` does it again at each value of a constant. Rank correlation
+is Spearman by ranking both sides and taking Pearson, because scipy is not in
+the deploy and is not going in for one function.
+
+What the rewind cannot do: availability, the published chance of playing,
+prices, set piece duty and ownership all read as they stand today, because the
+API keeps no history of them. Availability is opened up entirely, so a player
+injured at the time projects as fit, which is why every figure is given twice,
+over everyone and over those who played, and why bias over everyone is not the
+number to read. Rank correlation is, and then what the top fifty went on to
+score.
+
+Two baselines ride along and the model is always read against them. Last
+season's points over 38 is the identity `test_projection_is_not_just_last_seasons_points_over_38`
+guards against, and this season's points per game is the sort every
+spreadsheet does. Three gameweeks in the second out-ranked the model over the
+whole pool, 0.686 to 0.518, while the model's top fifty scored more, 3.80 to
+3.70, and the difference was the minutes term. That is what the role section
+above fixed.
+
+**A default argument that names a constant is bound at import.**
+`fixture_multiplier(weight=STRENGTH_WEIGHT)` was, and a sweep of
+`STRENGTH_WEIGHT` reported the same number at every value, which reads as a
+finding that the weight does not matter. It and `credibility` now read their
+constants at call time, and there is a test that a sweep of the weight moves
+the answer.
 
 ## Selection
 

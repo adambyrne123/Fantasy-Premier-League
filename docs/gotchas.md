@@ -101,6 +101,32 @@ Saturday. So an entry total is not an oracle for a live score, and the site's
 own live total is built from `event/{gw}/live/` client side, the same way this
 is.
 
+**FPL rewrites `position` on every pick at the audit, and the order it
+leaves is not the order the manager named.** An audited picks payload shows the
+lineup after its substitutions: the man who came on sits in the eleven and the
+man he replaced sits on the bench. Anything reading it as the named lineup is
+reading the answer, and `resolve_autosubs` handed that will correctly find
+nothing to do. Swapping each pair in `automatic_subs` back recovers who was
+named and not where, which matters the moment two idle starters share a
+position: GW3 2026/27 had exactly that and FPL took off the one the rewritten
+order puts second. `ROADMAP.md` carries the case.
+
+**A live payload cached mid-gameweek is not a settled gameweek, whatever its
+ttl says.** `live_{gw}` is written by the live tab every minute of a Saturday
+and the file left behind describes whenever the last poll happened. A month-long
+ttl on that key served a half-played GW1 to the backtest as though it were
+audited, 48 players short by a match. `FplApi.live_settled` reads the same
+endpoint under `live_{gw}_settled`, a key nothing writes until a caller asks
+about a gameweek `gameweeks_played` already covers, so its first write is
+post-audit by construction. Anything that wants a finished gameweek goes
+through it.
+
+**A player absent from a payload is absent, not nought.** Someone who joined in
+September has no row in the August live payloads. Summing per-gameweek frames
+as Series aligns him to NaN and a zero-fill then discards the gameweeks he did
+play. `backtest.as_of` stacks and sums with the gaps skipped, and the oracle in
+`tests/test_live_against_the_api.py` is what found it, on two players.
+
 **A month is ours, not FPL's, and it costs a request per manager.** There is no
 monthly endpoint and no monthly field anywhere in the API.
 `Season.gameweeks_in_month` defines a month by **deadline**, so a gameweek

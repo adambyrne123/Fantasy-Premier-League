@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import random
 from datetime import UTC, datetime, timedelta
+from typing import ClassVar
 
 import pandas as pd
 import pytest
@@ -167,6 +168,9 @@ class FakeApi:
                             "expected_assists": f"{minutes / 90 * xa90:.2f}"
                             if self.played
                             else "0.0",
+                            "expected_goal_involvements": f"{minutes / 90 * (xg90 + xa90):.2f}"
+                            if self.played
+                            else "0.0",
                             # charged only while the player was on the pitch, so
                             # a keeper's figure is his club's and an outfielder's
                             # is a fraction of it
@@ -256,12 +260,29 @@ class FakeApi:
                 fid += 1
         return fixtures
 
+    # The real catalogue, copied from the live bootstrap on 2026-08-23. Two of
+    # every chip, one per half, and wildcard and free hit unavailable in GW1.
+    # Written out rather than generated because the windows are the thing being
+    # tested and a generated pair would only prove the generator agrees with
+    # itself.
+    CHIP_CATALOGUE: ClassVar[list[dict]] = [
+        {"name": "wildcard", "start_event": 2, "stop_event": 19},
+        {"name": "wildcard", "start_event": 20, "stop_event": 38},
+        {"name": "freehit", "start_event": 2, "stop_event": 19},
+        {"name": "freehit", "start_event": 20, "stop_event": 38},
+        {"name": "bboost", "start_event": 1, "stop_event": 19},
+        {"name": "bboost", "start_event": 20, "stop_event": 38},
+        {"name": "3xc", "start_event": 1, "stop_event": 19},
+        {"name": "3xc", "start_event": 20, "stop_event": 38},
+    ]
+
     def bootstrap(self) -> dict:
         return {
             "teams": self._teams,
             "elements": self._elements,
             "events": self._events,
             "total_players": 9_000_000,
+            "chips": [dict(c) for c in self.CHIP_CATALOGUE],
         }
 
     def fixtures(self) -> list[dict]:
@@ -342,8 +363,30 @@ class FakeApi:
                 fixture["stats"] = []
         return rows
 
-    def live(self, gameweek: int) -> dict:
-        """Per-player totals for the gameweek, summed across his fixtures."""
+    def live(self, gameweek: int, ttl: int | None = None) -> dict:
+        """Per-player totals for the gameweek, summed across his fixtures.
+
+        A gameweek that has been played carries every counting stat, and each
+        one is the player's season total divided by the gameweeks played. That
+        keeps the identity the real API has and `backtest.as_of` relies on:
+        the bootstrap's figure is the sum of the live payloads. A gameweek
+        still to come is the in-play shape the live tests read instead.
+        """
+        if 1 <= gameweek <= self.played:
+            from fpl_manager.data import COUNTING_STATS
+
+            return {
+                "elements": [
+                    {
+                        "id": element["id"],
+                        "stats": {
+                            c: float(element.get(c) or 0) / self.played for c in COUNTING_STATS
+                        },
+                    }
+                    for element in self._elements
+                ]
+            }
+
         playing = set()
         for fixture in self.fixtures_for_event(gameweek):
             if fixture["started"]:
@@ -371,6 +414,10 @@ class FakeApi:
                 }
             )
         return {"elements": elements}
+
+    def live_settled(self, gameweek: int, ttl: int | None = None) -> dict:
+        """The audited payload, which for the fake is the same one."""
+        return self.live(gameweek)
 
     def event_status(self) -> dict:
         return {"status": [], "leagues": "Updated"}

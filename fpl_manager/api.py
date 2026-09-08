@@ -168,14 +168,34 @@ class FplApi:
             ttl=1800,
         )
 
-    def live(self, gameweek: int) -> dict:
+    def live(self, gameweek: int, ttl: int | None = None) -> dict:
         """Live points for every player in a gameweek. Short TTL by design.
 
         Stats are summed across a player's fixtures, so in a double gameweek
         this is the right source for what he has scored and the wrong one for
         anything decided per fixture. See `fixtures_for_event`.
+
+        The default minute suits a gameweek in progress. A caller reading a
+        gameweek FPL has already audited wants `live_settled` instead, and
+        not merely a longer ttl on this: the file behind this key may have
+        been written halfway through a Saturday, and a long ttl on it would
+        serve that half-played snapshot as though it were the audited
+        gameweek. Found that way, with 48 players short by a match.
         """
-        return self._get(f"event/{gameweek}/live/", key=f"live_{gameweek}", ttl=60)
+        return self._get(
+            f"event/{gameweek}/live/", key=f"live_{gameweek}", ttl=60 if ttl is None else ttl
+        )
+
+    def live_settled(self, gameweek: int, ttl: int = 30 * 24 * 3600) -> dict:
+        """The same payload for a gameweek FPL has finished processing.
+
+        Its own cache key, so it can never read the in-play poll's file. A
+        settled gameweek's figures do not change, so the first fetch under
+        this key is post-audit by construction and the month-long ttl is
+        safe on it. The caller is responsible for only asking about a
+        gameweek that `Season.gameweeks_played` covers.
+        """
+        return self._get(f"event/{gameweek}/live/", key=f"live_{gameweek}_settled", ttl=ttl)
 
     def fixtures_for_event(self, gameweek: int) -> list[dict]:
         """One gameweek's fixtures, carrying in-play stats once they kick off.

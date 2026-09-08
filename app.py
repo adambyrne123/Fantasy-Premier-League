@@ -18,8 +18,8 @@ import pandas as pd
 import streamlit as st
 
 from fpl_manager.api import FplApi
-from fpl_manager.captaincy import HAUL_POINTS, haul_frame, points_pmf
-from fpl_manager.chips import best_per_chip
+from fpl_manager.captaincy import HAUL_POINTS, field_gain, haul_frame, points_pmf
+from fpl_manager.chips import available_chips, best_per_chip
 from fpl_manager.chips import evaluate as evaluate_chips
 from fpl_manager.data import (
     FORMATIONS,
@@ -141,6 +141,14 @@ GLOSSARY = {
     "twice and a triple captain three times. At 1.5 his points land in every "
     "rival total one and a half times over, so a haul from him moves you far "
     "less than the score suggests.",
+    "beat_chance": "Chance he outscores whoever the field captained, on goals "
+    "and assists. The field's own favourite sits below half rather than at it, "
+    "because a tie is neither of you gaining and ties are common on a "
+    "distribution this lumpy.",
+    "expected_gain": "Points the armband is worth against the field, counting "
+    "one copy of the difference rather than two: a captain is one extra copy "
+    "of a player you already own, so between two managers with the same "
+    "fifteen that is the whole of what the choice changes.",
 }
 
 CACHE_TTL = 6 * 3600
@@ -497,6 +505,26 @@ def load_captaincy(
     return haul_frame(_season, projections, by_gameweek, event=event)
 
 
+@st.cache_data(show_spinner="Weighing the armband against the field")
+def load_field_gain(
+    _season: Season,
+    projections: pd.DataFrame,
+    by_gameweek: pd.DataFrame,
+    shares: pd.DataFrame,
+    event: int,
+    stamp: str,
+) -> pd.DataFrame:
+    """What each captain is worth against what the field captained.
+
+    The join `captaincy.py` is not allowed to make for itself: it may import
+    `data` and `projections` and nothing else, so the shares travel in as an
+    argument and this is where the two halves meet.
+    """
+    if shares.empty or "captain_share" not in shares.columns:
+        return pd.DataFrame()
+    return field_gain(_season, projections, by_gameweek, shares["captain_share"], event=event)
+
+
 @st.cache_data(show_spinner=False)
 def cached_month(
     _season: Season, table: pd.DataFrame, events: tuple[int, ...], stamp: str
@@ -620,14 +648,29 @@ def cached_chips(
     by_gameweek: pd.DataFrame,
     squad_ids: tuple[int, ...],
     budget_tenths: int,
+    windows: pd.DataFrame,
+    played: tuple[tuple[str, int], ...],
 ) -> pd.DataFrame:
     """Chip timing, cached because it is two solves per gameweek.
 
     Six seconds over a six week horizon, which is fine once and far too slow to
     sit behind a slider that re-runs the tab on every nudge. Takes the ids as a
     tuple so the cache can hash them.
+
+    `played` is in the key rather than the availability it implies, because a
+    dict of gameweeks is not hashable and the pairs are the smaller thing.
     """
-    return evaluate_chips(projections, by_gameweek, list(squad_ids), budget_tenths)
+    return evaluate_chips(
+        projections,
+        by_gameweek,
+        list(squad_ids),
+        budget_tenths,
+        available=available_chips(
+            windows,
+            played,
+            sorted(int(e) for e in by_gameweek["event"].unique()),
+        ),
+    )
 
 
 @st.cache_data(ttl=LIVE_MEMORY_TTL, show_spinner=False)
@@ -819,6 +862,12 @@ def pool_column_config(horizon: int, gw_cols: list[str], max_xpts: float) -> dic
         ),
         "effective_ownership": st.column_config.NumberColumn(
             "Effective own.", format="%.2f", **g("effective_ownership")
+        ),
+        "beat_chance": st.column_config.NumberColumn(
+            "Beats field", format="percent", **g("beat_chance")
+        ),
+        "expected_gain": st.column_config.NumberColumn(
+            "Gain vs field", format="%+.2f", **g("expected_gain")
         ),
     }
     for col in gw_cols:
@@ -2347,10 +2396,15 @@ with captain_tab:
                     {"captain_share": 0.0, "effective_ownership": 0.0}
                 )
                 captain_columns += ["captain_share", "effective_ownership"]
+                gain = load_field_gain(season, projections, by_gameweek, field, picked_gw, stamp)
+                if not gain.empty:
+                    shown = shown.join(gain[["beat_chance", "expected_gain"]])
+                    captain_columns += ["beat_chance", "expected_gain"]
                 field_note = (
-                    f" The last two columns are what {field_resolved} of the best managers "
+                    f" The field columns are what {field_resolved} of the best managers "
                     "did with the armband last gameweek, not what they will do with it "
-                    "next."
+                    "next, and the two against them are worked out on that same week's "
+                    "shares."
                 )
             st.caption(
                 f"Top {min(len(shown), 40)} of {len(shown)} by projected points for "
@@ -2650,9 +2704,10 @@ with fixtures_tab:
     st.caption("Club form, last five played")
     st.caption(
         "What each club has actually scored and conceded, with the scorelines behind it. "
-        "It is a record and it feeds nothing: the difficulty above already blends FPL's "
-        "attack and defence ratings, which move during the season off these same results, "
-        "so putting them into the projection as well would mostly count them twice."
+        "It is a record and it feeds nothing: the difficulty above already carries each "
+        "club's attack and defence, rebuilt from expected goals, and a scoreline is the "
+        "noisier version of the same matches, so putting it in as well would count them "
+        "twice with the worse measurement."
     )
     form_window = st.slider("Matches to look back over", 3, 10, 5, key="form_window")
     club_form = load_club_form(season, form_window, stamp)
@@ -2900,7 +2955,13 @@ with chips_tab:
         "gain falls the longer you leave it.\n\n"
         "The horizon bounds the answer. If the best week is beyond it the tool "
         "cannot see it, so widen the slider before trusting advice to play one "
-        "now. Nothing here knows which chips you have already used."
+        "now.\n\n"
+        "**Chips you have already played are left out, and there are two of "
+        "each.** FPL offers wildcard and free hit from gameweek 2 to 19 and "
+        "again from 20 to 38, and bench boost and triple captain the same way "
+        "from gameweek 1, so spending one in the first half leaves the second "
+        "half's untouched. Loading your entry is what makes this true; a squad "
+        "file says nothing about what you have spent."
     )
     st.caption(
         "Gain is what the chip adds on top of what your squad scores anyway, "
@@ -2916,7 +2977,14 @@ with chips_tab:
         # until My squad stopped calling st.stop() on the same squad this tab
         # was never reached to find out.
         try:
-            table = cached_chips(projections, by_gameweek, tuple(my_squad.player_ids), team_value)
+            table = cached_chips(
+                projections,
+                by_gameweek,
+                tuple(my_squad.player_ids),
+                team_value,
+                season.chip_windows,
+                my_squad.chips_played,
+            )
         except RuntimeError as exc:
             st.error(f"{exc}. There is nothing to price a chip against.")
             table = None

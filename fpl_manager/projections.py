@@ -33,7 +33,18 @@ PRIOR_CACHE = default_cache_dir() / "prior_season.parquet"
 # Refreshing it is 700 requests, which times out a cold Community Cloud boot.
 BUNDLED_PRIOR = Path(__file__).resolve().parent.parent / "prior_season.parquet"
 GAMES_IN_SEASON = 38
-SHRINKAGE_GAMES = 6.0  # gameweeks of current data needed to half-trust it
+SHRINKAGE_GAMES = 6.0  # gameweeks of current data needed to half-trust its scoring rate
+
+# The same question asked of his role, and answered much faster. A scoring
+# rate off three matches is a noisy sample of something that does not change
+# week to week, so it is right to lean on last season for a while. Whether he
+# starts is a decision his manager has already made three times, and it tends
+# to persist. Measured on GW1 to GW3 of 2026/27 with `backtest.py`: moving
+# this alone took the rank correlation with realised points from 0.48 to 0.53
+# and the minutes term's correlation with realised minutes from 0.58 to 0.65,
+# while moving `SHRINKAGE_GAMES` alone moved nothing. Two rather than one
+# because one was best by a little on the smallest sample there will ever be.
+ROLE_SHRINKAGE_GAMES = 2.0
 DIFFICULTY_ALPHA = 0.09  # points swing per unit of FDR away from average
 HOME_BONUS = 0.03
 
@@ -118,6 +129,27 @@ COMPONENT_MINUTES = 270
 # over, where no more evidence is coming and `_fill_missing_rates` is the
 # defined fallback. Named so the two cannot be quietly unified.
 PRIOR_MINUTES = 270
+
+# Keeper minutes behind a club before its own conceding rate is trusted in
+# full. Three matches, and the third constant to share the number 270 for a
+# third reason: this one scales a *club's* sample rather than a player's, and
+# a club only accumulates ninety of these per match however many players it
+# fields. Named apart for the same reason `PRIOR_MINUTES` is.
+TEAM_DEFENCE_MINUTES = 270
+
+# Keeper minutes behind a club before its expected goals, for and against,
+# are trusted in full as a fixture rating. Ten matches, and deliberately much
+# longer than `TEAM_DEFENCE_MINUTES` for the same raw numbers, because the
+# two uses tolerate different errors. The clean sheet term is bounded by the
+# Poisson it feeds, so a club rate a third out costs a defender a fraction of
+# a point. The fixture term multiplies every player at both clubs and was
+# built around ratings that sit between 0.8 and 1.2 of the league mean: at
+# 270 the rebuilt ratings spread from half the mean to nearly three times it,
+# the clip in `strength_multiplier` bit on 37% of fixtures and the average
+# fixture came out at 1.12 rather than 1.0, measured three gameweeks into
+# 2026/27. A club's expected goals per match after three games has a
+# standard error near half its mean, which is the arithmetic reason.
+CLUB_STRENGTH_MINUTES = 900
 
 
 def fetch_prior_season(season: Season, delay: float = 0.15) -> pd.DataFrame:
@@ -329,7 +361,7 @@ def _minutes_share(players: pd.DataFrame, start_rate: pd.Series, duration: pd.Se
     return _collapse(_start_mixture(players, start_rate, duration))
 
 
-def credibility(minutes: pd.Series) -> pd.Series:
+def credibility(minutes: pd.Series, scale: float | None = None) -> pd.Series:
     """How much of a usable sample this season's minutes are, nought to one.
 
     The projection used to gate on `COMPONENT_MINUTES`, which meant a player
@@ -353,9 +385,17 @@ def credibility(minutes: pd.Series) -> pd.Series:
     It is a weight and not a guard, and reading it as a guard is how August
     goes wrong. Pre-season the API serves last season's minutes, so this is one
     for everybody. What protects the model then is `weight_now` being zero.
+
+    `scale` is here so `team_defence_rate` can use the same ramp on a club's
+    minutes rather than growing a second copy of it. Everything above about the
+    shape of the fade applies whatever it is measuring. It defaults to
+    `COMPONENT_MINUTES` at call time rather than in the signature, so that a
+    `backtest.sweep` of the constant moves every use of it and not just the
+    ones that pass it explicitly.
     """
+    scale = COMPONENT_MINUTES if scale is None else scale
     minutes = pd.to_numeric(minutes, errors="coerce").fillna(0.0)
-    return (minutes / COMPONENT_MINUTES).clip(0.0, 1.0)
+    return (minutes / scale).clip(0.0, 1.0)
 
 
 def team_defence_rate(players: pd.DataFrame) -> pd.Series:
@@ -366,21 +406,83 @@ def team_defence_rate(players: pd.DataFrame) -> pd.Series:
     Summing outfielders instead would count the same goals once per defender
     and give a number several times too large.
 
+    Shrunk towards the league mean by how much football is behind it, because
+    a club's own rate off one match is noise and this is the one term whose
+    error does not wash out across a squad: every defender at a club reads the
+    same number, so an overstated defence moves five players the same way at
+    once rather than being diversified away.
+
+    Measured on 2026-08-23, one match into the season: eighteen clubs with
+    rates from 0.20 to 3.87 per 90, all off ninety keeper minutes each. The
+    gate that used to make that harmless was `component_rate` being barred
+    below 270 player minutes. That is a ramp now, so a third of a rate like
+    3.87 would otherwise reach every defender at that club in week two.
+
+    Shrunk towards the league mean rather than dropped, because `component_rate`
+    fills an absent defence with zero, which reads as no clean sheet points and
+    no concession charge at all. The average club is a better answer than that.
+
     Empty when nobody has the column or nobody has played, which is what
     pre-season looks like, and callers treat that as unknown rather than as a
     league of clubs that concede nothing.
     """
-    if "expected_goals_conceded" not in players.columns:
-        return pd.Series(dtype="float64")
+    rate, minutes = _club_rates(_keepers(players), "expected_goals_conceded")
+    return _shrink_to_league(rate, minutes, TEAM_DEFENCE_MINUTES)
+
+
+def _keepers(players: pd.DataFrame) -> pd.DataFrame:
+    """The rows a club's conceding figures have to be read from.
+
+    `expected_goals_conceded` is charged to every player on the pitch, so
+    summing it over a squad counts the same goals once per defender. The
+    keeper is on the pitch for all of it and for nobody else's share.
+    """
+    if "position" not in players.columns:
+        return players.iloc[0:0]
+    return players[players["position"] == "GKP"]
+
+
+def _club_rates(players: pd.DataFrame, column: str) -> tuple[pd.Series, pd.Series]:
+    """A counting stat summed per club, per 90 of the club's keeper minutes.
+
+    Comes back with the minutes beside the rate, since the shrinkage reads
+    them. Empty when the column is absent or nobody has played, and every
+    consumer treats that as unknown rather than as a league of nothing.
+
+    The keepers' minutes are the club's minutes: ninety per match however
+    many players it fields. What is summed over depends on the column and is
+    the caller's decision, so this sums over every row it is handed. Expected
+    goals are charged to one player per shot and want the whole squad;
+    expected goals conceded are charged to everyone on the pitch and want
+    `_keepers` first, or the same goals are counted once per defender.
+    """
+    empty = pd.Series(dtype="float64")
+    if column not in players.columns or "position" not in players.columns:
+        return empty, empty
 
     keepers = players[players["position"] == "GKP"]
-    conceded = pd.to_numeric(keepers["expected_goals_conceded"], errors="coerce").fillna(0.0)
     minutes = pd.to_numeric(keepers["minutes"], errors="coerce").fillna(0.0)
+    keeper_minutes = minutes.groupby(keepers["team"]).sum()
+    counted = pd.to_numeric(players[column], errors="coerce").fillna(0.0)
+    by_club = counted.groupby(players["team"]).sum().reindex(keeper_minutes.index).fillna(0.0)
 
-    by_club = pd.DataFrame({"team": keepers["team"], "xgc": conceded, "minutes": minutes})
-    totals = by_club.groupby("team")[["xgc", "minutes"]].sum()
-    rate = totals["xgc"] / (totals["minutes"] / 90)
-    return rate.replace([np.inf, -np.inf], np.nan).dropna()
+    rate = (by_club / (keeper_minutes / 90)).replace([np.inf, -np.inf], np.nan).dropna()
+    return rate, keeper_minutes.reindex(rate.index)
+
+
+def _shrink_to_league(rate: pd.Series, minutes: pd.Series, scale: float) -> pd.Series:
+    """A club rate pulled towards the league mean by how much football is behind it.
+
+    The mean is over the clubs that have played, which is the only league to
+    compare against, and it is unweighted: weighting it by minutes would let
+    the clubs with the most football set the target the short-sampled clubs
+    are being pulled towards, which is the wrong way round.
+    """
+    if rate.empty:
+        return rate
+    league = float(rate.mean())
+    cred = credibility(minutes, scale)
+    return cred * rate + (1 - cred) * league
 
 
 def _per_90(
@@ -515,6 +617,7 @@ def component_rate(players: pd.DataFrame, defence: pd.Series | None = None) -> p
                    - goals conceded charged in twos
                    + P(defensive contribution) * 2
                    - cards
+                   + bonus per 90
 
     Clean sheet probability is the Poisson zero, `exp(-xGC per 90)`, on the
     club's rate rather than the player's. The opponent adjustment deliberately
@@ -592,11 +695,20 @@ def component_rate(players: pd.DataFrame, defence: pd.Series | None = None) -> p
     cards = _per_90(players, "yellow_cards", ninetieths, played_enough) * YELLOW_CARD_POINTS
     cards = cards + _per_90(players, "red_cards", ninetieths, played_enough) * RED_CARD_POINTS
 
+    # Bonus is already points, awarded off the bonus points system rather than
+    # off any one category above, so it cannot be rebuilt from them and is
+    # read at the rate it was earned. Leaving it out was a systematic
+    # understatement that grew with the blend weight: measured three
+    # gameweeks into 2026/27, the component sat 0.4 to 0.8 per 90 below the
+    # observed rate by position and bonus was about half of that gap, and it
+    # is largest for exactly the players the armband question is about.
+    bonus = _per_90(players, "bonus", ninetieths, played_enough)
+
     rate = APPEARANCE_POINTS + xg90 * goal_points + xa90 * ASSIST_POINTS
     rate = rate + clean_sheet.fillna(0.0) + conceded.fillna(0.0)
     # every penalty is filled rather than left NaN, so a club with no conceding
     # rate is charged nothing instead of taking the whole player out
-    rate = rate + save_points.fillna(0.0) + defcon.fillna(0.0) + cards.fillna(0.0)
+    rate = rate + save_points.fillna(0.0) + defcon.fillna(0.0) + cards.fillna(0.0) + bonus
 
     # Set piece duty adjusts a rate, it does not make one. Someone who has not
     # played has no expected goals and no minutes to divide by, and calling the
@@ -614,6 +726,8 @@ def build_rates(season: Season, prior: pd.DataFrame | None = None) -> pd.DataFra
     p = season.players
     played = season.gameweeks_played
     weight_now = played / (played + SHRINKAGE_GAMES) if played else 0.0
+    # the role is trusted faster than the rate, see `ROLE_SHRINKAGE_GAMES`
+    weight_role = played / (played + ROLE_SHRINKAGE_GAMES) if played else 0.0
 
     out = pd.DataFrame(index=p.index)
     out["name"] = p["name"]
@@ -693,8 +807,8 @@ def build_rates(season: Season, prior: pd.DataFrame | None = None) -> pd.DataFra
     if played:
         now_start_rate, now_duration = _role(p["starts"], p["minutes"], played, p.index)
         now_mix = _start_mixture(out, now_start_rate, now_duration)
-        mix = weight_now * now_mix + (1 - weight_now) * prior_mix
-        share = weight_now * _collapse(now_mix) + (1 - weight_now) * prior_share
+        mix = weight_role * now_mix + (1 - weight_role) * prior_mix
+        share = weight_role * _collapse(now_mix) + (1 - weight_role) * prior_share
     else:
         mix = prior_mix
         share = prior_share
@@ -770,11 +884,103 @@ def strength_multiplier(fixtures: pd.DataFrame) -> pd.Series:
     return (attack * defence).clip(STRENGTH_FLOOR, STRENGTH_CEILING)
 
 
+def club_strength(players: pd.DataFrame) -> pd.DataFrame:
+    """Each club's attack and defence, rebuilt from this season's expected goals.
+
+    Columns `attack` and `defence`, both goals per 90 and both indexed by
+    club id, so a bigger attack is better and a bigger defence is worse. The
+    stand-in for FPL's own attack and defence ratings, which the fixture term
+    was built around and which have been published as zero for every club
+    all season. Checked on 2026-09-08, three gameweeks in: every one of the
+    four ratings read 0 for all twenty clubs, and `strength_overall_*` had
+    become a 2 to 5 scale rather than the 1000 to 1400 one the ratings used
+    to share. Without something in their place the continuous half of the
+    fixture term is dormant and the projection rests on the 1 to 5 rating
+    alone.
+
+    Attack is the sum of the club's players' expected goals per 90 of its
+    keepers' minutes. Summing players is right here where it was wrong for
+    conceded: a shot is charged to one player, so the club's total is the sum,
+    while `expected_goals_conceded` is charged to everyone on the pitch and
+    has to be read off the keeper. Defence is that keeper reading, the same
+    raw rate `team_defence_rate` starts from.
+
+    Both are shrunk towards the unweighted league mean by `credibility` on
+    the club's keeper minutes, on `CLUB_STRENGTH_MINUTES` rather than the
+    scale the clean sheet term uses, and the constant says why: this is a
+    multiplier on every player at both clubs, built around ratings that sit
+    within a fifth of the league mean, and three matches of expected goals
+    are nowhere near that precise. An error here is correlated across a
+    whole club rather than diversified away, which is the same reason the
+    defence rate is shrunk at all.
+
+    Empty before anybody has played, which is August, and callers read that
+    as no rating rather than as a league of clubs with no attack. That keeps
+    the pre-season fixture term what it always was.
+    """
+    if not {"expected_goals", "expected_goals_conceded", "team", "position"} <= set(
+        players.columns
+    ):
+        return pd.DataFrame(columns=["attack", "defence"], dtype="float64")
+
+    scored, minutes = _club_rates(players, "expected_goals")
+    # conceded off the keepers alone, or every defender's share of the same
+    # goals is added back in and a club reads as conceding six times over
+    conceded, _ = _club_rates(_keepers(players), "expected_goals_conceded")
+    if scored.empty or conceded.empty:
+        return pd.DataFrame(columns=["attack", "defence"], dtype="float64")
+
+    return pd.DataFrame(
+        {
+            "attack": _shrink_to_league(scored, minutes, CLUB_STRENGTH_MINUTES),
+            "defence": _shrink_to_league(conceded, minutes, CLUB_STRENGTH_MINUTES),
+        }
+    ).dropna()
+
+
+STRENGTH_COLUMNS = ("attack_for", "defence_for", "attack_against", "defence_against")
+
+
+def fill_strength(fixtures: pd.DataFrame, clubs: pd.DataFrame) -> pd.DataFrame:
+    """Put the rebuilt club ratings where FPL's are absent, and only there.
+
+    All or nothing across the frame. FPL's ratings and ours are on different
+    scales, so mixing them in one column would rate a club against a number
+    that means something else. If any fixture carries a published rating the
+    frame is left alone and FPL's view wins; the fill happens only when every
+    rating is missing, which is the state the whole of 2026/27 has been in so
+    far. `strength_multiplier` then normalises whichever set it is given to a
+    league mean of one, so the headline number stays in points either way.
+
+    FPL's defence rating is higher-is-better and `strength_multiplier` divides
+    by the opponent's, so a conceding rate goes in inverted. No home and away
+    split, since one season's expected goals do not support one.
+    """
+    if clubs.empty or not {"team", "opponent"} <= set(fixtures.columns):
+        return fixtures
+
+    present = [c for c in STRENGTH_COLUMNS if c in fixtures.columns]
+    if present:
+        rated = fixtures[present].apply(pd.to_numeric, errors="coerce")
+        if (rated > 0).any().any():
+            return fixtures
+
+    attack = clubs["attack"]
+    defence = (1.0 / clubs["defence"]).where(clubs["defence"] > 0)
+
+    filled = fixtures.copy()
+    filled["attack_for"] = filled["team"].map(attack).astype("float64")
+    filled["defence_for"] = filled["team"].map(defence).astype("float64")
+    filled["attack_against"] = filled["opponent"].map(attack).astype("float64")
+    filled["defence_against"] = filled["opponent"].map(defence).astype("float64")
+    return filled
+
+
 def fixture_multiplier(
     difficulty: pd.Series,
     is_home: pd.Series,
     strength: pd.Series | None = None,
-    weight: float = STRENGTH_WEIGHT,
+    weight: float | None = None,
 ) -> pd.Series:
     """Convert a fixture's difficulty into a scaling factor.
 
@@ -785,7 +991,12 @@ def fixture_multiplier(
     Where ratings exist the two are blended. Keeping some of the difficulty
     rating is deliberate: FPL sets it by hand and it sometimes carries a view
     on a fixture that the season-long ratings have not caught up with.
+
+    `weight` defaults to `STRENGTH_WEIGHT` at call time rather than in the
+    signature, because a default is bound when the module loads and a sweep
+    that reassigns the constant would then be sweeping nothing. Found that way.
     """
+    weight = STRENGTH_WEIGHT if weight is None else weight
     base = 1.0 + (3 - difficulty) * DIFFICULTY_ALPHA
 
     if strength is not None and weight:
@@ -820,7 +1031,9 @@ def project(
         rates["xpts_next"] = 0.0
         return rates, pd.DataFrame(columns=["id", "event", "xpts"])
 
-    fixtures = fixtures.copy()
+    # FPL's own ratings where it publishes them, ours rebuilt from expected
+    # goals where it does not, which this season is everywhere
+    fixtures = fill_strength(fixtures.copy(), club_strength(season.players))
     fixtures["strength"] = strength_multiplier(fixtures)
     fixtures["multiplier"] = fixture_multiplier(
         fixtures["difficulty"], fixtures["is_home"], fixtures["strength"]

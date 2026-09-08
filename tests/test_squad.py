@@ -297,3 +297,39 @@ def test_load_squad_prefers_the_entry_when_it_can_be_read(tmp_path, season: Seas
 def test_load_squad_needs_one_source_or_the_other(season: Season):
     with pytest.raises(ValueError):
         load_squad(season)
+
+
+def test_the_chips_you_have_played_come_back_with_the_entry():
+    """The API spells them `bboost` and `3xc`, and the gameweek matters as much
+    as the name: chips come in two halves and only the half you spent is
+    gone."""
+    from .conftest import FakeApi
+
+    class WithChips(FakeApi):
+        def entry_picks(self, entry_id: int, gameweek: int) -> dict:
+            return {"picks": _picks(list(range(1, 16))), "entry_history": {"bank": 0}}
+
+        def entry_history(self, entry_id: int) -> dict:
+            return {
+                "current": [],
+                "chips": [
+                    {"name": "3xc", "event": 12, "time": "2026-11-01T10:00:00Z"},
+                    {"name": "bboost", "event": 4, "time": "2026-09-01T10:00:00Z"},
+                    {"name": "assistant_manager", "event": 7},
+                ],
+            }
+
+    squad = load_from_entry(Season(WithChips(played=12)), entry_id=1234567)
+
+    assert squad.chips_played == (("bench_boost", 4), ("triple_captain", 12)), (
+        "mapped to our names and ordered by when they were spent"
+    )
+
+
+def test_a_squad_file_says_nothing_about_chips(season: Season, tmp_path, owned):
+    """Only an entry knows this, the same way only an entry knows the armband.
+    An empty tuple has to mean unknown rather than none spent."""
+    path = tmp_path / "squad.json"
+    path.write_text(json.dumps({"players": owned}), encoding="utf-8")
+
+    assert load_squad_file(path, season).chips_played == ()

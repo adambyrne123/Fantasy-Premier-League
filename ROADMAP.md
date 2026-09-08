@@ -18,6 +18,9 @@ attack and defence ratings. The rate is part observed and part rebuilt from
 expected goals, expected assists and a Poisson clean sheet chance, so a defender
 and a forward no longer collapse into the same number.
 
+The projection is scored against every gameweek that has been played, each
+rebuilt from the week before, and any constant can be swept.
+
 Transfers are planned across up to four gameweeks in a single MILP. All four
 chips are priced per gameweek. A live tab scores your squad while matches are
 being played, including provisional bonus and automatic substitutions. Two front
@@ -56,8 +59,20 @@ What is left:
 - **Run it once GW1 is audited.** The four tests that read the entry payload
   skip until `finished` is true across the gameweek, so they have never run
   green under their own gate. `uv run pytest -m network` is the whole job.
-- **A gameweek with a real automatic substitution in it.** GW1 needed none, so
-  the substitution comparison has so far only agreed that nothing happened.
+- **A gameweek with a real automatic substitution in it, and now there has
+  been one, and it disagrees.** GW3 2026/27 for entry 3921945: two defenders
+  in the eleven on nought minutes, O'Reilly and Senesi, one midfielder on the
+  bench who played, and FPL took off Senesi where `resolve_autosubs` takes off
+  O'Reilly. The audited payload cannot settle it, because FPL rewrites every
+  pick's `position` when it processes the gameweek, so the order the manager
+  actually named is gone and O'Reilly reading first may be the rewrite rather
+  than the lineup. The network test swaps each substituted pair back to
+  recover who was named, and skips with the facts when two idle starters
+  share a position, since that is the one case the swap cannot place.
+  Settling it needs a picks payload saved before the audit, which the live
+  tab fetches every hour and nothing keeps: a copy under a key that is never
+  refetched, written the first time a gameweek is read after its deadline,
+  would do it.
 - **A double gameweek.** The case most likely to be wrong, where the
   per-fixture and summed bonus figures diverge, and the one thing GW1 could not
   prove. The check finds its own gameweek, so it starts covering this the first
@@ -80,29 +95,21 @@ id gives the real bench order and the real armband.
 
 ### Model
 
-**Captaincy against the field, rather than against the scoring table.** The
-Captain tab ranks on projected points, which is the right answer under a points
-objective and is not the question most managers are actually asking. What
-decides a season is rank, and against a rival the useful number is the chance
-you finish above him, which depends on what he captains as much as on what you
-do. A captain sixty percent of the field already has moves your rank very little
-however well he does.
+**A single named rival, rather than the whole field.** Captaincy against the
+field is built: `captaincy.field_gain` mixes the field's distributions under
+`elite.field_shares`'s `captain_share` and returns the chance you outscore their
+armband and what the choice is worth in points, and the Captain tab shows both.
+The shares arrive as an argument, since `captaincy.py` may not import `elite`.
 
-The blocker is gone. This used to say that the API gives ownership but not
-captaincy, so a model of the field would have to rest on ownership raised to
-some power set by eye. `elite.py` measures it instead: a hundred squads say who
-was captained and what effective ownership was, and the Captain tab already
-shows both. What is left is the arithmetic, which is convolving your
-distribution against the field's the way a double gameweek is already convolved,
-and `captaincy.py` produces the distributions for it.
+What is left is the easier half, which needs no sample at all: one rival read
+through `leagues.py`, where the useful number is the chance you finish above him
+and it depends on what he captains rather than on what a hundred managers did.
 
-Two things to know before starting. `captaincy.py` is held to importing `data`
-and `projections` only, so the shares go in as an argument rather than as an
-import, and there is a test that fails if that is done the other way. And the
-shares describe the gameweek just gone: last week's armband is a decent guide to
-next week's and it is not the same question, so whatever uses them has to say
-which one it is answering. A single named rival through `leagues.py` is still
-the easier first version, since it needs no sample at all.
+Two things the built version cannot fix and a rival version inherits. The shares
+describe the gameweek just gone, because picks are not published before a
+deadline, so this answers what the field captained last week rather than what it
+will captain next; the caption says so. And it is goals and assists only, like
+everything else `captaincy.py` produces, so for a defender it understates.
 
 **Position-specific scoring is complete, with two loose ends.**
 `component_rate` now covers every category FPL pays for.
@@ -132,13 +139,18 @@ rather than a modelling problem. Note the refetch would become mandatory rather
 than advisable, since `build_rates` backfills absent prior columns with NaN and
 a stale parquet would silently not blend.
 
-**`team_defence_rate` has no gate.** It never needed one: its only consumer was
-`component_rate`, which was gated at 270 minutes, so a club rate off one
-keeper's ninety minutes could not reach anything. Now that the gate is a ramp it
-can. It is bounded by the clean sheet and conceded terms and by the ramp itself,
-but unlike the per-player terms the error is correlated across every player at
-that club rather than diversified away, so it does not wash out across a squad.
-The fix is presumably the same credibility treatment on the club's minutes.
+**The defensive contribution term is still a threshold estimated from a mean,
+and the club rate now is not.** `team_defence_rate` is shrunk towards the league
+mean by `credibility` on the club's own keeper minutes, which was the open item
+here: measured one match into 2026/27 the raw rates ran from 0.20 to 3.87 per
+90, all off ninety minutes, and every defender at a club reads the same number
+so that error does not wash out across a squad. `docs/model.md` carries the
+reasoning, including why the target mean is unweighted.
+
+What that does not fix is the shrinkage target itself. The league mean is the
+only stable thing available with no history loaded, and last season's conceding
+rate per club would be better. It is blocked on the same parquet the captaincy
+shrinkage target is: `fetch_prior_season` stores nothing about clubs at all.
 
 **`FakeApi` is kinder pre-season than the real payload.** It zeroes `minutes`,
 `expected_goals` and the counting stats when `played=0`, and the API does not:
@@ -148,6 +160,21 @@ the guard works, unless it writes the stale values in itself.
 `test_the_new_scoring_terms_are_inert_before_the_first_deadline` does. A
 `stale_preseason` flag on the fixture would fix it at the source, and it
 reparametrises a fixture every test depends on, so it is its own piece of work.
+
+**Constants to revisit with the backtest once there is a sample.**
+`fpl-manager backtest --sweep` exists now, and three gameweeks in it had
+nothing to say about `DIFFICULTY_ALPHA`, `START_RATE_TRUST` or `STRENGTH_ALPHA`
+either way. Around GW8 there will be enough to read. `ROLE_SHRINKAGE_GAMES`
+was set to 2 off three weeks where 1 was best by a little, and is the first to
+re-check. The rebuilt club strength term was neutral at one or two matches per
+club and should either earn its place or go.
+
+**Bonus is in the projection and not the haul distribution.** `component_rate`
+reads it at the rate it was earned. `captaincy.py` has no rate to draw a bonus
+from, so its haul chance understates where the projection now does not, and
+the gap is largest for exactly the players the tab is about. A bonus
+distribution conditional on the goals and assists already drawn is the shape
+of the fix, and it is a separate piece of work.
 
 **Set piece constants are guesses.** `PENALTY_XG_P90` and `FREEKICK_XG_P90` are
 set by eye against how many spot kicks a season produces, not fitted. Only
@@ -160,11 +187,21 @@ the mean linearly and the chance of two goals roughly quadratically.
 ### Planning and chips
 
 **Chips are advisory and independent.** All four are priced per gameweek across
-the horizon, wildcard over every remaining gameweek since you keep the squad.
-Missing: planning two chips together, any sense of a chip being worth saving for
-a gameweek beyond the horizon, and the assistant manager chip. Nothing reads
-which chips you have already used, either. `evaluate()` takes a `chips` tuple,
-but it is a caller-supplied filter and nothing populates it from the API.
+the horizon, wildcard over every remaining gameweek since you keep the squad,
+and what you have already spent is now read off your entry and left out.
+
+That turned out to be a bigger question than "which have I used". The bootstrap
+publishes a chip catalogue nobody was parsing, and it says there are **two of
+every chip**, one per half: wildcard and free hit from gameweek 2 to 19 and
+again from 20 to 38, bench boost and triple captain the same way from gameweek
+1. So availability is a question about a gameweek rather than about a season,
+which is what `chips.available_chips` answers, and `Season.chip_windows` is the
+catalogue. It also says wildcard and free hit cannot be played in gameweek 1 at
+all, which nothing knew and which was being priced anyway.
+
+Still missing: planning two chips together, any sense of a chip being worth
+saving for a gameweek beyond the horizon, and the assistant manager chip, which
+is absent from the catalogue this season and so cannot be priced off it.
 
 **Planning stops at four gameweeks.** `MAX_PLAN_WEEKS` is 4 because three weeks
 solves in about 0.7s and four in about 1.5s, but five jumps to five or six, past
@@ -308,15 +345,15 @@ live work will drift towards this if allowed to.
 better XI than FPL actually will, which is a wrong answer stated confidently, and
 it would import the optimiser into `live.py`, which has to stay a leaf.
 
-**Recent club form as a term in the fixture multiplier.** `Season.club_form`
-counts what each club has scored and conceded lately and the Fixtures tab shows
-it, and it deliberately feeds nothing. `strength_multiplier` already blends
-FPL's attack and defence ratings, which are continuous, separate for home and
-away, and move during the season off these same results, so putting the results
-in again would mostly count them twice. It would also need a weight, and there
-is nothing to fit one against. If this is revisited, the case to make is that
-the published ratings lag the results rather than that recent form is
-informative, and it should be measured before it is written.
+**Recent club form, as scorelines, in the fixture multiplier.**
+`Season.club_form` counts what each club has scored and conceded lately and the
+Fixtures tab shows it, and it deliberately feeds nothing. The fixture term now
+carries a continuous club rating rebuilt from expected goals, since FPL's own
+ratings have been zero all season, and scorelines are the noisy version of the
+same information: a club that scored three off one expected goal has been lucky
+rather than good. Putting them in as well would count the same matches twice
+with the worse measurement. The rebuilt rating is the thing to tune, with
+`backtest --sweep STRENGTH_ALPHA`, not to duplicate.
 
 **Tableau or any BI tool**, a static page from a scheduled GitHub Action, and a
 FastAPI plus JS front end. All three were ruled out when Streamlit was chosen;
