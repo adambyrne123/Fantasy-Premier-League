@@ -2704,9 +2704,10 @@ with fixtures_tab:
     st.caption("Club form, last five played")
     st.caption(
         "What each club has actually scored and conceded, with the scorelines behind it. "
-        "It is a record and it feeds nothing: the difficulty above already blends FPL's "
-        "attack and defence ratings, which move during the season off these same results, "
-        "so putting them into the projection as well would mostly count them twice."
+        "It is a record and it feeds nothing: the difficulty above already carries each "
+        "club's attack and defence, rebuilt from expected goals, and a scoreline is the "
+        "noisier version of the same matches, so putting it in as well would count them "
+        "twice with the worse measurement."
     )
     form_window = st.slider("Matches to look back over", 3, 10, 5, key="form_window")
     club_form = load_club_form(season, form_window, stamp)

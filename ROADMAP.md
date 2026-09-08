@@ -18,6 +18,9 @@ attack and defence ratings. The rate is part observed and part rebuilt from
 expected goals, expected assists and a Poisson clean sheet chance, so a defender
 and a forward no longer collapse into the same number.
 
+The projection is scored against every gameweek that has been played, each
+rebuilt from the week before, and any constant can be swept.
+
 Transfers are planned across up to four gameweeks in a single MILP. All four
 chips are priced per gameweek. A live tab scores your squad while matches are
 being played, including provisional bonus and automatic substitutions. Two front
@@ -56,8 +59,20 @@ What is left:
 - **Run it once GW1 is audited.** The four tests that read the entry payload
   skip until `finished` is true across the gameweek, so they have never run
   green under their own gate. `uv run pytest -m network` is the whole job.
-- **A gameweek with a real automatic substitution in it.** GW1 needed none, so
-  the substitution comparison has so far only agreed that nothing happened.
+- **A gameweek with a real automatic substitution in it, and now there has
+  been one, and it disagrees.** GW3 2026/27 for entry 3921945: two defenders
+  in the eleven on nought minutes, O'Reilly and Senesi, one midfielder on the
+  bench who played, and FPL took off Senesi where `resolve_autosubs` takes off
+  O'Reilly. The audited payload cannot settle it, because FPL rewrites every
+  pick's `position` when it processes the gameweek, so the order the manager
+  actually named is gone and O'Reilly reading first may be the rewrite rather
+  than the lineup. The network test swaps each substituted pair back to
+  recover who was named, and skips with the facts when two idle starters
+  share a position, since that is the one case the swap cannot place.
+  Settling it needs a picks payload saved before the audit, which the live
+  tab fetches every hour and nothing keeps: a copy under a key that is never
+  refetched, written the first time a gameweek is read after its deadline,
+  would do it.
 - **A double gameweek.** The case most likely to be wrong, where the
   per-fixture and summed bonus figures diverge, and the one thing GW1 could not
   prove. The check finds its own gameweek, so it starts covering this the first
@@ -145,6 +160,21 @@ the guard works, unless it writes the stale values in itself.
 `test_the_new_scoring_terms_are_inert_before_the_first_deadline` does. A
 `stale_preseason` flag on the fixture would fix it at the source, and it
 reparametrises a fixture every test depends on, so it is its own piece of work.
+
+**Constants to revisit with the backtest once there is a sample.**
+`fpl-manager backtest --sweep` exists now, and three gameweeks in it had
+nothing to say about `DIFFICULTY_ALPHA`, `START_RATE_TRUST` or `STRENGTH_ALPHA`
+either way. Around GW8 there will be enough to read. `ROLE_SHRINKAGE_GAMES`
+was set to 2 off three weeks where 1 was best by a little, and is the first to
+re-check. The rebuilt club strength term was neutral at one or two matches per
+club and should either earn its place or go.
+
+**Bonus is in the projection and not the haul distribution.** `component_rate`
+reads it at the rate it was earned. `captaincy.py` has no rate to draw a bonus
+from, so its haul chance understates where the projection now does not, and
+the gap is largest for exactly the players the tab is about. A bonus
+distribution conditional on the goals and assists already drawn is the shape
+of the fix, and it is a separate piece of work.
 
 **Set piece constants are guesses.** `PENALTY_XG_P90` and `FREEKICK_XG_P90` are
 set by eye against how many spot kicks a season produces, not fitted. Only
@@ -315,15 +345,15 @@ live work will drift towards this if allowed to.
 better XI than FPL actually will, which is a wrong answer stated confidently, and
 it would import the optimiser into `live.py`, which has to stay a leaf.
 
-**Recent club form as a term in the fixture multiplier.** `Season.club_form`
-counts what each club has scored and conceded lately and the Fixtures tab shows
-it, and it deliberately feeds nothing. `strength_multiplier` already blends
-FPL's attack and defence ratings, which are continuous, separate for home and
-away, and move during the season off these same results, so putting the results
-in again would mostly count them twice. It would also need a weight, and there
-is nothing to fit one against. If this is revisited, the case to make is that
-the published ratings lag the results rather than that recent form is
-informative, and it should be measured before it is written.
+**Recent club form, as scorelines, in the fixture multiplier.**
+`Season.club_form` counts what each club has scored and conceded lately and the
+Fixtures tab shows it, and it deliberately feeds nothing. The fixture term now
+carries a continuous club rating rebuilt from expected goals, since FPL's own
+ratings have been zero all season, and scorelines are the noisy version of the
+same information: a club that scored three off one expected goal has been lucky
+rather than good. Putting them in as well would count the same matches twice
+with the worse measurement. The rebuilt rating is the thing to tune, with
+`backtest --sweep STRENGTH_ALPHA`, not to duplicate.
 
 **Tableau or any BI tool**, a static page from a scheduled GitHub Action, and a
 FastAPI plus JS front end. All three were ruled out when Streamlit was chosen;

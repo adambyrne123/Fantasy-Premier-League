@@ -45,6 +45,35 @@ CHIP_NAMES = {
 # it against this rather than letting it silently override.
 DEFCON_THRESHOLD = {"DEF": 10, "MID": 12, "FWD": 12}
 
+# The season-to-date counters the projection reads, in the order the payload
+# lists them. Named because they share two properties nothing else in the
+# player frame has: every one of them is last season's figure until the first
+# deadline, and every one of them is the sum of what `event/{gw}/live/` reports
+# per gameweek, which is what lets `backtest.py` rewind the bootstrap to how it
+# stood after any gameweek that has been played. A new counter belongs here as
+# well as in `_build_players`, or the rewind will silently leave it current.
+COUNTING_STATS = (
+    "minutes",
+    "total_points",
+    "starts",
+    "goals_scored",
+    "assists",
+    "clean_sheets",
+    "bonus",
+    "bps",
+    "expected_goals",
+    "expected_assists",
+    "expected_goal_involvements",
+    "expected_goals_conceded",
+    "saves",
+    "yellow_cards",
+    "red_cards",
+    "defensive_contribution",
+    "tackles",
+    "recoveries",
+    "clearances_blocks_interceptions",
+)
+
 
 def is_legal_xi(positions: Iterable[str]) -> bool:
     """Whether eleven positions make a formation FPL would accept.

@@ -39,6 +39,8 @@ uv run fpl-manager captains --top 20    # who to captain, and how safe
 uv run fpl-manager find salah              # resolve player ids by name
 uv run fpl-manager chips --squad squad.json   # when to play each chip
 uv run fpl-manager live --entry 1234567    # what your squad is scoring now
+uv run fpl-manager backtest                # how accurate the projection has been
+uv run fpl-manager backtest --sweep SHRINKAGE_GAMES=3,6,9   # re-score at each value
 ```
 
 Global flags live on the parent parser, not the subcommands. `--horizon`,
@@ -73,6 +75,7 @@ api.py  ──▶  data.py  ──▶  projections.py  ──▶  optimiser.py  
 | `prices.py` | Who is close to a price rise or fall. | Anything the points model reads |
 | `live.py` | In-play scoring: live stats, provisional bonus, autosubs. | Anything forward looking, and any selection logic |
 | `roi.py` | Points already returned per million. | Projections, which look forward |
+| `backtest.py` | Rewinds the season to any played gameweek and scores what the projection would have said. Sweeps a constant. | Anything the projection reads. It consumes the model and never feeds it |
 | `captaincy.py` | Haul and return chances for the armband, and what it is worth against the field. Distributions, not point estimates. | Anything the optimiser reads. It is a leaf on purpose |
 | `squad.py` | Loading the user's 15, bank, selling prices, chips spent. | Projections or optimisation |
 | `leagues.py` | Public manager profiles, classic league tables, and monthly totals. | Anything that scores or ranks players |
@@ -109,6 +112,11 @@ toggle gates it.
 
 All three leaf rules have tests in `tests/test_pipeline.py` that parse the
 imports, so none of them can be undone by accident.
+
+**`backtest.py` is a consumer and stays one.** It reads realised points off
+`event/{gw}/live/` to score the projection, which makes it an outcome rather
+than evidence, the same reason `live.py` is a leaf. Nothing that projects or
+picks may import it, and the same test file holds that.
 
 `Season` (in `data.py`) is the single object holding a loaded season. Pass it
 around rather than re-instantiating, since construction does two API calls.
@@ -215,13 +223,49 @@ xPts(player, gw) = sum over that club's fixtures in gw of
 
 Three terms, deliberately separable so any one can be replaced without touching
 the others. Tuning constants sit at the top of `projections.py`:
-`SHRINKAGE_GAMES`, `DIFFICULTY_ALPHA`, `HOME_BONUS`, `START_RATE_TRUST`,
+`SHRINKAGE_GAMES`, `ROLE_SHRINKAGE_GAMES`, `DIFFICULTY_ALPHA`, `HOME_BONUS`,
+`START_RATE_TRUST`,
 `SUB_SHARE`, `STARTER_DURATION`, `STRENGTH_WEIGHT`, `STRENGTH_ALPHA`,
 `PENALTY_XG_P90`, `FREEKICK_XG_P90`, `COMPONENT_MINUTES`, `PRIOR_MINUTES`,
-`SAVE_REMAINDER`. `PRIOR_MINUTES` is a sample floor on a finished season and
+`SAVE_REMAINDER`, `TEAM_DEFENCE_MINUTES`, `CLUB_STRENGTH_MINUTES`. `PRIOR_MINUTES` is a sample floor on a finished season and
 not a tuning knob, and it is deliberately a separate name from
 `COMPONENT_MINUTES` even though both are 270. That one scales a season in
 progress, this one gates one that is over.
+
+**Every constant is now a measured quantity, so measure before moving one.**
+`fpl-manager backtest` rebuilds the bootstrap as it stood after each played
+gameweek out of the live payloads, projects the next one and scores it, with
+last season's points over 38 and this season's points per game as the two
+baselines it has to beat. `--sweep NAME=v1,v2` re-scores at each value of a
+constant. Read rank correlation first, then what the top fifty went on to
+score; bias and error are dominated by the half of the game that does not
+play. Two things it cannot know: availability and prices as they stood then,
+so a player injured at the time projects as fit, and every figure is given
+over everyone and over those who played. A default argument that names a
+constant binds it at import, which is why `fixture_multiplier` and
+`credibility` read theirs at call time: a sweep of a bound one reports the
+same number at every value and looks like a finding.
+
+**The role is trusted faster than the rate, on purpose.** `ROLE_SHRINKAGE_GAMES`
+governs how fast this season's starts replace last season's in the minutes
+term, `SHRINKAGE_GAMES` how fast this season's points replace last season's
+in the scoring rate, and the first is a third of the second. A start is a
+decision a manager has already made and it persists; a rate off the same
+matches is a sample. Measured on GW1 to GW3 of 2026/27, moving the role
+alone took the rank correlation with realised points from 0.48 to 0.53 and
+moving the rate alone moved nothing.
+
+**FPL's attack and defence ratings are zero this season, for every club.**
+Checked on 2026-09-08, three gameweeks in. `club_strength` rebuilds them from
+expected goals, the club's summed player xG for attack and the keepers' xGC
+for defence, both shrunk to the league mean on `CLUB_STRENGTH_MINUTES`, ten
+matches rather than the three the clean sheet term uses, because a
+multiplier on every player at both clubs cannot afford the spread three
+matches of xG carry, and
+`fill_strength` puts them in only where FPL's are absent, all or nothing,
+because the two are on different scales. If FPL's come back they win. Before
+anything has been played the term is empty and the fixture multiplier is the
+1 to 5 rating alone, as it always was in August.
 
 **The minutes term must not be derived from minutes.** This is the trap the
 model already fell into once. If `expected_minutes_share` is computed as

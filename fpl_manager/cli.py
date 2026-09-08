@@ -9,6 +9,7 @@ python -m fpl_manager captains --top 20
 python -m fpl_manager --formation 3-4-3 build
 python -m fpl_manager live --entry 1234567
 python -m fpl_manager find haaland
+python -m fpl_manager backtest --sweep SHRINKAGE_GAMES=3,6,9
 """
 
 from __future__ import annotations
@@ -18,7 +19,7 @@ import sys
 
 import pandas as pd
 
-from . import captaincy, chips, live
+from . import backtest, captaincy, chips, live
 from .api import FplApi
 from .data import FORMATIONS, OUTFIELD, Season, format_formation, parse_formation
 from .optimiser import MAX_PLAN_WEEKS, build_squad, pick_xi, plan_transfers, suggest_transfers
@@ -358,6 +359,73 @@ def cmd_live(args, season, projections, by_gw):
         print(f"\nAuto sub: {names.get(out, out)} off, {names.get(came_in, came_in)} on")
 
 
+def _parse_sweep(spec: str) -> tuple[str, list[float]]:
+    """`NAME=v1,v2,v3` into a constant name and the values to try."""
+    name, sep, values = spec.partition("=")
+    if not sep or not values.strip():
+        raise SystemExit(f"--sweep wants NAME=v1,v2,..., got {spec!r}")
+    try:
+        return name.strip(), [float(v) for v in values.split(",") if v.strip()]
+    except ValueError:
+        raise SystemExit(f"--sweep values must be numbers, got {values!r}") from None
+
+
+BACKTEST_COLS = [
+    "n",
+    "bias",
+    "mae",
+    "rmse",
+    "rank",
+    "rank_played",
+    f"top{backtest.TOP_N}",
+    "minutes_corr",
+    "prior_rank",
+    "form_rank",
+]
+
+
+def cmd_backtest(args, season, projections, by_gw):
+    if not season.gameweeks_played:
+        print("\nNothing has been played, so there is nothing to score the model against.")
+        print("This fills in from the first gameweek.")
+        return
+
+    prior = _load_prior(season, use_prior=not args.no_prior)
+    through = (
+        min(args.through, season.gameweeks_played) if args.through else season.gameweeks_played
+    )
+    stats = backtest.load_stats(season.api, through)
+
+    if args.sweep:
+        constant, values = _parse_sweep(args.sweep)
+        table = backtest.sweep(season, prior, constant, values, through=through, stats=stats)
+        print(f"\n{constant} swept over GW1 to GW{through}, pooled")
+        print(_fmt(table.reset_index(), [constant, *BACKTEST_COLS]))
+        print(f"\nThe live value is {getattr(backtest.projections, constant)}, and nothing here")
+        print("has changed it. Read rank first, then the top fifty, then the rest.")
+        return
+
+    scored = backtest.evaluate(season, prior, through=through, stats=stats)
+    per_gameweek, pooled = backtest.summarise(scored)
+
+    print(f"\nProjection scored against GW1 to GW{through}, each rebuilt from the week before")
+    print(_fmt(per_gameweek.reset_index(), ["event", *BACKTEST_COLS]))
+    print("\nPooled")
+    print(_fmt(pooled.to_frame().T, BACKTEST_COLS))
+    print("\nBy position, over those who played")
+    print(_fmt(backtest.position_bias(scored).reset_index(), ["position", "bias", "mae", "n"]))
+    print("\nCalibration by decile of the projection")
+    print(_fmt(backtest.calibration(scored).reset_index(), ["decile", "xpts", "points", "n"]))
+    print("\nrank is the rank correlation with what was scored, over everyone, and")
+    print("rank_played the same over those who featured. prior_rank is last season's")
+    print("points over 38, which is the identity the model was built to escape, and")
+    print("form_rank is this season's points per game so far, the sort every spreadsheet")
+    print(f"does. top{backtest.TOP_N} is what the top of each week's shortlist went on to score.")
+    print("Availability, prices and set piece duty read as they stand today, because")
+    print("the API keeps no history of them, so a player who was injured at the time")
+    print("projects here as if fit. That is why every figure is given twice.")
+
+
 def cmd_find(args, season, projections, by_gw):
     query = args.query.lower()
     p = season.players
@@ -464,6 +532,15 @@ def main(argv: list[str] | None = None) -> int:
     f = sub.add_parser("find", help="look up player ids by name")
     f.add_argument("query")
     f.set_defaults(func=cmd_find)
+
+    bt = sub.add_parser("backtest", help="how accurate the projection has been this season")
+    bt.add_argument("--through", type=int, help="score up to this gameweek, default all played")
+    bt.add_argument(
+        "--sweep",
+        metavar="NAME=v1,v2,...",
+        help="re-score at each value of a projections.py constant, e.g. SHRINKAGE_GAMES=3,6,9",
+    )
+    bt.set_defaults(func=cmd_backtest)
 
     args = parser.parse_args(argv)
 

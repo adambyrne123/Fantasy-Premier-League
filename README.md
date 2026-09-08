@@ -86,6 +86,7 @@ uv run fpl-manager captains --top 20               # who to captain, and how saf
 uv run fpl-manager chips --squad squad.json        # when to play each chip
 uv run fpl-manager prices                          # who is close to moving
 uv run fpl-manager live --entry 1234567            # what you are scoring now
+uv run fpl-manager backtest                        # how accurate it has been
 ```
 
 The shape of the eleven is the solver's choice unless you make it yours.
@@ -145,7 +146,8 @@ them in `projections.py`.
 
 **points_per_90** blends last season's rate with this season's, weighted by
 `played / (played + 6)`. In August that is entirely last season. By November it
-is roughly two thirds this season. Players with no Premier League history get a
+is roughly two thirds this season. The minutes term below blends on a much
+faster clock, and the difference is deliberate. Players with no Premier League history get a
 per-position fit of rate against price, which is a stand-in and nothing more:
 a promoted club's 5.5m midfielder gets a promoted-club-shaped number regardless
 of what they actually did in the Championship.
@@ -175,6 +177,10 @@ The rest of the scoring is there too, including the parts that cost points:
   for anyone who falls well short of his bar.
 - **Cards**, minus one and minus three. Small, but systematically larger for
   defenders and holding midfielders, which is more position separation.
+- **Bonus**, read at the rate it was earned, since it is paid off the bonus
+  points system rather than off any one category above and cannot be rebuilt
+  from them. Leaving it out understated the best players most, and by more
+  every week as the rebuilt rate took on weight.
 
 The whole rebuilt rate contributes nothing in August, and deliberately. Until a
 gameweek has been played the blend weight is zero, so it cannot contribute at
@@ -198,7 +204,11 @@ against `points_per_90` and reduces the whole projection to last season's points
 divided by 38, which cannot tell a high scorer over half a season apart from a
 plodder who played every week. The start rate is shrunk towards the rate implied
 by price, since price is the only signal that does not come from last season's
-minutes. The result is then scaled by `chance_of_playing_next_round` when FPL
+minutes. This season's starts replace last season's by `played / (played + 2)`,
+three times faster than the scoring rate above, because a start is a decision
+his manager has already made and tends to persist, where a scoring rate off the
+same few matches is a noisy sample. Measured over the first three gameweeks of
+2026/27 that one change did more for the projection than anything else tried. The result is then scaled by `chance_of_playing_next_round` when FPL
 publishes one, and forced to zero for anyone flagged injured, suspended or
 unavailable.
 
@@ -209,16 +219,40 @@ history rather than being credited with form from three seasons ago.
 
 **fixture_multiplier** blends two views of how hard a fixture is. FPL's own 1
 to 5 difficulty rating maps onto a scaling factor of roughly 0.84 to 1.16 plus
-a small home adjustment, and that is combined with the clubs' attack and
-defence ratings, which are continuous, split by home and away, and move during
-the season. The second is what tells apart two fixtures FPL rates the same. It
-is normalised so the average fixture is exactly 1.0, which keeps the headline
-number in points.
+a small home adjustment, and that is combined with a continuous rating of each
+club's attack and defence. The second is what tells apart two fixtures FPL rates
+the same. It is normalised so the average fixture is exactly 1.0, which keeps
+the headline number in points.
 
-FPL publishes those ratings as zero until the season is under way, so in August
-the fixture term is the difficulty rating alone, exactly as it was before. Any
-club missing a rating falls back the same way rather than failing. Constants
-sit at the top of `projections.py` if you want a different shape.
+The continuous rating was FPL's own, which it published as zero until the season
+was under way. This season it has stayed zero for every club, so the rating is
+rebuilt instead from expected goals: a club's attack is what its players have
+been expected to score per match and its defence is what its keepers have been
+expected to concede, each shrunk towards the league average until ten matches
+are behind it, since a multiplier on every player at both clubs cannot afford
+the spread three matches of expected goals carry. FPL's figures are used wherever it publishes them. Before a ball
+is kicked there is nothing to rebuild from and the fixture term is the
+difficulty rating alone, exactly as it always was in August. Constants sit at
+the top of `projections.py` if you want a different shape.
+
+## How accurate it has been
+
+```
+uv run fpl-manager backtest
+uv run fpl-manager backtest --sweep SHRINKAGE_GAMES=3,6,9
+```
+
+Every gameweek FPL has scored, the tool rebuilds the data as it stood the week
+before, projects that gameweek, and compares with what was actually scored. It
+reports the rank correlation between projection and outcome, what the top fifty
+projected players went on to score, and how well the minutes term guessed who
+played, beside two baselines it has to beat: last season's points over 38 and
+this season's points per game. The sweep re-scores at each value of a constant,
+which is how the constants above stopped being set by eye.
+
+What it cannot know is who was injured or suspended at the time, since the API
+keeps no history of that, so every figure is given over everyone and again over
+those who actually played.
 
 Because the projection is built per fixture rather than per gameweek, doubles
 and blanks come out correctly without any special casing. A club with two
