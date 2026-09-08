@@ -19,7 +19,7 @@ import streamlit as st
 
 from fpl_manager.api import FplApi
 from fpl_manager.captaincy import HAUL_POINTS, field_gain, haul_frame, points_pmf
-from fpl_manager.chips import best_per_chip
+from fpl_manager.chips import available_chips, best_per_chip
 from fpl_manager.chips import evaluate as evaluate_chips
 from fpl_manager.data import (
     FORMATIONS,
@@ -648,14 +648,29 @@ def cached_chips(
     by_gameweek: pd.DataFrame,
     squad_ids: tuple[int, ...],
     budget_tenths: int,
+    windows: pd.DataFrame,
+    played: tuple[tuple[str, int], ...],
 ) -> pd.DataFrame:
     """Chip timing, cached because it is two solves per gameweek.
 
     Six seconds over a six week horizon, which is fine once and far too slow to
     sit behind a slider that re-runs the tab on every nudge. Takes the ids as a
     tuple so the cache can hash them.
+
+    `played` is in the key rather than the availability it implies, because a
+    dict of gameweeks is not hashable and the pairs are the smaller thing.
     """
-    return evaluate_chips(projections, by_gameweek, list(squad_ids), budget_tenths)
+    return evaluate_chips(
+        projections,
+        by_gameweek,
+        list(squad_ids),
+        budget_tenths,
+        available=available_chips(
+            windows,
+            played,
+            sorted(int(e) for e in by_gameweek["event"].unique()),
+        ),
+    )
 
 
 @st.cache_data(ttl=LIVE_MEMORY_TTL, show_spinner=False)
@@ -2939,7 +2954,13 @@ with chips_tab:
         "gain falls the longer you leave it.\n\n"
         "The horizon bounds the answer. If the best week is beyond it the tool "
         "cannot see it, so widen the slider before trusting advice to play one "
-        "now. Nothing here knows which chips you have already used."
+        "now.\n\n"
+        "**Chips you have already played are left out, and there are two of "
+        "each.** FPL offers wildcard and free hit from gameweek 2 to 19 and "
+        "again from 20 to 38, and bench boost and triple captain the same way "
+        "from gameweek 1, so spending one in the first half leaves the second "
+        "half's untouched. Loading your entry is what makes this true; a squad "
+        "file says nothing about what you have spent."
     )
     st.caption(
         "Gain is what the chip adds on top of what your squad scores anyway, "
@@ -2955,7 +2976,14 @@ with chips_tab:
         # until My squad stopped calling st.stop() on the same squad this tab
         # was never reached to find out.
         try:
-            table = cached_chips(projections, by_gameweek, tuple(my_squad.player_ids), team_value)
+            table = cached_chips(
+                projections,
+                by_gameweek,
+                tuple(my_squad.player_ids),
+                team_value,
+                season.chip_windows,
+                my_squad.chips_played,
+            )
         except RuntimeError as exc:
             st.error(f"{exc}. There is nothing to price a chip against.")
             table = None

@@ -80,29 +80,21 @@ id gives the real bench order and the real armband.
 
 ### Model
 
-**Captaincy against the field, rather than against the scoring table.** The
-Captain tab ranks on projected points, which is the right answer under a points
-objective and is not the question most managers are actually asking. What
-decides a season is rank, and against a rival the useful number is the chance
-you finish above him, which depends on what he captains as much as on what you
-do. A captain sixty percent of the field already has moves your rank very little
-however well he does.
+**A single named rival, rather than the whole field.** Captaincy against the
+field is built: `captaincy.field_gain` mixes the field's distributions under
+`elite.field_shares`'s `captain_share` and returns the chance you outscore their
+armband and what the choice is worth in points, and the Captain tab shows both.
+The shares arrive as an argument, since `captaincy.py` may not import `elite`.
 
-The blocker is gone. This used to say that the API gives ownership but not
-captaincy, so a model of the field would have to rest on ownership raised to
-some power set by eye. `elite.py` measures it instead: a hundred squads say who
-was captained and what effective ownership was, and the Captain tab already
-shows both. What is left is the arithmetic, which is convolving your
-distribution against the field's the way a double gameweek is already convolved,
-and `captaincy.py` produces the distributions for it.
+What is left is the easier half, which needs no sample at all: one rival read
+through `leagues.py`, where the useful number is the chance you finish above him
+and it depends on what he captains rather than on what a hundred managers did.
 
-Two things to know before starting. `captaincy.py` is held to importing `data`
-and `projections` only, so the shares go in as an argument rather than as an
-import, and there is a test that fails if that is done the other way. And the
-shares describe the gameweek just gone: last week's armband is a decent guide to
-next week's and it is not the same question, so whatever uses them has to say
-which one it is answering. A single named rival through `leagues.py` is still
-the easier first version, since it needs no sample at all.
+Two things the built version cannot fix and a rival version inherits. The shares
+describe the gameweek just gone, because picks are not published before a
+deadline, so this answers what the field captained last week rather than what it
+will captain next; the caption says so. And it is goals and assists only, like
+everything else `captaincy.py` produces, so for a defender it understates.
 
 **Position-specific scoring is complete, with two loose ends.**
 `component_rate` now covers every category FPL pays for.
@@ -132,13 +124,18 @@ rather than a modelling problem. Note the refetch would become mandatory rather
 than advisable, since `build_rates` backfills absent prior columns with NaN and
 a stale parquet would silently not blend.
 
-**`team_defence_rate` has no gate.** It never needed one: its only consumer was
-`component_rate`, which was gated at 270 minutes, so a club rate off one
-keeper's ninety minutes could not reach anything. Now that the gate is a ramp it
-can. It is bounded by the clean sheet and conceded terms and by the ramp itself,
-but unlike the per-player terms the error is correlated across every player at
-that club rather than diversified away, so it does not wash out across a squad.
-The fix is presumably the same credibility treatment on the club's minutes.
+**The defensive contribution term is still a threshold estimated from a mean,
+and the club rate now is not.** `team_defence_rate` is shrunk towards the league
+mean by `credibility` on the club's own keeper minutes, which was the open item
+here: measured one match into 2026/27 the raw rates ran from 0.20 to 3.87 per
+90, all off ninety minutes, and every defender at a club reads the same number
+so that error does not wash out across a squad. `docs/model.md` carries the
+reasoning, including why the target mean is unweighted.
+
+What that does not fix is the shrinkage target itself. The league mean is the
+only stable thing available with no history loaded, and last season's conceding
+rate per club would be better. It is blocked on the same parquet the captaincy
+shrinkage target is: `fetch_prior_season` stores nothing about clubs at all.
 
 **`FakeApi` is kinder pre-season than the real payload.** It zeroes `minutes`,
 `expected_goals` and the counting stats when `played=0`, and the API does not:
@@ -160,11 +157,21 @@ the mean linearly and the chance of two goals roughly quadratically.
 ### Planning and chips
 
 **Chips are advisory and independent.** All four are priced per gameweek across
-the horizon, wildcard over every remaining gameweek since you keep the squad.
-Missing: planning two chips together, any sense of a chip being worth saving for
-a gameweek beyond the horizon, and the assistant manager chip. Nothing reads
-which chips you have already used, either. `evaluate()` takes a `chips` tuple,
-but it is a caller-supplied filter and nothing populates it from the API.
+the horizon, wildcard over every remaining gameweek since you keep the squad,
+and what you have already spent is now read off your entry and left out.
+
+That turned out to be a bigger question than "which have I used". The bootstrap
+publishes a chip catalogue nobody was parsing, and it says there are **two of
+every chip**, one per half: wildcard and free hit from gameweek 2 to 19 and
+again from 20 to 38, bench boost and triple captain the same way from gameweek
+1. So availability is a question about a gameweek rather than about a season,
+which is what `chips.available_chips` answers, and `Season.chip_windows` is the
+catalogue. It also says wildcard and free hit cannot be played in gameweek 1 at
+all, which nothing knew and which was being priced anyway.
+
+Still missing: planning two chips together, any sense of a chip being worth
+saving for a gameweek beyond the horizon, and the assistant manager chip, which
+is absent from the catalogue this season and so cannot be priced off it.
 
 **Planning stops at four gameweeks.** `MAX_PLAN_WEEKS` is 4 because three weeks
 solves in about 0.7s and four in about 1.5s, but five jumps to five or six, past

@@ -216,7 +216,14 @@ def cmd_chips(args, season, projections, by_gw):
     squad = load_squad(season, args.squad, args.entry)
     budget = args.budget_tenths if args.budget_tenths else squad.value_tenths(season)
 
-    table = chips.evaluate(projections, by_gw, squad.player_ids, budget_tenths=budget)
+    available = chips.available_chips(
+        season.chip_windows,
+        squad.chips_played,
+        sorted(int(e) for e in by_gw["event"].unique()),
+    )
+    table = chips.evaluate(
+        projections, by_gw, squad.player_ids, budget_tenths=budget, available=available
+    )
     if table.empty:
         print("\nNot enough of the squad is known to price a chip.")
         return
@@ -229,6 +236,11 @@ def cmd_chips(args, season, projections, by_gw):
     if args.all:
         print("\nEvery gameweek, best first")
         print(_fmt(table, ["chip", "event", "gain", "baseline"]))
+
+    if squad.chips_played:
+        spent = ", ".join(f"{name} in GW{event}" for name, event in squad.chips_played)
+        print(f"\nAlready played: {spent}. There are two of each chip, one per half")
+        print("of the season, so only the half you spent is missing above.")
 
     print("\nGain is on top of what that squad scores anyway. Wildcard is the one")
     print("measured over every remaining gameweek rather than one, since you keep")

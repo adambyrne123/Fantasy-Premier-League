@@ -28,7 +28,66 @@ from .optimiser import build_squad, gameweek_frame, pick_xi, window_frame
 
 CHIPS = ("bench_boost", "triple_captain", "free_hit", "wildcard")
 
-__all__ = ["CHIPS", "best_per_chip", "evaluate", "gameweek_frame", "window_frame"]
+__all__ = [
+    "CHIPS",
+    "available_chips",
+    "best_per_chip",
+    "evaluate",
+    "gameweek_frame",
+    "window_frame",
+]
+
+
+def available_chips(
+    windows: pd.DataFrame,
+    played: tuple[tuple[str, int], ...],
+    events: list[int],
+) -> dict[int, tuple[str, ...]]:
+    """Which chips are still playable, per gameweek.
+
+    Per gameweek and not per season, because **FPL gives two of each**. The
+    bootstrap publishes wildcard and free hit for gameweeks 2 to 19 and again
+    for 20 to 38, and bench boost and triple captain the same way from gameweek
+    1, so spending the first half's wildcard leaves the second half's untouched.
+    A flat "which have I used" cannot express that and would withdraw a chip
+    the manager still holds.
+
+    It also carries the fact that wildcard and free hit cannot be played in
+    gameweek 1 at all, which nothing knew until the catalogue was parsed.
+
+    `windows` is `Season.chip_windows`. `played` is `(chip, gameweek)` pairs,
+    which is what `squad.chips_played` returns: the gameweek is what decides
+    which of the two offers was spent.
+
+    An empty catalogue means every chip everywhere. An unknown catalogue should
+    not quietly take a chip away, and before the parsing existed that was the
+    behaviour anyway.
+
+    `events` has no default on purpose. Omitting it would return an empty map,
+    which `evaluate` reads as every chip being unavailable in every gameweek and
+    prices nothing at all, and an empty chips table is a plausible enough result
+    that nobody would go looking for a missing argument.
+    """
+    wanted = sorted(set(events))
+    if windows.empty:
+        return {event: CHIPS for event in wanted}
+
+    spent = set()
+    for chip, event in played:
+        for row in windows.itertuples():
+            if row.chip == chip and row.start_event <= event <= row.stop_event:
+                spent.add((row.chip, row.start_event, row.stop_event))
+
+    out = {}
+    for event in wanted:
+        live = {
+            row.chip
+            for row in windows.itertuples()
+            if row.start_event <= event <= row.stop_event
+            and (row.chip, row.start_event, row.stop_event) not in spent
+        }
+        out[event] = tuple(chip for chip in CHIPS if chip in live)
+    return out
 
 
 def _best_lineup(frame: pd.DataFrame) -> tuple[float, pd.DataFrame, pd.Series]:
@@ -44,12 +103,19 @@ def evaluate(
     budget_tenths: int,
     chips: tuple[str, ...] = CHIPS,
     min_minutes_share: float = 0.05,
+    available: dict[int, tuple[str, ...]] | None = None,
 ) -> pd.DataFrame:
     """Score every chip in every gameweek of the horizon.
 
     `budget_tenths` is your team value, which is what a Free Hit squad has to
     fit inside. Returns one row per chip per gameweek, sorted by gain, so the
     top row is the best single play available over the horizon.
+
+    `chips` is the caller's own filter and applies to the whole horizon.
+    `available` is what the rules and the manager's own history leave him,
+    per gameweek, and comes from `available_chips`. They intersect: a chip has
+    to survive both, so passing neither prices everything, which is what
+    happened before any of this was read.
 
     Free Hit costs one solve per gameweek. That is a few hundred milliseconds
     each and only runs for the gameweeks in the horizon, so it stays quick
@@ -60,13 +126,19 @@ def evaluate(
     rows = []
 
     for event in events:
+        playable = set(chips)
+        if available is not None:
+            playable &= set(available.get(event, ()))
+        if not playable:
+            continue
+
         held = gameweek_frame(projections, by_gameweek, event, owned)
         if len(held) < 15:
             # a squad short of fifteen has no legal XI to compare against
             continue
         baseline, bench, captain = _best_lineup(held)
 
-        if "bench_boost" in chips:
+        if "bench_boost" in playable:
             rows.append(
                 {
                     "chip": "Bench Boost",
@@ -77,7 +149,7 @@ def evaluate(
                 }
             )
 
-        if "triple_captain" in chips:
+        if "triple_captain" in playable:
             rows.append(
                 {
                     "chip": "Triple Captain",
@@ -88,7 +160,7 @@ def evaluate(
                 }
             )
 
-        if "free_hit" in chips:
+        if "free_hit" in playable:
             pool = gameweek_frame(projections, by_gameweek, event)
             try:
                 fresh = build_squad(
@@ -111,7 +183,7 @@ def evaluate(
                 }
             )
 
-        if "wildcard" in chips:
+        if "wildcard" in playable:
             row = _wildcard(
                 projections, by_gameweek, event, owned, budget_tenths, min_minutes_share
             )

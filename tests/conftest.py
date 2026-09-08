@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import random
 from datetime import UTC, datetime, timedelta
+from typing import ClassVar
 
 import pandas as pd
 import pytest
@@ -256,12 +257,29 @@ class FakeApi:
                 fid += 1
         return fixtures
 
+    # The real catalogue, copied from the live bootstrap on 2026-08-23. Two of
+    # every chip, one per half, and wildcard and free hit unavailable in GW1.
+    # Written out rather than generated because the windows are the thing being
+    # tested and a generated pair would only prove the generator agrees with
+    # itself.
+    CHIP_CATALOGUE: ClassVar[list[dict]] = [
+        {"name": "wildcard", "start_event": 2, "stop_event": 19},
+        {"name": "wildcard", "start_event": 20, "stop_event": 38},
+        {"name": "freehit", "start_event": 2, "stop_event": 19},
+        {"name": "freehit", "start_event": 20, "stop_event": 38},
+        {"name": "bboost", "start_event": 1, "stop_event": 19},
+        {"name": "bboost", "start_event": 20, "stop_event": 38},
+        {"name": "3xc", "start_event": 1, "stop_event": 19},
+        {"name": "3xc", "start_event": 20, "stop_event": 38},
+    ]
+
     def bootstrap(self) -> dict:
         return {
             "teams": self._teams,
             "elements": self._elements,
             "events": self._events,
             "total_players": 9_000_000,
+            "chips": [dict(c) for c in self.CHIP_CATALOGUE],
         }
 
     def fixtures(self) -> list[dict]:

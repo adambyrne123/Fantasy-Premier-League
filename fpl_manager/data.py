@@ -23,6 +23,16 @@ MAX_PER_CLUB = 3
 SQUAD_SIZE = sum(SQUAD_LIMITS.values())
 XI_SIZE = 11
 
+# The API's chip names against ours. Ours are spelled out because they are read
+# in output, and the API's are not a naming convention anybody would arrive at
+# twice, so the two are mapped rather than munged.
+CHIP_NAMES = {
+    "wildcard": "wildcard",
+    "freehit": "free_hit",
+    "bboost": "bench_boost",
+    "3xc": "triple_captain",
+}
+
 # What a defensive contribution takes in one match. Defenders count clearances,
 # blocks, interceptions and tackles, everyone else counts recoveries too, which
 # is why the bar is higher for them. Keepers are absent rather than set high,
@@ -271,6 +281,39 @@ class Season:
         if len(current):
             return int(current[0])
         return self.gameweeks_played
+
+    @property
+    def chip_windows(self) -> pd.DataFrame:
+        """Every chip the season offers, and the gameweeks it can be played in.
+
+        Columns `chip`, `start_event`, `stop_event`, one row per offer rather
+        than per chip, because **there are two of each**. The bootstrap
+        publishes wildcard and free hit twice, once for gameweeks 2 to 19 and
+        once for 20 to 38, and bench boost and triple captain the same way from
+        gameweek 1. Spending the first half's wildcard does not touch the
+        second half's, so what a manager has left is a question about a
+        gameweek and never about a season.
+
+        It also says that wildcard and free hit cannot be played in gameweek 1
+        at all, which nothing knew before this was parsed.
+
+        Empty when the payload does not carry the block, and callers treat that
+        as every chip being available rather than as none of them being, since
+        an unknown catalogue should not silently withdraw a chip somebody has.
+        """
+        rows = []
+        for chip in self._boot.get("chips") or []:
+            name = CHIP_NAMES.get(chip.get("name"))
+            if name is None or chip.get("start_event") is None:
+                continue
+            rows.append(
+                {
+                    "chip": name,
+                    "start_event": int(chip["start_event"]),
+                    "stop_event": int(chip.get("stop_event") or 38),
+                }
+            )
+        return pd.DataFrame(rows, columns=["chip", "start_event", "stop_event"])
 
     @property
     def data_stamp(self) -> str:

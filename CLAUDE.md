@@ -73,8 +73,8 @@ api.py  ──▶  data.py  ──▶  projections.py  ──▶  optimiser.py  
 | `prices.py` | Who is close to a price rise or fall. | Anything the points model reads |
 | `live.py` | In-play scoring: live stats, provisional bonus, autosubs. | Anything forward looking, and any selection logic |
 | `roi.py` | Points already returned per million. | Projections, which look forward |
-| `captaincy.py` | Haul and return chances for the armband. Distributions, not point estimates. | Anything the optimiser reads. It is a leaf on purpose |
-| `squad.py` | Loading the user's 15, bank, selling prices. | Projections or optimisation |
+| `captaincy.py` | Haul and return chances for the armband, and what it is worth against the field. Distributions, not point estimates. | Anything the optimiser reads. It is a leaf on purpose |
+| `squad.py` | Loading the user's 15, bank, selling prices, chips spent. | Projections or optimisation |
 | `leagues.py` | Public manager profiles, classic league tables, and monthly totals. | Anything that scores or ranks players |
 | `elite.py` | What the top managers own and captain, counted off their squads. | Anything forward looking. It counts squads that already exist |
 | `cli.py` | Argument parsing and printing. | Model logic of any kind |
@@ -91,6 +91,11 @@ argued out once already and turned down as precision theatre on a model this
 rough. A haul chance read beside the projection is the useful version of caring
 about variance, and one folded into the objective is a squad the user cannot
 argue with.
+
+It also may not import `elite.py`, which is the rule most likely to be broken by
+accident now that `field_gain` exists: knowing what the field captains is
+exactly what that arithmetic needs, and it takes the shares as an **argument**.
+`app.py` holds both halves and does the joining. A test parses the imports.
 
 **`elite.py` is a leaf for a third reason.** It reads the top of the overall
 league and counts what those managers own and captain. Nothing that projects or
@@ -164,6 +169,15 @@ is one MILP rather than a loop of weekly ones. Both have tests asserting it. See
 `docs/model.md` before reformulating either.
 
 ## Conventions
+
+**There are two of every chip, one per half of the season.** The bootstrap
+publishes the catalogue and `Season.chip_windows` parses it: wildcard and free
+hit from gameweek 2 to 19 and again from 20 to 38, bench boost and triple
+captain the same way from gameweek 1. So what a manager has left is a question
+about a **gameweek**, never about a season, which is what
+`chips.available_chips` answers off `squad.chips_played`. Anything reducing that
+to a flat set of names will withdraw a chip the manager is still holding, and
+will also miss that wildcard and free hit cannot be played in gameweek 1.
 
 **Prices are in tenths of a million, everywhere except display.** The API gives
 `now_cost: 55` meaning 5.5m. Keeping it integer makes the budget constraint

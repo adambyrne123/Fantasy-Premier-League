@@ -167,3 +167,90 @@ def test_window_frame_sums_the_gameweeks_it_is_given(horizon_data):
     weekly = sum(gameweek_frame(projections, by_gw, e)["xpts_gw"] for e in events[:2])
     windowed = window_frame(projections, by_gw, events[0], events[1])["xpts_gw"]
     assert (weekly - windowed).abs().max() < 1e-9
+
+
+# ----------------------------------------------------------------------
+# what you actually have left
+# ----------------------------------------------------------------------
+def test_the_catalogue_says_there_are_two_of_every_chip(season: Season):
+    """The fact the flat "which have I used" framing could not express, and the
+    reason this is a question about a gameweek rather than about a season."""
+    windows = season.chip_windows
+
+    assert not windows.empty
+    assert set(windows["chip"]) == set(chips.CHIPS)
+    assert (windows.groupby("chip").size() == 2).all(), "one per half of the season"
+
+
+def test_wildcard_and_free_hit_cannot_be_played_in_gameweek_one(season: Season):
+    """Nothing knew this until the catalogue was parsed, and every chip was
+    being priced in every gameweek of the horizon regardless."""
+    live = chips.available_chips(season.chip_windows, (), [1, 2])
+
+    assert "wildcard" not in live[1]
+    assert "free_hit" not in live[1]
+    assert "bench_boost" in live[1], "these two do open at gameweek one"
+    assert "triple_captain" in live[1]
+    assert set(live[2]) == set(chips.CHIPS)
+
+
+def test_a_chip_spent_in_one_half_leaves_the_other_half_alone(season: Season):
+    """The whole point of the per-gameweek shape. Withdrawing the second
+    wildcard because the first was played would be wrong about a chip the
+    manager is holding."""
+    played = (("wildcard", 5),)
+    live = chips.available_chips(season.chip_windows, played, [6, 19, 20, 30])
+
+    assert "wildcard" not in live[6], "spent for the rest of the first half"
+    assert "wildcard" not in live[19]
+    assert "wildcard" in live[20], "and back the moment the second half opens"
+    assert "wildcard" in live[30]
+    # nothing else was touched
+    assert "free_hit" in live[6]
+
+
+def test_both_halves_spent_means_the_chip_is_gone(season: Season):
+    played = (("bench_boost", 3), ("bench_boost", 25))
+    live = chips.available_chips(season.chip_windows, played, [4, 26])
+
+    assert "bench_boost" not in live[4]
+    assert "bench_boost" not in live[26]
+
+
+def test_an_unknown_catalogue_withdraws_nothing(season: Season):
+    """A payload without the block should not quietly take a chip away. Before
+    any of this was parsed everything was priced, and that is the safe default
+    to fall back to."""
+    live = chips.available_chips(pd.DataFrame(), (("wildcard", 5),), [1, 6])
+
+    assert live[1] == chips.CHIPS
+    assert live[6] == chips.CHIPS
+
+
+def test_evaluate_prices_only_what_is_left(horizon_data, owned, season: Season):
+    """The filter has to reach the solve, not just the caption."""
+    projections, by_gw = horizon_data
+    events = sorted(int(e) for e in by_gw["event"].unique())
+
+    everything = chips.evaluate(projections, by_gw, owned, budget_tenths=1000)
+    assert "Bench Boost" in set(everything["chip"])
+
+    without = chips.evaluate(
+        projections,
+        by_gw,
+        owned,
+        budget_tenths=1000,
+        available=dict.fromkeys(events, ("triple_captain", "free_hit", "wildcard")),
+    )
+    assert "Bench Boost" not in set(without["chip"])
+    assert "Triple Captain" in set(without["chip"])
+
+
+def test_passing_nothing_prices_everything(horizon_data, owned):
+    """`available=None` has to reproduce the old behaviour exactly, or every
+    caller that has not been updated quietly changes answer."""
+    projections, by_gw = horizon_data
+
+    before = chips.evaluate(projections, by_gw, owned, budget_tenths=1000)
+    after = chips.evaluate(projections, by_gw, owned, budget_tenths=1000, available=None)
+    pd.testing.assert_frame_equal(before, after)
