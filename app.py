@@ -231,11 +231,19 @@ TERM_CHARTS = (
 # Nothing here fetches them: these are strings handed to the browser, so the
 # cache in `api.py` is not involved and neither is the network from our side.
 #
+# The photographs come from the `premierleague25` bucket because that is the
+# one the Premier League site reads, and it is the one refreshed after a
+# transfer. The older `premierleague/photos/players/.../p{code}.png` path still
+# answers, which is how it went unnoticed, but its pictures were frozen at the
+# point players moved club, so Eze stood on the pitch in a Palace shirt with an
+# Arsenal crest beside him. The 25 is a bucket name and not a season: the site
+# kept it across the 2026/27 rollover, so do not derive it from one.
+#
 # A player with no photograph gets a 403 rather than a 404, and it is the cheap
 # fringe players who are missing, which is exactly who the optimiser buys to
 # enable a squad. So a face always carries a fallback to the club kit and never
 # stands on its own.
-FACE_URL = "https://resources.premierleague.com/premierleague/photos/players/110x140/p{}.png"
+FACE_URL = "https://resources.premierleague.com/premierleague25/photos/players/110x140/{}.png"
 KIT_URL = "https://fantasy.premierleague.com/dist/img/shirts/standard/shirt_{}{}-66.png"
 BADGE_URL = "https://resources.premierleague.com/premierleague/badges/70/t{}.png"
 BADGE_COLUMN = st.column_config.ImageColumn("", width="small")
@@ -321,9 +329,9 @@ PITCH_CSS = """
 }
 .mug img { object-fit:contain; object-position:center; padding:3px; }
 .pitch.compact .mug, .bench-strip.compact .mug { width:34px; height:43px; }
-/* FPL's photographs go stale after a transfer, so a player can appear in the
-   kit of the club he has just left. The crest is read off the live team code
-   and is always current, which makes it the thing to trust on the card. */
+/* A photograph can lag a deadline day move by a while, so a player can appear
+   in the kit of the club he has just left. The crest is read off the live team
+   code and is never behind, which makes it the thing to trust on the card. */
 .crest { position:absolute; top:5px; left:5px; width:15px; height:15px; opacity:.95; }
 .state {
   border:1px solid var(--line-soft); border-radius:var(--radius);
@@ -1055,8 +1063,8 @@ def availability(row: pd.Series) -> tuple[str, str]:
 def _mug(images: pd.DataFrame | None, player_id, css: str = "mug") -> str:
     """A player's face, falling back to his club kit if there is no photograph.
 
-    Roughly half of the cheapest players have no photograph and the CDN answers
-    403 for them, which is the bench of any squad the optimiser builds. Leaving
+    Some of the cheapest players have no photograph and the CDN answers 403
+    for them, which is the bench of any squad the optimiser builds. Leaving
     a hole there is the worst case, since a cheap defender is exactly who you
     cannot identify from the name alone.
 

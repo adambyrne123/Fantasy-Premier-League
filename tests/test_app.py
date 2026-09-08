@@ -462,7 +462,20 @@ def test_every_card_in_the_squad_carries_a_face(app):
     assert not at.exception
     pitch = _pitch(at)
     assert pitch.count('<span class="mug"') == 15, "eleven starters and four on the bench"
-    assert "photos/players/110x140/p500" in pitch, "built from the player's code, not his id"
+    assert "photos/players/110x140/500" in pitch, "built from the player's code, not his id"
+
+
+def test_the_faces_come_from_the_bucket_the_premier_league_site_reads(app):
+    """The older `premierleague/photos/players/.../p{code}.png` path still
+    answers, but its pictures were frozen at the point players moved club, so a
+    summer signing stood on the pitch in the shirt of the club he had left. The
+    `premierleague25` bucket is the one the site itself reads and the one that
+    gets refreshed, and the 25 is a bucket name rather than a season."""
+    at = app.run()
+    assert not at.exception
+    pitch = _pitch(at)
+    assert "premierleague25/photos/players/" in pitch
+    assert "/photos/players/110x140/p" not in pitch, "the p prefix belongs to the old bucket"
 
 
 def test_the_kit_is_the_fallback_and_not_a_backdrop(app):
